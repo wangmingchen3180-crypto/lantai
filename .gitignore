@@ -1,0 +1,15 @@
+.DS_Store
+
+# Local build products and caches
+.build/
+work/
+outputs/
+DerivedData/
+
+# Downloaded installers and archives
+*.dmg
+*.zip
+
+# Xcode user state
+*.xcuserstate
+xcuserdata/
