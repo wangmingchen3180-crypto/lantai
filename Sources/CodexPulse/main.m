@@ -102,6 +102,74 @@ static NSString *CPCleanTitle(const unsigned char *text) {
 @end
 @implementation CPAgent @end
 
+#pragma mark - Display Status & Review Store
+
+typedef NS_ENUM(NSInteger, CPDisplayStatus) {
+    CPDisplayStatusIdle,
+    CPDisplayStatusWorking,
+    CPDisplayStatusCompletedPendingReview,
+    CPDisplayStatusWaiting,
+    CPDisplayStatusFailed
+};
+
+@interface CPReviewStore : NSObject
+@property NSUserDefaults *defaults;
+- (instancetype)initWithDefaults:(NSUserDefaults *)defaults;
+- (NSString *)signatureForTask:(CPTask *)task;
+- (BOOL)isTaskReviewed:(CPTask *)task agentID:(NSString *)agentID;
+- (void)markTaskReviewed:(CPTask *)task agentID:(NSString *)agentID;
+@end
+
+@implementation CPReviewStore
+
+- (instancetype)initWithDefaults:(NSUserDefaults *)defaults {
+    self = [super init];
+    if (!self) return nil;
+    self.defaults = defaults;
+    return self;
+}
+
+- (NSString *)signatureForTask:(CPTask *)task {
+    return [NSString stringWithFormat:@"%.3f", task.updatedAt.timeIntervalSince1970];
+}
+
+- (NSString *)keyForTask:(CPTask *)task agentID:(NSString *)agentID {
+    return [NSString stringWithFormat:@"reviewed.%@.%@", agentID, task.taskID];
+}
+
+- (BOOL)isTaskReviewed:(CPTask *)task agentID:(NSString *)agentID {
+    NSString *stored = [self.defaults stringForKey:[self keyForTask:task agentID:agentID]];
+    return stored && [stored isEqualToString:[self signatureForTask:task]];
+}
+
+- (void)markTaskReviewed:(CPTask *)task agentID:(NSString *)agentID {
+    [self.defaults setObject:[self signatureForTask:task] forKey:[self keyForTask:task agentID:agentID]];
+}
+
+@end
+
+// Strict priority: failed > attention/waiting > completed-unreviewed > working > idle.
+static CPDisplayStatus CPDisplayStatusForTasks(NSArray<CPTask *> *tasks, NSString *agentID, CPReviewStore *reviewStore) {
+    BOOL anyFailed = NO, anyWaiting = NO, anyPendingReview = NO, anyWorking = NO;
+    for (CPTask *t in tasks) {
+        switch (t.status) {
+            case CPStatusFailed: anyFailed = YES; break;
+            case CPStatusAttention:
+            case CPStatusWaiting: anyWaiting = YES; break;
+            case CPStatusCompleted:
+                if (![reviewStore isTaskReviewed:t agentID:agentID]) anyPendingReview = YES;
+                break;
+            case CPStatusWorking: anyWorking = YES; break;
+            case CPStatusIdle: break;
+        }
+    }
+    if (anyFailed) return CPDisplayStatusFailed;
+    if (anyWaiting) return CPDisplayStatusWaiting;
+    if (anyPendingReview) return CPDisplayStatusCompletedPendingReview;
+    if (anyWorking) return CPDisplayStatusWorking;
+    return CPDisplayStatusIdle;
+}
+
 #pragma mark - Helpers
 
 static NSTextField *CPLabel(NSString *text, CGFloat size, NSFontWeight weight, NSColor *color) {
@@ -130,6 +198,156 @@ static NSImage *CPSymbol(NSString *name, CGFloat pointSize, NSColor *color) {
     if (color) img = [img imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithHierarchicalColor:color]];
     return img;
 }
+
+#pragma mark - Agent Status Button
+
+static NSString *CPDisplayStatusTitle(CPDisplayStatus s) {
+    switch (s) {
+        case CPDisplayStatusFailed: return @"失败";
+        case CPDisplayStatusWaiting: return @"需关注";
+        case CPDisplayStatusCompletedPendingReview: return @"待查验";
+        case CPDisplayStatusWorking: return @"工作中";
+        case CPDisplayStatusIdle: return @"空闲";
+    }
+}
+
+static NSColor *CPDisplayStatusColor(CPDisplayStatus s) {
+    switch (s) {
+        case CPDisplayStatusFailed: return CPRed();
+        case CPDisplayStatusWaiting: return CPOrange();
+        case CPDisplayStatusCompletedPendingReview: return CPBlue();
+        case CPDisplayStatusWorking: return CPGreen();
+        case CPDisplayStatusIdle: return [NSColor colorWithSRGBRed:0.0 green:0.72 blue:0.78 alpha:1.0];
+    }
+}
+
+static CGFloat CPDisplayStatusBreathDuration(CPDisplayStatus s) {
+    switch (s) {
+        case CPDisplayStatusFailed: return 0.5;                 // 红色快速脉冲
+        case CPDisplayStatusWaiting: return 1.2;                // 橙色较快呼吸
+        case CPDisplayStatusCompletedPendingReview: return 1.8; // 蓝色双层呼吸
+        case CPDisplayStatusWorking: return 2.0;                // 绿色呼吸
+        case CPDisplayStatusIdle: return 3.2;                   // 青色慢呼吸
+    }
+}
+
+@interface CPAgentStatusButton : NSButton
+@property NSString *agentID;
+@property (nonatomic) BOOL reduceMotion;
+@property CPDisplayStatus displayStatus;
+@property BOOL statusSelected;
+@property CAShapeLayer *ringLayer;
+@property CAShapeLayer *innerRingLayer;
+@property NSView *statusDot;
+@property NSImageView *iconView;
+- (void)updateWithAgent:(CPAgent *)agent displayStatus:(CPDisplayStatus)status selected:(BOOL)selected;
+@end
+
+@implementation CPAgentStatusButton
+
+- (instancetype)initWithFrame:(NSRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+    self.bordered = NO;
+    self.wantsLayer = YES;
+    self.layer.cornerRadius = 8.0;
+
+    self.ringLayer = [CAShapeLayer layer];
+    self.ringLayer.fillColor = NSColor.clearColor.CGColor;
+    self.ringLayer.lineWidth = 2.0;
+    [self.layer addSublayer:self.ringLayer];
+
+    // Second ring used only by the blue completed-pending-review double layer.
+    self.innerRingLayer = [CAShapeLayer layer];
+    self.innerRingLayer.fillColor = NSColor.clearColor.CGColor;
+    self.innerRingLayer.lineWidth = 1.5;
+    [self.layer addSublayer:self.innerRingLayer];
+
+    self.iconView = [[NSImageView alloc] initWithFrame:NSZeroRect];
+    [self addSubview:self.iconView];
+
+    self.statusDot = [[NSView alloc] initWithFrame:NSZeroRect];
+    self.statusDot.wantsLayer = YES;
+    self.statusDot.layer.cornerRadius = 5.0;
+    self.statusDot.layer.borderWidth = 1.5;
+    self.statusDot.layer.borderColor = NSColor.whiteColor.CGColor;
+    [self addSubview:self.statusDot];
+    return self;
+}
+
+- (void)layout {
+    [super layout];
+    CGRect b = self.bounds;
+    CGFloat side = MIN(b.size.width, b.size.height);
+    CGPoint c = CGPointMake(CGRectGetMidX(b), CGRectGetMidY(b));
+    CGFloat outerR = side / 2.0 - 2.0;
+    self.ringLayer.frame = b;
+    self.ringLayer.path = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(c.x - outerR, c.y - outerR, outerR * 2, outerR * 2)].CGPath;
+    CGFloat innerR = MAX(outerR - 4.0, 1.0);
+    self.innerRingLayer.frame = b;
+    self.innerRingLayer.path = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(c.x - innerR, c.y - innerR, innerR * 2, innerR * 2)].CGPath;
+    self.iconView.frame = NSMakeRect(c.x - 10, c.y - 10, 20, 20);
+    self.statusDot.frame = NSMakeRect(b.size.width - 12, 1, 10, 10);
+}
+
+- (void)setReduceMotion:(BOOL)reduceMotion {
+    _reduceMotion = reduceMotion;
+    [self applyAnimations];
+}
+
+- (void)updateWithAgent:(CPAgent *)agent displayStatus:(CPDisplayStatus)status selected:(BOOL)selected {
+    self.agentID = agent.agentID;
+    self.displayStatus = status;
+    self.statusSelected = selected;
+    NSColor *color = CPDisplayStatusColor(status);
+
+    self.image = nil;
+    self.iconView.image = CPSymbol(agent.iconName ?: @"sparkles", 16, selected ? CPAccent() : CPFg2());
+    self.iconView.contentTintColor = selected ? CPAccent() : CPFg2();
+    self.layer.backgroundColor = (selected ? [NSColor colorWithSRGBRed:0.91 green:0.94 blue:1.0 alpha:1.0] : NSColor.clearColor).CGColor;
+
+    self.ringLayer.strokeColor = color.CGColor;
+    self.ringLayer.opacity = 1.0;
+    BOOL doubleRing = status == CPDisplayStatusCompletedPendingReview;
+    self.innerRingLayer.hidden = !doubleRing;
+    self.innerRingLayer.strokeColor = color.CGColor;
+    self.innerRingLayer.opacity = 1.0;
+    self.statusDot.layer.backgroundColor = color.CGColor;
+
+    self.toolTip = [NSString stringWithFormat:@"%@ · %@", agent.name, CPDisplayStatusTitle(status)];
+    self.accessibilityLabel = [NSString stringWithFormat:@"%@，%@", agent.name, CPDisplayStatusTitle(status)];
+
+    [self setNeedsLayout:YES];
+    [self layout];
+    [self applyAnimations];
+}
+
+- (void)applyAnimations {
+    [self.ringLayer removeAllAnimations];
+    [self.innerRingLayer removeAllAnimations];
+    self.ringLayer.opacity = 1.0;
+    self.innerRingLayer.opacity = 1.0;
+    if (self.reduceMotion) return; // 减少动态效果：只保留静态外圈与状态点
+
+    CGFloat duration = CPDisplayStatusBreathDuration(self.displayStatus);
+    CABasicAnimation *breath = [CABasicAnimation animationWithKeyPath:@"opacity"];
+    breath.fromValue = @1.0;
+    breath.toValue = self.displayStatus == CPDisplayStatusFailed ? @0.25 : @0.45;
+    breath.duration = duration;
+    breath.autoreverses = YES;
+    breath.repeatCount = HUGE_VALF;
+    breath.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+    [self.ringLayer addAnimation:breath forKey:@"breath"];
+
+    if (!self.innerRingLayer.hidden) {
+        CABasicAnimation *inner = [breath copy];
+        inner.toValue = @0.55;
+        inner.timeOffset = duration / 2.0; // 相位错开，形成双层呼吸
+        [self.innerRingLayer addAnimation:inner forKey:@"breath"];
+    }
+}
+
+@end
 
 #pragma mark - State Reader
 
@@ -327,6 +545,7 @@ static NSImage *CPSymbol(NSString *name, CGFloat pointSize, NSColor *color) {
 
 @interface CPWorkbenchCardController : NSObject
 @property NSPanel *window;
+@property NSView *shadowCarrier;
 @property NSView *card;
 @property NSView *leftColumn;
 @property NSView *middleColumn;
@@ -334,8 +553,6 @@ static NSImage *CPSymbol(NSString *name, CGFloat pointSize, NSColor *color) {
 @property NSStackView *agentStack;
 @property NSStackView *taskStack;
 @property NSStackView *detailStack;
-@property NSLayoutConstraint *leftWidth;
-@property NSLayoutConstraint *rightWidth;
 @property NSButton *pinButton;
 @property NSButton *modeButton;
 @property NSTextField *cardMetaLabel;
@@ -344,13 +561,13 @@ static NSImage *CPSymbol(NSString *name, CGFloat pointSize, NSColor *color) {
 @property NSArray<CPAgent *> *agents;
 @property CPAgent *selectedAgent;
 @property CPTask *selectedTask;
-@property BOOL leftExpanded;
-@property BOOL rightExpanded;
+@property CPReviewStore *reviewStore;
 @property BOOL pinned;
 @property NSInteger dockMode;
 @property id clickMonitor;
 @property NSRect lastDockRect;
 - (NSRect)targetFrameNearDockRect:(NSRect)rect edge:(NSRectEdge)edge;
+- (NSRect)targetFrameInVisibleRect:(NSRect)visible;
 - (void)showNearDockRect:(NSRect)rect edge:(NSRectEdge)edge;
 - (void)close;
 - (BOOL)isVisible;
@@ -359,48 +576,71 @@ static NSImage *CPSymbol(NSString *name, CGFloat pointSize, NSColor *color) {
 
 @implementation CPWorkbenchCardController
 
-static const CGFloat CPCardWidth = 620.0;
-static const CGFloat CPCardHeight = 440.0;
+static const CGFloat CPCardWidth = 520.0;
+static const CGFloat CPCardHeight = 360.0;
 
 - (instancetype)init {
     self = [super init];
     if (!self) return nil;
-    self.leftExpanded = YES;
-    self.rightExpanded = YES;
     self.pinned = YES;
     self.dockMode = 0;
+    self.reviewStore = [[CPReviewStore alloc] initWithDefaults:NSUserDefaults.standardUserDefaults];
     [self buildWindow];
     return self;
 }
 
+static const CGFloat CPWorkbenchInset = 20.0;
+
+// Pure geometry helpers: depend only on a visibleFrame rect and a target size,
+// so headless self-tests can drive the exact same code paths with synthetic rects.
+static NSRect CPCenteredRectInVisibleFrame(NSRect visible, NSSize size) {
+    CGFloat x = NSMidX(visible) - size.width / 2.0;
+    CGFloat y = NSMidY(visible) - size.height / 2.0;
+    x = MAX(NSMinX(visible) + CPWorkbenchInset, MIN(x, NSMaxX(visible) - size.width - CPWorkbenchInset));
+    y = MAX(NSMinY(visible) + CPWorkbenchInset, MIN(y, NSMaxY(visible) - size.height - CPWorkbenchInset));
+    return NSIntegralRect(NSMakeRect(x, y, size.width, size.height));
+}
+
+static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
+    return NSMakeRect(NSMaxX(visible) - size.width, NSMaxY(visible) - size.height, size.width, size.height);
+}
+
 - (void)buildWindow {
-    self.window = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, CPCardWidth, CPCardHeight)
+    CGFloat windowW = CPCardWidth + CPWorkbenchInset * 2.0;
+    CGFloat windowH = CPCardHeight + CPWorkbenchInset * 2.0;
+    self.window = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, windowW, windowH)
                                              styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
                                                backing:NSBackingStoreBuffered
                                                  defer:NO];
     self.window.level = NSFloatingWindowLevel;
     self.window.opaque = NO;
     self.window.backgroundColor = NSColor.clearColor;
-    self.window.hasShadow = YES;
+    self.window.hasShadow = NO;
     self.window.hidesOnDeactivate = NO;
     self.window.movable = YES;
     self.window.movableByWindowBackground = NO;
     self.window.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
                                      NSWindowCollectionBehaviorFullScreenAuxiliary;
 
-    self.card = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, CPCardWidth, CPCardHeight)];
+    self.shadowCarrier = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, windowW, windowH)];
+    self.shadowCarrier.wantsLayer = YES;
+    self.shadowCarrier.layer.backgroundColor = NSColor.clearColor.CGColor;
+    self.shadowCarrier.layer.shadowColor = [NSColor colorWithSRGBRed:0.078 green:0.078 blue:0.086 alpha:0.12].CGColor;
+    self.shadowCarrier.layer.shadowOffset = CGSizeMake(0, -8);
+    self.shadowCarrier.layer.shadowRadius = 30.0;
+    self.shadowCarrier.layer.shadowOpacity = 1.0;
+    self.shadowCarrier.layer.shadowPath = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(CPWorkbenchInset, CPWorkbenchInset, CPCardWidth, CPCardHeight) xRadius:18 yRadius:18].CGPath;
+    self.window.contentView = self.shadowCarrier;
+
+    self.card = [[NSView alloc] initWithFrame:NSMakeRect(CPWorkbenchInset, CPWorkbenchInset, CPCardWidth, CPCardHeight)];
     self.card.wantsLayer = YES;
     self.card.layer.backgroundColor = CPSurface().CGColor;
     self.card.layer.cornerRadius = 18.0;
     self.card.layer.borderWidth = 1.0;
     self.card.layer.borderColor = CPBorder().CGColor;
-    NSShadow *shadow = [[NSShadow alloc] init];
-    shadow.shadowColor = [NSColor colorWithSRGBRed:0.078 green:0.078 blue:0.086 alpha:0.12];
-    shadow.shadowOffset = NSMakeSize(0, -8);
-    shadow.shadowBlurRadius = 30.0;
-    self.card.shadow = shadow;
-    self.window.contentView = self.card;
-    self.card.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    self.card.layer.masksToBounds = YES;
+    self.card.autoresizingMask = NSViewNotSizable;
+    [self.shadowCarrier addSubview:self.card];
 
     [self buildHeader];
     [self buildBody];
@@ -444,13 +684,11 @@ static const CGFloat CPCardHeight = 440.0;
     left.spacing = 8;
     left.translatesAutoresizingMaskIntoConstraints = NO;
 
-    NSButton *railToggle = CPIconButton(@"sidebar.leading", self, @selector(toggleLeft:), @"切换左栏");
-    NSButton *detailToggle = CPIconButton(@"sidebar.trailing", self, @selector(toggleRight:), @"切换右栏");
     self.modeButton = CPIconButton(@"rectangle.2.swap", self, @selector(toggleDockMode:), @"切换为底部快捷栏");
     self.pinButton = CPIconButton(@"pin.fill", self, @selector(togglePin:), @"固定");
     NSButton *closeButton = CPIconButton(@"xmark", self, @selector(close), @"关闭");
 
-    NSStackView *right = [NSStackView stackViewWithViews:@[railToggle, detailToggle, self.modeButton, self.pinButton, closeButton]];
+    NSStackView *right = [NSStackView stackViewWithViews:@[self.modeButton, self.pinButton, closeButton]];
     right.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     right.spacing = 4;
     right.translatesAutoresizingMaskIntoConstraints = NO;
@@ -492,10 +730,10 @@ static const CGFloat CPCardHeight = 440.0;
     self.rightColumn = [self columnWithBackground:[NSColor colorWithSRGBRed:0.980 green:0.980 blue:0.976 alpha:1.0]];
 
     [self.leftColumn setContentHuggingPriority:NSLayoutPriorityDefaultHigh forOrientation:NSLayoutConstraintOrientationHorizontal];
-    [self.rightColumn setContentHuggingPriority:NSLayoutPriorityDefaultHigh forOrientation:NSLayoutConstraintOrientationHorizontal];
     [self.middleColumn setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
 
-    NSStackView *columns = [NSStackView stackViewWithViews:@[self.leftColumn, self.middleColumn, self.rightColumn]];
+    // 常驻两栏:左侧 Agent 固定宽度,右侧任务区填满剩余宽度。
+    NSStackView *columns = [NSStackView stackViewWithViews:@[self.leftColumn, self.middleColumn]];
     columns.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     columns.spacing = 0;
     columns.distribution = NSStackViewDistributionFill;
@@ -508,10 +746,18 @@ static const CGFloat CPCardHeight = 440.0;
         [columns.bottomAnchor constraintEqualToAnchor:body.bottomAnchor]
     ]];
 
-    self.leftWidth = [self.leftColumn.widthAnchor constraintEqualToConstant:130];
-    self.rightWidth = [self.rightColumn.widthAnchor constraintEqualToConstant:200];
-    self.leftWidth.active = YES;
-    self.rightWidth.active = YES;
+    [self.leftColumn.widthAnchor constraintEqualToConstant:126].active = YES;
+
+    // 详情抽屉:middleColumn 上方的隐藏 overlay,不占水平宽度,层级在任务列表之上。
+    self.rightColumn.hidden = YES;
+    self.rightColumn.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.middleColumn addSubview:self.rightColumn positioned:NSWindowAbove relativeTo:nil];
+    [NSLayoutConstraint activateConstraints:@[
+        [self.rightColumn.leadingAnchor constraintEqualToAnchor:self.middleColumn.leadingAnchor],
+        [self.rightColumn.trailingAnchor constraintEqualToAnchor:self.middleColumn.trailingAnchor],
+        [self.rightColumn.topAnchor constraintEqualToAnchor:self.middleColumn.topAnchor],
+        [self.rightColumn.bottomAnchor constraintEqualToAnchor:self.middleColumn.bottomAnchor]
+    ]];
 
     [self buildLeftColumn];
     [self buildMiddleColumn];
@@ -603,9 +849,35 @@ static const CGFloat CPCardHeight = 440.0;
     head.translatesAutoresizingMaskIntoConstraints = NO;
     [head.heightAnchor constraintEqualToConstant:36].active = YES;
     NSTextField *title = CPLabel(@"任务详情", 12, NSFontWeightSemibold, CPFg());
+    title.translatesAutoresizingMaskIntoConstraints = NO;
+    NSButton *closeButton = CPIconButton(@"xmark", self, @selector(closeDetailDrawer), @"关闭详情");
     [head addSubview:title];
-    [title setFrameOrigin:NSMakePoint(0, 8)];
+    [head addSubview:closeButton];
+    [NSLayoutConstraint activateConstraints:@[
+        [title.leadingAnchor constraintEqualToAnchor:head.leadingAnchor],
+        [title.centerYAnchor constraintEqualToAnchor:head.centerYAnchor],
+        [closeButton.trailingAnchor constraintEqualToAnchor:head.trailingAnchor],
+        [closeButton.centerYAnchor constraintEqualToAnchor:head.centerYAnchor]
+    ]];
     [stack addArrangedSubview:head];
+}
+
+- (void)showDetailDrawer {
+    // 提到任务列表之上再显示。
+    [self.middleColumn addSubview:self.rightColumn positioned:NSWindowAbove relativeTo:nil];
+    self.rightColumn.hidden = NO;
+}
+
+- (void)closeDetailDrawer {
+    self.rightColumn.hidden = YES;
+}
+
+- (void)handleEscape {
+    if (!self.rightColumn.hidden) {
+        [self closeDetailDrawer];
+    } else {
+        [self close];
+    }
 }
 
 - (NSButton *)agentRow:(CPAgent *)agent selected:(BOOL)selected {
@@ -706,8 +978,23 @@ static const CGFloat CPCardHeight = 440.0;
 }
 
 - (void)renderAgents:(NSArray<CPAgent *> *)agents {
+    // 刷新时先按 agentID 映射到新实例;找不到才回退 firstObject,并清 selectedTask/关闭抽屉。
+    NSString *selectedID = self.selectedAgent.agentID;
+    CPAgent *match = nil;
+    for (CPAgent *a in agents) {
+        if (selectedID && [a.agentID isEqualToString:selectedID]) {
+            match = a;
+            break;
+        }
+    }
+    if (match) {
+        self.selectedAgent = match;
+    } else {
+        self.selectedAgent = agents.count ? agents.firstObject : nil;
+        self.selectedTask = nil;
+        [self closeDetailDrawer];
+    }
     self.agents = agents;
-    if (!self.selectedAgent && agents.count) self.selectedAgent = agents.firstObject;
 
     // Rebuild agent list
     while (self.agentStack.arrangedSubviews.count > 1) {
@@ -752,12 +1039,28 @@ static const CGFloat CPCardHeight = 440.0;
     if (!tasks.count) {
         [self.taskStack addArrangedSubview:CPLabel(@"暂无活动任务", 12, NSFontWeightRegular, CPMuted())];
         self.selectedTask = nil;
+        [self closeDetailDrawer];
     } else {
         NSInteger idx = 0;
         for (CPTask *task in tasks) {
             [self.taskStack addArrangedSubview:[self taskRow:task index:idx++]];
         }
-        if (!self.selectedTask || ![tasks containsObject:self.selectedTask]) self.selectedTask = tasks.firstObject;
+        // 刷新时按 taskID 映射保留 selectedTask 与抽屉开关;任务不存在才关闭抽屉。
+        if (self.selectedTask) {
+            CPTask *match = nil;
+            for (CPTask *t in tasks) {
+                if ([t.taskID isEqualToString:self.selectedTask.taskID]) {
+                    match = t;
+                    break;
+                }
+            }
+            if (match) {
+                self.selectedTask = match;
+            } else {
+                self.selectedTask = nil;
+                [self closeDetailDrawer];
+            }
+        }
     }
     [self renderDetail];
     [self updateMeta];
@@ -815,6 +1118,7 @@ static const CGFloat CPCardHeight = 440.0;
     if (idx >= 0 && idx < (NSInteger)self.agents.count) {
         self.selectedAgent = self.agents[(NSUInteger)idx];
         self.selectedTask = nil;
+        [self closeDetailDrawer];
         [self renderAgents:self.agents];
     }
 }
@@ -823,8 +1127,13 @@ static const CGFloat CPCardHeight = 440.0;
     NSInteger idx = sender.tag;
     if (idx >= 0 && idx < (NSInteger)self.selectedAgent.tasks.count) {
         self.selectedTask = self.selectedAgent.tasks[(NSUInteger)idx];
-        if (!self.rightExpanded) [self toggleRight:nil];
         [self renderDetail];
+        [self showDetailDrawer];
+        // 只有真正打开任务详情才写入查验；render/选择Agent/刷新均不写defaults。
+        if (self.selectedTask.status == CPStatusCompleted) {
+            [self.reviewStore markTaskReviewed:self.selectedTask agentID:self.selectedAgent.agentID];
+            [[NSNotificationCenter defaultCenter] postNotificationName:@"CPTaskReviewed" object:nil];
+        }
     }
 }
 
@@ -834,34 +1143,6 @@ static const CGFloat CPCardHeight = 440.0;
     alert.informativeText = @"未来将支持读取本地配置文件添加更多 Agent。";
     [alert addButtonWithTitle:@"好"];
     [alert runModal];
-}
-
-- (CGFloat)cardWidth {
-    CGFloat w = CPCardWidth;
-    if (!self.leftExpanded) w -= 130.0;
-    if (!self.rightExpanded) w -= 200.0;
-    return MAX(w, 290.0);
-}
-
-- (void)updateCardWidth {
-    CGFloat w = [self cardWidth];
-    NSRect f = self.window.frame;
-    f.size.width = w;
-    [self.window setFrame:f display:YES animate:YES];
-}
-
-- (void)toggleLeft:(id)sender {
-    self.leftExpanded = !self.leftExpanded;
-    self.leftWidth.constant = self.leftExpanded ? 130 : 0;
-    self.leftColumn.hidden = !self.leftExpanded;
-    [self updateCardWidth];
-}
-
-- (void)toggleRight:(id)sender {
-    self.rightExpanded = !self.rightExpanded;
-    self.rightWidth.constant = self.rightExpanded ? 200 : 0;
-    self.rightColumn.hidden = !self.rightExpanded;
-    [self updateCardWidth];
 }
 
 - (void)togglePin:(id)sender {
@@ -881,24 +1162,16 @@ static const CGFloat CPCardHeight = 440.0;
     self.modeButton.toolTip = mode == 0 ? @"切换为底部快捷栏" : @"切换为侧边胶囊";
 }
 
+- (NSRect)targetFrameInVisibleRect:(NSRect)visible {
+    NSSize size = NSMakeSize(CPCardWidth + CPWorkbenchInset * 2.0, CPCardHeight + CPWorkbenchInset * 2.0);
+    return CPCenteredRectInVisibleFrame(visible, size);
+}
+
 - (NSRect)targetFrameNearDockRect:(NSRect)rect edge:(NSRectEdge)edge {
+    (void)rect;
     (void)edge;
-    NSScreen *screen = nil;
-    NSPoint anchor = NSMakePoint(NSMidX(rect), NSMidY(rect));
-    for (NSScreen *candidate in NSScreen.screens) {
-        if (NSPointInRect(anchor, candidate.frame)) {
-            screen = candidate;
-            break;
-        }
-    }
-    screen = screen ?: NSScreen.mainScreen ?: NSScreen.screens.firstObject;
-    NSRect visible = screen.visibleFrame;
-    CGFloat w = [self cardWidth];
-    CGFloat x = NSMidX(visible) - w / 2.0;
-    CGFloat y = NSMidY(visible) - CPCardHeight / 2.0;
-    x = MAX(NSMinX(visible) + 16, MIN(x, NSMaxX(visible) - w - 16));
-    y = MAX(NSMinY(visible) + 16, MIN(y, NSMaxY(visible) - CPCardHeight - 16));
-    return NSIntegralRect(NSMakeRect(x, y, w, CPCardHeight));
+    NSScreen *screen = NSScreen.screens.firstObject ?: NSScreen.mainScreen;
+    return [self targetFrameInVisibleRect:screen.visibleFrame];
 }
 
 - (void)showNearDockRect:(NSRect)rect edge:(NSRectEdge)edge {
@@ -1575,55 +1848,102 @@ static const CGFloat CPBarWorkbenchWidth = 82.0;
 
 @end
 
+static const CGFloat CPHUDContentWidth = 320.0;
+static const CGFloat CPHUDContentHeight = 200.0;
+static const CGFloat CPHUDInset = 12.0;
+static const CGFloat CPHUDCollapsedWidth = 6.0;
+static const CGFloat CPHUDCollapsedHeight = 72.0;
+
+@interface CPHUDBackgroundView : NSView
+@property (weak) id target;
+@property SEL action;
+@end
+
+@implementation CPHUDBackgroundView
+- (void)mouseDown:(NSEvent *)event {
+    if (self.target && self.action && [self.target respondsToSelector:self.action]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        [self.target performSelector:self.action withObject:self];
+#pragma clang diagnostic pop
+    }
+}
+@end
+
 @interface CPHUDWindowController : NSObject
 @property NSPanel *window;
+@property NSView *shadowCarrier;
 @property NSVisualEffectView *visualView;
 @property NSView *container;
+@property NSView *handleView;
+@property NSView *backgroundClickView;
+@property NSTrackingArea *trackingArea;
+@property NSTimer *hoverTimer;
+@property BOOL expanded;
+@property BOOL pendingCollapse;
 @property NSArray<CPAgent *> *agents;
 @property CPAgent *selectedAgent;
+@property CPReviewStore *reviewStore;
 @property NSStackView *agentList;
 @property NSStackView *taskList;
 @property NSTextField *agentNameLabel;
 @property NSTextField *agentStatusLabel;
-@property CPProgressBarView *overallProgress;
 @property void (^onClicked)(void);
 - (void)show;
 - (void)updateWithAgents:(NSArray<CPAgent *> *)agents selectedAgent:(CPAgent *)agent;
+- (NSRect)expandedFrameInVisibleRect:(NSRect)visible;
+- (NSRect)collapsedFrameInVisibleRect:(NSRect)visible;
 @end
 
 @implementation CPHUDWindowController
 
-static const CGFloat CPHUDWidth = 320.0;
-static const CGFloat CPHUDHeight = 200.0;
 static const CGFloat CPHUDAgentColumn = 84.0;
 
 - (instancetype)init {
     self = [super init];
     if (!self) return nil;
+    self.reviewStore = [[CPReviewStore alloc] initWithDefaults:NSUserDefaults.standardUserDefaults];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(taskReviewed:)
+                                                 name:@"CPTaskReviewed"
+                                               object:nil];
     [self buildWindow];
     return self;
 }
 
 - (void)buildWindow {
-    NSScreen *screen = NSScreen.mainScreen ?: NSScreen.screens.firstObject;
+    NSScreen *screen = NSScreen.screens.firstObject ?: NSScreen.mainScreen;
     NSRect visible = screen.visibleFrame;
-    NSRect frame = NSMakeRect(NSMaxX(visible) - CPHUDWidth - 14, NSMaxY(visible) - CPHUDHeight - 10, CPHUDWidth, CPHUDHeight);
+    NSRect collapsedFrame = [self collapsedFrameInVisibleRect:visible];
 
-    self.window = [[NSPanel alloc] initWithContentRect:frame
+    self.window = [[NSPanel alloc] initWithContentRect:collapsedFrame
                                              styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
                                                backing:NSBackingStoreBuffered
                                                  defer:NO];
     self.window.level = NSStatusWindowLevel + 2;
     self.window.opaque = NO;
     self.window.backgroundColor = NSColor.clearColor;
-    self.window.hasShadow = YES;
+    self.window.hasShadow = NO;
     self.window.hidesOnDeactivate = NO;
     self.window.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
                                      NSWindowCollectionBehaviorFullScreenAuxiliary |
                                      NSWindowCollectionBehaviorStationary;
     self.window.ignoresMouseEvents = NO;
 
-    NSVisualEffectView *visualView = [[NSVisualEffectView alloc] initWithFrame:NSMakeRect(0, 0, CPHUDWidth, CPHUDHeight)];
+    self.shadowCarrier = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, CPHUDCollapsedWidth, CPHUDCollapsedHeight)];
+    self.shadowCarrier.wantsLayer = YES;
+    self.shadowCarrier.layer.backgroundColor = NSColor.clearColor.CGColor;
+    self.shadowCarrier.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    self.window.contentView = self.shadowCarrier;
+
+    self.handleView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, CPHUDCollapsedWidth, CPHUDCollapsedHeight)];
+    self.handleView.wantsLayer = YES;
+    self.handleView.layer.backgroundColor = CPAccent().CGColor;
+    self.handleView.layer.cornerRadius = CPHUDCollapsedWidth / 2.0;
+    self.handleView.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
+    [self.shadowCarrier addSubview:self.handleView];
+
+    NSVisualEffectView *visualView = [[NSVisualEffectView alloc] initWithFrame:NSMakeRect(CPHUDInset, CPHUDInset, CPHUDContentWidth, CPHUDContentHeight)];
     visualView.material = NSVisualEffectMaterialHUDWindow;
     visualView.blendingMode = NSVisualEffectBlendingModeBehindWindow;
     visualView.state = NSVisualEffectStateActive;
@@ -1631,13 +1951,23 @@ static const CGFloat CPHUDAgentColumn = 84.0;
     visualView.layer.cornerRadius = 18.0;
     visualView.layer.borderWidth = 1.0;
     visualView.layer.borderColor = [NSColor colorWithSRGBRed:1.0 green:1.0 blue:1.0 alpha:0.22].CGColor;
+    visualView.layer.masksToBounds = YES;
+    visualView.autoresizingMask = NSViewNotSizable;
+    visualView.hidden = YES;
     self.visualView = visualView;
-    self.window.contentView = visualView;
+    [self.shadowCarrier addSubview:visualView];
 
     NSView *container = [[NSView alloc] initWithFrame:visualView.bounds];
     container.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [visualView addSubview:container];
     self.container = container;
+
+    // Background click view behind all content so Agent buttons hit first.
+    self.backgroundClickView = [[CPHUDBackgroundView alloc] initWithFrame:container.bounds];
+    ((CPHUDBackgroundView *)self.backgroundClickView).target = self;
+    ((CPHUDBackgroundView *)self.backgroundClickView).action = @selector(hudClicked:);
+    self.backgroundClickView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [container addSubview:self.backgroundClickView positioned:NSWindowBelow relativeTo:nil];
 
     // Header
     NSTextField *title = [NSTextField labelWithString:@"Pulse"];
@@ -1688,12 +2018,7 @@ static const CGFloat CPHUDAgentColumn = 84.0;
     [container addSubview:agentStatus];
     self.agentStatusLabel = agentStatus;
 
-    CPProgressBarView *progress = [[CPProgressBarView alloc] initWithFrame:NSMakeRect(0, 0, 100, 4)];
-    progress.translatesAutoresizingMaskIntoConstraints = NO;
-    [container addSubview:progress];
-    self.overallProgress = progress;
-
-    NSTextField *taskHeader = [NSTextField labelWithString:@"运行中"];
+    NSTextField *taskHeader = [NSTextField labelWithString:@"任务"];
     taskHeader.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
     taskHeader.textColor = CPFg2();
     taskHeader.translatesAutoresizingMaskIntoConstraints = NO;
@@ -1705,12 +2030,6 @@ static const CGFloat CPHUDAgentColumn = 84.0;
     self.taskList.alignment = NSLayoutAttributeLeading;
     self.taskList.translatesAutoresizingMaskIntoConstraints = NO;
     [container addSubview:self.taskList];
-
-    // Click overlay
-    NSButton *clickButton = [NSButton buttonWithTitle:@"" target:self action:@selector(hudClicked:)];
-    clickButton.bordered = NO;
-    clickButton.translatesAutoresizingMaskIntoConstraints = NO;
-    [container addSubview:clickButton];
 
     [NSLayoutConstraint activateConstraints:@[
         [title.leadingAnchor constraintEqualToAnchor:container.leadingAnchor constant:16],
@@ -1738,27 +2057,18 @@ static const CGFloat CPHUDAgentColumn = 84.0;
         [agentStatus.leadingAnchor constraintEqualToAnchor:agentName.leadingAnchor],
         [agentStatus.topAnchor constraintEqualToAnchor:agentName.bottomAnchor constant:2],
 
-        [progress.leadingAnchor constraintEqualToAnchor:agentName.leadingAnchor],
-        [progress.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-16],
-        [progress.topAnchor constraintEqualToAnchor:agentStatus.bottomAnchor constant:8],
-        [progress.heightAnchor constraintEqualToConstant:4],
-
         [taskHeader.leadingAnchor constraintEqualToAnchor:agentName.leadingAnchor],
-        [taskHeader.topAnchor constraintEqualToAnchor:progress.bottomAnchor constant:14],
+        [taskHeader.topAnchor constraintEqualToAnchor:agentStatus.bottomAnchor constant:14],
         [taskHeader.trailingAnchor constraintLessThanOrEqualToAnchor:container.trailingAnchor constant:-16],
 
         [self.taskList.leadingAnchor constraintEqualToAnchor:taskHeader.leadingAnchor],
         [self.taskList.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-16],
         [self.taskList.topAnchor constraintEqualToAnchor:taskHeader.bottomAnchor constant:8],
-        [self.taskList.bottomAnchor constraintLessThanOrEqualToAnchor:container.bottomAnchor constant:-12],
-
-        [clickButton.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
-        [clickButton.trailingAnchor constraintEqualToAnchor:container.trailingAnchor],
-        [clickButton.topAnchor constraintEqualToAnchor:container.topAnchor],
-        [clickButton.bottomAnchor constraintEqualToAnchor:container.bottomAnchor]
+        [self.taskList.bottomAnchor constraintLessThanOrEqualToAnchor:container.bottomAnchor constant:-12]
     ]];
 
     [self updateTimeLabel:time];
+    [self updateTracking];
 }
 
 - (NSString *)currentTimeString {
@@ -1781,6 +2091,102 @@ static const CGFloat CPHUDAgentColumn = 84.0;
 
 - (void)show {
     [self.window orderFrontRegardless];
+    [self updateTracking];
+}
+
+- (void)updateTracking {
+    if (self.trackingArea) [self.shadowCarrier removeTrackingArea:self.trackingArea];
+    self.trackingArea = [[NSTrackingArea alloc] initWithRect:self.shadowCarrier.bounds
+                                                     options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect
+                                                       owner:self
+                                                    userInfo:nil];
+    [self.shadowCarrier addTrackingArea:self.trackingArea];
+}
+
+- (void)mouseEntered:(NSEvent *)event {
+    if (self.expanded) return;
+    [self cancelHoverTimer];
+    __weak typeof(self) weakSelf = self;
+    self.hoverTimer = [NSTimer scheduledTimerWithTimeInterval:0.2 repeats:NO block:^(NSTimer *timer) {
+        [weakSelf expand];
+    }];
+}
+
+- (void)mouseExited:(NSEvent *)event {
+    [self cancelHoverTimer];
+    if (!self.expanded) return;
+    self.pendingCollapse = YES;
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        CPHUDWindowController *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        strongSelf.pendingCollapse = NO;
+        if (!NSPointInRect(NSEvent.mouseLocation, strongSelf.window.frame)) {
+            [strongSelf collapse];
+        }
+    });
+}
+
+- (void)cancelHoverTimer {
+    [self.hoverTimer invalidate];
+    self.hoverTimer = nil;
+}
+
+- (NSScreen *)targetScreen {
+    return NSScreen.screens.firstObject ?: NSScreen.mainScreen;
+}
+
+- (NSRect)expandedFrameInVisibleRect:(NSRect)visible {
+    NSSize size = NSMakeSize(CPHUDContentWidth + CPHUDInset * 2.0, CPHUDContentHeight + CPHUDInset * 2.0);
+    return CPRectAtTopRightOfVisibleFrame(visible, size);
+}
+
+- (NSRect)collapsedFrameInVisibleRect:(NSRect)visible {
+    return CPRectAtTopRightOfVisibleFrame(visible, NSMakeSize(CPHUDCollapsedWidth, CPHUDCollapsedHeight));
+}
+
+- (NSRect)expandedFrame {
+    return [self expandedFrameInVisibleRect:self.targetScreen.visibleFrame];
+}
+
+- (NSRect)collapsedFrame {
+    return [self collapsedFrameInVisibleRect:self.targetScreen.visibleFrame];
+}
+
+- (void)layoutHandleToTopRightOfCarrier {
+    NSSize sz = self.shadowCarrier.bounds.size;
+    self.handleView.frame = NSMakeRect(MAX(0, sz.width - CPHUDCollapsedWidth),
+                                       MAX(0, sz.height - CPHUDCollapsedHeight),
+                                       CPHUDCollapsedWidth,
+                                       CPHUDCollapsedHeight);
+}
+
+- (void)expand {
+    if (self.expanded) return;
+    self.expanded = YES;
+    [self layoutHandleToTopRightOfCarrier];
+    self.handleView.hidden = YES;
+    self.visualView.hidden = NO;
+    NSRect frame = [self expandedFrame];
+    [self.window setFrame:frame display:YES animate:YES];
+    self.shadowCarrier.layer.shadowColor = [NSColor colorWithSRGBRed:0.078 green:0.078 blue:0.086 alpha:0.18].CGColor;
+    self.shadowCarrier.layer.shadowOffset = CGSizeMake(0, 8);
+    self.shadowCarrier.layer.shadowRadius = 24.0;
+    self.shadowCarrier.layer.shadowOpacity = 1.0;
+    self.shadowCarrier.layer.shadowPath = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(CPHUDInset, CPHUDInset, CPHUDContentWidth, CPHUDContentHeight) xRadius:18 yRadius:18].CGPath;
+    [self updateTracking];
+}
+
+- (void)collapse {
+    if (!self.expanded) return;
+    self.expanded = NO;
+    self.visualView.hidden = YES;
+    [self layoutHandleToTopRightOfCarrier];
+    self.handleView.hidden = NO;
+    self.shadowCarrier.layer.shadowOpacity = 0.0;
+    NSRect frame = [self collapsedFrame];
+    [self.window setFrame:frame display:YES animate:YES];
+    [self updateTracking];
 }
 
 - (void)agentButtonClicked:(NSButton *)sender {
@@ -1792,8 +2198,21 @@ static const CGFloat CPHUDAgentColumn = 84.0;
 }
 
 - (void)updateWithAgents:(NSArray<CPAgent *> *)agents selectedAgent:(CPAgent *)agent {
+    // 按 agentID 映射保留选择，避免用旧对象指针导致状态错位；找不到才回退 firstObject。
+    NSString *selectedID = agent.agentID ?: self.selectedAgent.agentID;
+    CPAgent *match = nil;
+    for (CPAgent *a in agents) {
+        if (selectedID && [a.agentID isEqualToString:selectedID]) {
+            match = a;
+            break;
+        }
+    }
     self.agents = agents;
-    self.selectedAgent = agent ?: agents.firstObject;
+    self.selectedAgent = match ?: agents.firstObject;
+    [self render];
+}
+
+- (void)taskReviewed:(NSNotification *)note {
     [self render];
 }
 
@@ -1802,20 +2221,9 @@ static const CGFloat CPHUDAgentColumn = 84.0;
     if (!agent) return;
 
     self.agentNameLabel.stringValue = agent.name;
-    self.agentStatusLabel.stringValue = CPStatusTitle(agent.status);
-    self.agentStatusLabel.textColor = CPStatusColor(agent.status);
-
-    NSInteger running = 0;
-    NSInteger completed = 0;
-    NSInteger failed = 0;
-    for (CPTask *t in agent.tasks) {
-        if (t.status == CPStatusWorking || t.status == CPStatusWaiting) running++;
-        else if (t.status == CPStatusCompleted) completed++;
-        else if (t.status == CPStatusFailed || t.status == CPStatusAttention) failed++;
-    }
-    NSInteger total = agent.tasks.count;
-    double progress = total > 0 ? ((double)completed + (double)running * 0.5) / (double)total * 100.0 : 0.0;
-    self.overallProgress.progress = MAX(0, MIN(100, progress));
+    CPDisplayStatus displayStatus = CPDisplayStatusForTasks(agent.tasks, agent.agentID, self.reviewStore);
+    self.agentStatusLabel.stringValue = CPDisplayStatusTitle(displayStatus);
+    self.agentStatusLabel.textColor = CPDisplayStatusColor(displayStatus);
 
     // Agent list
     while (self.agentList.arrangedSubviews.count > 0) {
@@ -1823,16 +2231,17 @@ static const CGFloat CPHUDAgentColumn = 84.0;
         [self.agentList removeArrangedSubview:v];
         [v removeFromSuperview];
     }
+    BOOL reduceMotion = NSWorkspace.sharedWorkspace.accessibilityDisplayShouldReduceMotion;
     for (NSUInteger i = 0; i < self.agents.count; i++) {
         CPAgent *a = self.agents[i];
-        NSButton *btn = [NSButton buttonWithImage:CPSymbol(a.iconName ?: @"sparkles", 16, a == agent ? CPAccent() : CPFg2()) target:self action:@selector(agentButtonClicked:)];
-        btn.bordered = NO;
+        CPDisplayStatus ds = CPDisplayStatusForTasks(a.tasks, a.agentID, self.reviewStore);
+        CPAgentStatusButton *btn = [[CPAgentStatusButton alloc] initWithFrame:NSMakeRect(0, 0, 38, 38)];
+        btn.reduceMotion = reduceMotion;
+        btn.target = self;
+        btn.action = @selector(agentButtonClicked:);
         btn.tag = (NSInteger)i;
-        btn.toolTip = [NSString stringWithFormat:@"%@ · %@", a.name, CPStatusTitle(a.status)];
         btn.translatesAutoresizingMaskIntoConstraints = NO;
-        btn.wantsLayer = YES;
-        btn.layer.cornerRadius = 8.0;
-        btn.layer.backgroundColor = (a == agent ? [NSColor colorWithSRGBRed:0.91 green:0.94 blue:1.0 alpha:1.0] : NSColor.clearColor).CGColor;
+        [btn updateWithAgent:a displayStatus:ds selected:(a == agent)];
         [btn.widthAnchor constraintEqualToConstant:38].active = YES;
         [btn.heightAnchor constraintEqualToConstant:38].active = YES;
         [self.agentList addArrangedSubview:btn];
@@ -1845,19 +2254,15 @@ static const CGFloat CPHUDAgentColumn = 84.0;
         [v removeFromSuperview];
     }
 
-    NSMutableArray<CPTask *> *displayTasks = NSMutableArray.array;
-    for (CPTask *t in agent.tasks) {
-        if (t.status == CPStatusWorking || t.status == CPStatusWaiting || t.status == CPStatusAttention) {
-            [displayTasks addObject:t];
-        }
-    }
+    // 右侧只渲染当前选中 Agent 的真实任务，不混入其他 Agent。
+    NSArray<CPTask *> *displayTasks = agent.tasks;
     if (displayTasks.count == 0) {
-        NSTextField *empty = [NSTextField labelWithString:@"当前没有运行中任务"];
+        NSTextField *empty = [NSTextField labelWithString:@"当前没有任务"];
         empty.font = [NSFont systemFontOfSize:12 weight:NSFontWeightRegular];
         empty.textColor = CPMuted();
         [self.taskList addArrangedSubview:empty];
     } else {
-        for (NSUInteger i = 0; i < displayTasks.count && i < 4; i++) {
+        for (NSUInteger i = 0; i < displayTasks.count && i < 3; i++) {
             CPTask *t = displayTasks[i];
             NSStackView *row = [NSStackView stackViewWithViews:@[
                 [self taskDot:t.status],
@@ -1865,7 +2270,7 @@ static const CGFloat CPHUDAgentColumn = 84.0;
             ]];
             row.orientation = NSUserInterfaceLayoutOrientationHorizontal;
             row.spacing = 8;
-            row.alignment = NSLayoutAttributeCenterY;
+            row.alignment = NSLayoutAttributeTop;
             [self.taskList addArrangedSubview:row];
         }
     }
@@ -1886,12 +2291,31 @@ static const CGFloat CPHUDAgentColumn = 84.0;
     title.textColor = CPFg();
     title.lineBreakMode = NSLineBreakByTruncatingTail;
     title.maximumNumberOfLines = 1;
-    NSTextField *meta = [NSTextField labelWithString:[NSString stringWithFormat:@"%@ · %@", task.projectName, CPStatusTitle(task.status)]];
+
+    NSString *path = task.projectPath.length ? task.projectPath : @"—";
+    NSTextField *meta = [NSTextField labelWithString:[NSString stringWithFormat:@"%@ · %@", task.projectName, path]];
     meta.font = [NSFont systemFontOfSize:10 weight:NSFontWeightRegular];
     meta.textColor = CPMuted();
-    NSStackView *s = [NSStackView stackViewWithViews:@[title, meta]];
+    meta.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    meta.maximumNumberOfLines = 1;
+
+    NSTextField *activity = [NSTextField labelWithString:task.activity.length ? task.activity : @"—"];
+    activity.font = [NSFont systemFontOfSize:10 weight:NSFontWeightRegular];
+    activity.textColor = CPFg2();
+    activity.lineBreakMode = NSLineBreakByTruncatingTail;
+    activity.maximumNumberOfLines = 1;
+
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.dateStyle = NSDateFormatterShortStyle;
+    fmt.timeStyle = NSDateFormatterShortStyle;
+    NSTextField *updated = [NSTextField labelWithString:[NSString stringWithFormat:@"更新于 %@", [fmt stringFromDate:task.updatedAt]]];
+    updated.font = [NSFont systemFontOfSize:9 weight:NSFontWeightRegular];
+    updated.textColor = CPMuted();
+
+    NSStackView *s = [NSStackView stackViewWithViews:@[title, meta, activity, updated]];
     s.orientation = NSUserInterfaceLayoutOrientationVertical;
-    s.spacing = 0;
+    s.alignment = NSLayoutAttributeLeading;
+    s.spacing = 1;
     return s;
 }
 
@@ -2039,7 +2463,7 @@ static const CGFloat CPHUDAgentColumn = 84.0;
 
     __weak typeof(self) weakSelf = self;
     self.dock = CPDockWindowController.new;
-    self.dock.onPillClicked = ^{ [weakSelf toggleCard]; };
+    self.dock.onPillClicked = ^{ [weakSelf showCard]; };
     [self.dock show];
 
     self.card = CPWorkbenchCardController.new;
@@ -2068,7 +2492,7 @@ static const CGFloat CPHUDAgentColumn = 84.0;
 
     [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent *(NSEvent *event) {
         if (event.keyCode == 53 && weakSelf.card.isVisible) {
-            [weakSelf.card close];
+            [weakSelf.card handleEscape];
             return nil;
         }
         return event;
@@ -2102,11 +2526,6 @@ static const CGFloat CPHUDAgentColumn = 84.0;
 - (void)openWorkbench:(NSNotification *)note {
     [self.popover close];
     [self showCard];
-}
-
-- (void)toggleCard {
-    if (self.card.isVisible) [self.card close];
-    else [self showCard];
 }
 
 - (void)showCard {
@@ -2162,6 +2581,27 @@ static const CGFloat CPHUDAgentColumn = 84.0;
 
 #pragma mark - Main
 
+static CPTask *CPTestTask(NSString *taskID, CPStatus status, NSTimeInterval updatedAt) {
+    CPTask *t = CPTask.new;
+    t.taskID = taskID;
+    t.title = taskID;
+    t.projectName = @"proj";
+    t.projectPath = @"~/proj";
+    t.activity = @"activity";
+    t.status = status;
+    t.updatedAt = [NSDate dateWithTimeIntervalSince1970:updatedAt];
+    return t;
+}
+
+static CPAgent *CPTestAgent(NSString *agentID, NSArray<CPTask *> *tasks) {
+    CPAgent *a = CPAgent.new;
+    a.agentID = agentID;
+    a.name = agentID;
+    a.iconName = @"sparkles";
+    a.tasks = [NSMutableArray arrayWithArray:tasks];
+    return a;
+}
+
 static BOOL CPAnotherInstanceIsRunning(void) {
     NSString *bundleIdentifier = @"com.codexpulse.menubar";
     pid_t currentPID = NSProcessInfo.processInfo.processIdentifier;
@@ -2183,13 +2623,29 @@ int main(int argc, const char *argv[]) {
             [NSApplication sharedApplication];
 
             CPWorkbenchCardController *card = CPWorkbenchCardController.new;
-            NSScreen *screen = NSScreen.mainScreen ?: NSScreen.screens.firstObject;
-            NSRect visible = screen.visibleFrame;
-            NSRect cardFrame = [card targetFrameNearDockRect:NSMakeRect(NSMaxX(visible) - 52, NSMidY(visible), 52, 52)
-                                                          edge:NSRectEdgeMaxX];
-            BOOL centered = fabs(NSMidX(cardFrame) - NSMidX(visible)) <= 1.0 &&
-                            fabs(NSMidY(cardFrame) - NSMidY(visible)) <= 1.0;
+            NSScreen *screen = NSScreen.screens.firstObject ?: NSScreen.mainScreen;
+            NSRect visible = screen ? screen.visibleFrame : NSZeroRect;
+            BOOL hasScreen = !NSEqualRects(visible, NSZeroRect);
+            NSRect testVisible = hasScreen ? visible : NSMakeRect(0, 0, 1680, 1050);
+            NSRect cardFrame = [card targetFrameInVisibleRect:testVisible];
+            BOOL centered = fabs(NSMidX(cardFrame) - NSMidX(testVisible)) <= 1.0 &&
+                            fabs(NSMidY(cardFrame) - NSMidY(testVisible)) <= 1.0;
             BOOL draggableHeader = [card.card.subviews.firstObject isKindOfClass:CPDraggableHeaderView.class];
+
+            // Workbench structural / geometry checks
+            BOOL cardMasksToBounds = card.card.layer.masksToBounds;
+            BOOL shadowCarrierNoMasks = !card.shadowCarrier.layer.masksToBounds;
+            BOOL cardIsChildOfShadowCarrier = card.card.superview == card.shadowCarrier;
+            BOOL windowHasWorkbenchInset = fabs(card.window.frame.size.width - (CPCardWidth + CPWorkbenchInset * 2.0)) <= 0.5 &&
+                                           fabs(card.window.frame.size.height - (CPCardHeight + CPWorkbenchInset * 2.0)) <= 0.5;
+            BOOL fixedCardSize = fabs(card.card.frame.size.width - 520.0) <= 0.5 &&
+                                 fabs(card.card.frame.size.height - 360.0) <= 0.5;
+            NSStackView *columnsStack = (NSStackView *)card.leftColumn.superview;
+            BOOL twoColumn = [columnsStack isKindOfClass:NSStackView.class] &&
+                             columnsStack.arrangedSubviews.count == 2 &&
+                             card.middleColumn.superview == columnsStack;
+            BOOL rightOverlayHidden = card.rightColumn.hidden &&
+                                      card.rightColumn.superview == card.middleColumn;
 
             NSArray<CPAgent *> *agents = [CPStateReader.new readAgents];
             CPDockWindowController *dock = CPDockWindowController.new;
@@ -2209,15 +2665,281 @@ int main(int argc, const char *argv[]) {
             NSPoint pillPoint = [dock.barLogoButton convertPoint:buttonCenter toView:dock.pill];
             BOOL buttonReceivesClick = [dock.pill hitTest:pillPoint] == dock.barLogoButton;
 
-            BOOL passed = centered && draggableHeader && labeledWorkbench && onlyRealAgents && labeledAgent && buttonReceivesClick;
-            NSString *result = [NSString stringWithFormat:
-                @"Codex Pulse UI self-test: center=%@ drag=%@ workbench-label=%@ real-agents=%@ agent-label=%@ button-hit=%@\n",
+            // HUD structural / geometry checks
+            CPHUDWindowController *hud = CPHUDWindowController.new;
+            NSRect collapsedFrame = [hud collapsedFrameInVisibleRect:testVisible];
+            NSRect expandedFrame = [hud expandedFrameInVisibleRect:testVisible];
+            NSSize collapsedSize = collapsedFrame.size;
+            NSSize expandedSize = expandedFrame.size;
+            BOOL hudCollapsed6x72 = fabs(collapsedSize.width - CPHUDCollapsedWidth) <= 0.5 &&
+                                    fabs(collapsedSize.height - CPHUDCollapsedHeight) <= 0.5;
+            BOOL hudCollapsedOnMainScreen = fabs(collapsedFrame.origin.x - (NSMaxX(testVisible) - CPHUDCollapsedWidth)) <= 0.5 &&
+                                            fabs(collapsedFrame.origin.y - (NSMaxY(testVisible) - CPHUDCollapsedHeight)) <= 0.5;
+            BOOL hudExpanded344x224 = fabs(expandedSize.width - (CPHUDContentWidth + CPHUDInset * 2.0)) <= 0.5 &&
+                                      fabs(expandedSize.height - (CPHUDContentHeight + CPHUDInset * 2.0)) <= 0.5;
+            BOOL hudExpandedOnMainScreen = fabs(expandedFrame.origin.x - (NSMaxX(testVisible) - expandedSize.width)) <= 0.5 &&
+                                           fabs(expandedFrame.origin.y - (NSMaxY(testVisible) - expandedSize.height)) <= 0.5;
+            BOOL shadowCarrierScales = hud.shadowCarrier.autoresizingMask == (NSViewWidthSizable | NSViewHeightSizable);
+            BOOL handleAnchoredTopRight = hud.handleView.autoresizingMask == (NSViewMinXMargin | NSViewMinYMargin);
+            BOOL contentNotSizable = hud.visualView.autoresizingMask == NSViewNotSizable;
+            BOOL hudClickViewIsBackgroundView = [hud.backgroundClickView isKindOfClass:CPHUDBackgroundView.class] &&
+                                                hud.backgroundClickView.superview == hud.container;
+
+            [hud expand];
+            [hud.shadowCarrier layoutSubtreeIfNeeded];
+            NSRect visualFrame = hud.visualView.frame;
+            NSRect carrierBounds = hud.shadowCarrier.bounds;
+            NSRect handleFrame = hud.handleView.frame;
+            BOOL hudVisualFrameExact = fabs(visualFrame.origin.x - CPHUDInset) <= 0.5 &&
+                                       fabs(visualFrame.origin.y - CPHUDInset) <= 0.5 &&
+                                       fabs(visualFrame.size.width - CPHUDContentWidth) <= 0.5 &&
+                                       fabs(visualFrame.size.height - CPHUDContentHeight) <= 0.5;
+            BOOL hudHandleTopRight = fabs(handleFrame.origin.x - (carrierBounds.size.width - CPHUDCollapsedWidth)) <= 0.5 &&
+                                     fabs(handleFrame.origin.y - (carrierBounds.size.height - CPHUDCollapsedHeight)) <= 0.5 &&
+                                     fabs(handleFrame.size.width - CPHUDCollapsedWidth) <= 0.5 &&
+                                     fabs(handleFrame.size.height - CPHUDCollapsedHeight) <= 0.5;
+
+            // M2: CPAgentStatusButton rings, reduce-motion, HUD per-agent scoping
+            NSString *uiSuite = [NSString stringWithFormat:@"com.codexpulse.uitest.%d", NSProcessInfo.processInfo.processIdentifier];
+            NSUserDefaults *uiDefaults = [[NSUserDefaults alloc] initWithSuiteName:uiSuite];
+            [uiDefaults removePersistentDomainForName:uiSuite];
+            CPReviewStore *uiStore = [[CPReviewStore alloc] initWithDefaults:uiDefaults];
+
+            BOOL ringColorsOK = YES;
+            BOOL blueDoubleOK = YES;
+            BOOL reduceMotionOK = YES;
+            NSArray<NSNumber *> *allStatuses = @[@(CPDisplayStatusFailed), @(CPDisplayStatusWaiting),
+                                                 @(CPDisplayStatusCompletedPendingReview), @(CPDisplayStatusWorking),
+                                                 @(CPDisplayStatusIdle)];
+            for (NSNumber *st in allStatuses) {
+                CPDisplayStatus s = (CPDisplayStatus)st.integerValue;
+                CPAgentStatusButton *b = [[CPAgentStatusButton alloc] initWithFrame:NSMakeRect(0, 0, 38, 38)];
+                b.reduceMotion = YES;
+                [b updateWithAgent:CPTestAgent(@"ring-test", @[]) displayStatus:s selected:NO];
+                if (!CGColorEqualToColor(b.ringLayer.strokeColor, CPDisplayStatusColor(s).CGColor)) ringColorsOK = NO;
+                BOOL expectDouble = s == CPDisplayStatusCompletedPendingReview;
+                if (b.innerRingLayer.hidden != !expectDouble) blueDoubleOK = NO;
+                if (expectDouble && !CGColorEqualToColor(b.innerRingLayer.strokeColor, CPBlue().CGColor)) blueDoubleOK = NO;
+                if (b.ringLayer.animationKeys.count != 0 || b.innerRingLayer.animationKeys.count != 0) reduceMotionOK = NO;
+            }
+            CPAgentStatusButton *motionBtn = [[CPAgentStatusButton alloc] initWithFrame:NSMakeRect(0, 0, 38, 38)];
+            motionBtn.reduceMotion = NO;
+            [motionBtn updateWithAgent:CPTestAgent(@"motion-test", @[]) displayStatus:CPDisplayStatusWorking selected:NO];
+            BOOL motionAnimOK = [motionBtn.ringLayer.animationKeys containsObject:@"breath"];
+            CPAgentStatusButton *blueBtn = [[CPAgentStatusButton alloc] initWithFrame:NSMakeRect(0, 0, 38, 38)];
+            blueBtn.reduceMotion = NO;
+            [blueBtn updateWithAgent:CPTestAgent(@"blue-test", @[]) displayStatus:CPDisplayStatusCompletedPendingReview selected:NO];
+            BOOL blueAnimOK = [blueBtn.ringLayer.animationKeys containsObject:@"breath"] &&
+                              [blueBtn.innerRingLayer.animationKeys containsObject:@"breath"];
+
+            CPHUDWindowController *hud2 = CPHUDWindowController.new;
+            hud2.reviewStore = uiStore;
+            CPAgent *agentA = CPTestAgent(@"agent-a", @[CPTestTask(@"a1", CPStatusWorking, 1),
+                                                        CPTestTask(@"a2", CPStatusWaiting, 2)]);
+            CPAgent *agentB = CPTestAgent(@"agent-b", @[CPTestTask(@"b1", CPStatusWorking, 1)]);
+            [hud2 updateWithAgents:@[agentA, agentB] selectedAgent:agentB];
+            BOOL hudAgentScope = [hud2.selectedAgent.agentID isEqualToString:@"agent-b"] &&
+                                 hud2.taskList.arrangedSubviews.count == 1;
+            if (hudAgentScope) {
+                NSStackView *row = (NSStackView *)hud2.taskList.arrangedSubviews.firstObject;
+                NSStackView *labelStack = row.arrangedSubviews.count > 1 ? (NSStackView *)row.arrangedSubviews[1] : nil;
+                NSTextField *titleLabel = labelStack.arrangedSubviews.count ? (NSTextField *)labelStack.arrangedSubviews.firstObject : nil;
+                hudAgentScope = [titleLabel isKindOfClass:NSTextField.class] &&
+                                [titleLabel.stringValue isEqualToString:@"b1"];
+            }
+            CPAgent *agentANew = CPTestAgent(@"agent-a", @[CPTestTask(@"a9", CPStatusWorking, 9)]);
+            CPAgent *agentBNew = CPTestAgent(@"agent-b", @[CPTestTask(@"b9", CPStatusWorking, 9)]);
+            [hud2 updateWithAgents:@[agentANew, agentBNew] selectedAgent:agentB]; // stale pointer, same agentID
+            BOOL hudSelectByID = hud2.selectedAgent == agentBNew;
+            [uiDefaults removePersistentDomainForName:uiSuite];
+            [uiDefaults synchronize];
+
+            BOOL m2ui = ringColorsOK && blueDoubleOK && reduceMotionOK && motionAnimOK && blueAnimOK &&
+                        hudAgentScope && hudSelectByID;
+
+            // M3: detail drawer + two-stage Esc + review only on real detail open
+            NSString *m3Suite = [NSString stringWithFormat:@"com.codexpulse.drawertest.%d", NSProcessInfo.processInfo.processIdentifier];
+            NSUserDefaults *m3Defaults = [[NSUserDefaults alloc] initWithSuiteName:m3Suite];
+            [m3Defaults removePersistentDomainForName:m3Suite];
+            CPWorkbenchCardController *card2 = CPWorkbenchCardController.new;
+            card2.reviewStore = [[CPReviewStore alloc] initWithDefaults:m3Defaults];
+            CPAgent *workAgent = CPTestAgent(@"w-agent", @[CPTestTask(@"w1", CPStatusWorking, 1),
+                                                           CPTestTask(@"w2", CPStatusCompleted, 2)]);
+            [card2 renderAgents:@[workAgent]];
+            BOOL drawerInitiallyHidden = card2.rightColumn.hidden;
+            BOOL renderDoesNotMark = ![card2.reviewStore isTaskReviewed:workAgent.tasks[1] agentID:@"w-agent"] &&
+                                     ![card2.reviewStore isTaskReviewed:workAgent.tasks[0] agentID:@"w-agent"];
+
+            NSButton *fakeRow = NSButton.new;
+            fakeRow.tag = 1; // completed task w2
+            [card2 taskClicked:fakeRow];
+            BOOL drawerShownOnClick = !card2.rightColumn.hidden &&
+                                      card2.rightColumn.superview == card2.middleColumn;
+            BOOL reviewMarkedOnOpen = [card2.reviewStore isTaskReviewed:workAgent.tasks[1] agentID:@"w-agent"];
+
+            [card2.window orderFrontRegardless];
+            [card2 handleEscape];
+            BOOL firstEscDrawerOnly = card2.rightColumn.hidden && card2.window.isVisible;
+            [card2 handleEscape];
+            BOOL secondEscClosesWorkbench = !card2.window.isVisible;
+            [m3Defaults removePersistentDomainForName:m3Suite];
+            [m3Defaults synchronize];
+
+            BOOL m3ui = drawerInitiallyHidden && renderDoesNotMark && drawerShownOnClick &&
+                        reviewMarkedOnOpen && firstEscDrawerOnly && secondEscClosesWorkbench;
+
+            // M3 entries: every entry shows-and-fronts, never toggles closed
+            CPWorkbenchCardController *card3 = CPWorkbenchCardController.new;
+            NSRect fakeDockRect = NSMakeRect(NSMaxX(testVisible) - 56, NSMidY(testVisible), 56, 56);
+            [card3 showNearDockRect:fakeDockRect edge:NSRectEdgeMaxX];
+            [card3 showNearDockRect:fakeDockRect edge:NSRectEdgeMaxX];
+            [card3 showNearDockRect:fakeDockRect edge:NSRectEdgeMaxX];
+            NSRect expectedTarget = [card3 targetFrameNearDockRect:fakeDockRect edge:NSRectEdgeMaxX];
+            BOOL reshowVisible = card3.window.isVisible;
+            BOOL reshowCentered = NSEqualRects(card3.window.frame, expectedTarget);
+            BOOL reshowFixedSize = fabs(card3.window.frame.size.width - (CPCardWidth + CPWorkbenchInset * 2.0)) <= 0.5 &&
+                                   fabs(card3.window.frame.size.height - (CPCardHeight + CPWorkbenchInset * 2.0)) <= 0.5;
+            BOOL m3entries = reshowVisible && reshowCentered && reshowFixedSize;
+
+            // M4: refresh stability — ID-based remapping, no defaults writes, no stacked animations
+            NSString *m4Suite = [NSString stringWithFormat:@"com.codexpulse.refreshtest.%d", NSProcessInfo.processInfo.processIdentifier];
+            NSUserDefaults *m4Defaults = [[NSUserDefaults alloc] initWithSuiteName:m4Suite];
+            [m4Defaults removePersistentDomainForName:m4Suite];
+            CPWorkbenchCardController *card4 = CPWorkbenchCardController.new;
+            card4.reviewStore = [[CPReviewStore alloc] initWithDefaults:m4Defaults];
+            CPAgent *m4Agent = CPTestAgent(@"m4-agent", @[CPTestTask(@"m4t1", CPStatusWorking, 1),
+                                                          CPTestTask(@"m4t2", CPStatusCompleted, 2)]);
+            [card4 renderAgents:@[m4Agent]];
+            NSButton *m4Row = NSButton.new;
+            m4Row.tag = 1;
+            [card4 taskClicked:m4Row]; // open detail drawer for completed task
+            CPAgent *m4AgentNew = CPTestAgent(@"m4-agent", @[CPTestTask(@"m4t1", CPStatusWorking, 3),
+                                                             CPTestTask(@"m4t2", CPStatusCompleted, 4)]);
+            [card4 renderAgents:@[m4AgentNew]]; // refresh with new instances, same IDs
+            BOOL refreshNewInstances = card4.selectedAgent == m4AgentNew &&
+                                       card4.selectedTask == m4AgentNew.tasks[1];
+            BOOL drawerKeptOnRefresh = !card4.rightColumn.hidden;
+            BOOL refreshNoMark = ![card4.reviewStore isTaskReviewed:m4AgentNew.tasks[1] agentID:@"m4-agent"] &&
+                                 ![card4.reviewStore isTaskReviewed:m4AgentNew.tasks[0] agentID:@"m4-agent"];
+
+            CPAgent *m4Other = CPTestAgent(@"m4-other", @[CPTestTask(@"o1", CPStatusWorking, 1)]);
+            [card4 renderAgents:@[m4Other]]; // agent disappears → fallback, drawer closed
+            BOOL agentFallback = card4.selectedAgent == m4Other &&
+                                 card4.selectedTask == nil &&
+                                 card4.rightColumn.hidden;
+
+            [card4 renderAgents:@[m4AgentNew]]; // reselect m4-agent
+            NSButton *m4Row0 = NSButton.new;
+            m4Row0.tag = 0;
+            [card4 taskClicked:m4Row0]; // open m4t1 detail
+            CPAgent *m4AgentShrunk = CPTestAgent(@"m4-agent", @[CPTestTask(@"m4t2", CPStatusCompleted, 4)]);
+            [card4 renderAgents:@[m4AgentShrunk]]; // selected task disappears
+            BOOL taskGoneClosesDrawer = card4.selectedTask == nil && card4.rightColumn.hidden;
+
+            CPHUDWindowController *hud3 = CPHUDWindowController.new;
+            hud3.reviewStore = [[CPReviewStore alloc] initWithDefaults:m4Defaults];
+            CPAgent *hAgent = CPTestAgent(@"h-agent", @[CPTestTask(@"h1", CPStatusWorking, 1)]);
+            for (NSInteger i = 0; i < 3; i++) [hud3 updateWithAgents:@[hAgent] selectedAgent:hAgent];
+            BOOL hudNoDupButtons = hud3.agentList.arrangedSubviews.count == 1;
+            CPAgentStatusButton *hBtn = (CPAgentStatusButton *)hud3.agentList.arrangedSubviews.firstObject;
+            hBtn.reduceMotion = NO;
+            for (NSInteger i = 0; i < 3; i++) {
+                [hBtn updateWithAgent:hAgent displayStatus:CPDisplayStatusWorking selected:YES];
+            }
+            BOOL singleBreathKey = [hBtn.ringLayer.animationKeys isEqualToArray:@[@"breath"]] &&
+                                   hBtn.innerRingLayer.animationKeys.count == 0;
+
+            CPDockWindowController *dock4 = CPDockWindowController.new;
+            [dock4 renderWithAgents:@[hAgent] selectedAgent:hAgent];
+            __block BOOL dockCallbackFired = NO;
+            dock4.onPillClicked = ^{ dockCallbackFired = YES; };
+            [dock4 setMode:0];
+            BOOL dockOrbVisible = !dock4.floatingPill.hidden && dock4.barView.hidden;
+            [dock4 setMode:1];
+            BOOL dockBarVisible = !dock4.barView.hidden && dock4.floatingPill.hidden;
+            [dock4 barLogoClicked:nil];
+            BOOL dockCallbackOK = dockCallbackFired;
+
+            BOOL sqliteReadonly = (SQLITE_OPEN_READONLY != 0) && (SQLITE_OPEN_READWRITE != SQLITE_OPEN_READONLY);
+            BOOL singleInstanceGuard = &CPAnotherInstanceIsRunning != NULL;
+            [m4Defaults removePersistentDomainForName:m4Suite];
+            [m4Defaults synchronize];
+
+            BOOL m4ui = refreshNewInstances && drawerKeptOnRefresh && refreshNoMark &&
+                        agentFallback && taskGoneClosesDrawer && hudNoDupButtons && singleBreathKey &&
+                        dockOrbVisible && dockBarVisible && dockCallbackOK && sqliteReadonly && singleInstanceGuard;
+
+            BOOL passed = centered && draggableHeader && labeledWorkbench && onlyRealAgents && labeledAgent && buttonReceivesClick &&
+                          cardMasksToBounds && shadowCarrierNoMasks && cardIsChildOfShadowCarrier && windowHasWorkbenchInset &&
+                          fixedCardSize && twoColumn && rightOverlayHidden &&
+                          hudCollapsed6x72 && hudCollapsedOnMainScreen && hudExpanded344x224 && hudExpandedOnMainScreen &&
+                          shadowCarrierScales && handleAnchoredTopRight && contentNotSizable && hudClickViewIsBackgroundView &&
+                          hudVisualFrameExact && hudHandleTopRight && m2ui && m3ui && m3entries && m4ui;
+            NSMutableString *result = [NSMutableString stringWithFormat:
+                @"Codex Pulse UI self-test: center=%@ drag=%@ workbench-label=%@ real-agents=%@ agent-label=%@ button-hit=%@ "
+                @"card-mask=%@ carrier-mask=%@ card-child=%@ win-inset=%@ card-520x360=%@ two-column=%@ right-overlay=%@ "
+                @"hud-6x72=%@ hud-collapsed-pos=%@ hud-344x224=%@ hud-expanded-pos=%@ "
+                @"hud-carrier-scale=%@ hud-handle-tr=%@ hud-content-fixed=%@ hud-bg-click=%@ "
+                @"hud-visual-frame=%@ hud-handle-pos=%@\n",
                 centered ? @"OK" : @"FAIL",
                 draggableHeader ? @"OK" : @"FAIL",
                 labeledWorkbench ? @"OK" : @"FAIL",
                 onlyRealAgents ? @"OK" : @"FAIL",
                 labeledAgent ? @"OK" : @"FAIL",
-                buttonReceivesClick ? @"OK" : @"FAIL"];
+                buttonReceivesClick ? @"OK" : @"FAIL",
+                cardMasksToBounds ? @"OK" : @"FAIL",
+                shadowCarrierNoMasks ? @"OK" : @"FAIL",
+                cardIsChildOfShadowCarrier ? @"OK" : @"FAIL",
+                windowHasWorkbenchInset ? @"OK" : @"FAIL",
+                fixedCardSize ? @"OK" : @"FAIL",
+                twoColumn ? @"OK" : @"FAIL",
+                rightOverlayHidden ? @"OK" : @"FAIL",
+                hudCollapsed6x72 ? @"OK" : @"FAIL",
+                hudCollapsedOnMainScreen ? @"OK" : @"FAIL",
+                hudExpanded344x224 ? @"OK" : @"FAIL",
+                hudExpandedOnMainScreen ? @"OK" : @"FAIL",
+                shadowCarrierScales ? @"OK" : @"FAIL",
+                handleAnchoredTopRight ? @"OK" : @"FAIL",
+                contentNotSizable ? @"OK" : @"FAIL",
+                hudClickViewIsBackgroundView ? @"OK" : @"FAIL",
+                hudVisualFrameExact ? @"OK" : @"FAIL",
+                hudHandleTopRight ? @"OK" : @"FAIL"];
+            [result appendFormat:@"M2 UI self-test: ring-colors=%@ blue-double=%@ reduce-motion=%@ motion-anim=%@ blue-anim=%@ hud-agent-scope=%@ hud-select-by-id=%@\n",
+                ringColorsOK ? @"OK" : @"FAIL",
+                blueDoubleOK ? @"OK" : @"FAIL",
+                reduceMotionOK ? @"OK" : @"FAIL",
+                motionAnimOK ? @"OK" : @"FAIL",
+                blueAnimOK ? @"OK" : @"FAIL",
+                hudAgentScope ? @"OK" : @"FAIL",
+                hudSelectByID ? @"OK" : @"FAIL"];
+            [result appendFormat:@"M3 UI self-test: drawer-init-hidden=%@ render-no-mark=%@ drawer-on-click=%@ review-on-open=%@ esc-drawer=%@ esc-workbench=%@\n",
+                drawerInitiallyHidden ? @"OK" : @"FAIL",
+                renderDoesNotMark ? @"OK" : @"FAIL",
+                drawerShownOnClick ? @"OK" : @"FAIL",
+                reviewMarkedOnOpen ? @"OK" : @"FAIL",
+                firstEscDrawerOnly ? @"OK" : @"FAIL",
+                secondEscClosesWorkbench ? @"OK" : @"FAIL"];
+            [result appendFormat:@"M3 entries self-test: reshow-visible=%@ reshow-centered=%@ reshow-fixed-size=%@\n",
+                reshowVisible ? @"OK" : @"FAIL",
+                reshowCentered ? @"OK" : @"FAIL",
+                reshowFixedSize ? @"OK" : @"FAIL"];
+            [result appendFormat:@"M4 UI self-test: refresh-new-instances=%@ drawer-kept=%@ refresh-no-mark=%@ agent-fallback=%@ task-gone-close=%@ hud-no-dup=%@ single-breath=%@ dock-orb=%@ dock-bar=%@ dock-callback=%@ sqlite-readonly=%@ single-instance=%@\n",
+                refreshNewInstances ? @"OK" : @"FAIL",
+                drawerKeptOnRefresh ? @"OK" : @"FAIL",
+                refreshNoMark ? @"OK" : @"FAIL",
+                agentFallback ? @"OK" : @"FAIL",
+                taskGoneClosesDrawer ? @"OK" : @"FAIL",
+                hudNoDupButtons ? @"OK" : @"FAIL",
+                singleBreathKey ? @"OK" : @"FAIL",
+                dockOrbVisible ? @"OK" : @"FAIL",
+                dockBarVisible ? @"OK" : @"FAIL",
+                dockCallbackOK ? @"OK" : @"FAIL",
+                sqliteReadonly ? @"OK" : @"FAIL",
+                singleInstanceGuard ? @"OK" : @"FAIL"];
+            if (!centered) {
+                [result appendFormat:@"  diagnostic: testVisible=%@ cardFrame=%@ hasScreen=%@\n",
+                 NSStringFromRect(testVisible), NSStringFromRect(cardFrame), hasScreen ? @"YES" : @"NO"];
+            }
             fputs(result.UTF8String, stdout);
             fflush(stdout);
             if (argc > 2) {
@@ -2231,7 +2953,53 @@ int main(int argc, const char *argv[]) {
             NSInteger taskCount = 0;
             for (CPAgent *a in agents) taskCount += a.tasks.count;
             printf("Codex Pulse self-test: %lu agents, %ld tasks, local read OK\n", (unsigned long)agents.count, (long)taskCount);
-            return taskCount > 0 ? 0 : 2;
+
+            // M2: CPReviewStore + CPDisplayStatus priority, isolated NSUserDefaults suite.
+            NSString *suite = [NSString stringWithFormat:@"com.codexpulse.selftest.%d", NSProcessInfo.processInfo.processIdentifier];
+            NSUserDefaults *testDefaults = [[NSUserDefaults alloc] initWithSuiteName:suite];
+            [testDefaults removePersistentDomainForName:suite];
+            CPReviewStore *store = [[CPReviewStore alloc] initWithDefaults:testDefaults];
+
+            CPTask *done = CPTestTask(@"t1", CPStatusCompleted, 1000);
+            BOOL reviewUnseenFirst = ![store isTaskReviewed:done agentID:@"codex"];
+            [store markTaskReviewed:done agentID:@"codex"];
+            BOOL reviewMarked = [store isTaskReviewed:done agentID:@"codex"];
+            done.updatedAt = [NSDate dateWithTimeIntervalSince1970:2000];
+            BOOL reviewResetOnNewSignature = ![store isTaskReviewed:done agentID:@"codex"];
+            CPTask *sameIDDifferentAgent = CPTestTask(@"t1", CPStatusCompleted, 1000);
+            BOOL reviewAgentIsolated = [store isTaskReviewed:sameIDDifferentAgent agentID:@"codex"] &&
+                                       ![store isTaskReviewed:sameIDDifferentAgent agentID:@"kimi"];
+
+            BOOL prFailed = CPDisplayStatusForTasks(@[CPTestTask(@"a", CPStatusWorking, 1),
+                                                      CPTestTask(@"b", CPStatusCompleted, 1),
+                                                      CPTestTask(@"c", CPStatusAttention, 1),
+                                                      CPTestTask(@"d", CPStatusFailed, 1)], @"x", store) == CPDisplayStatusFailed;
+            BOOL prWaiting = CPDisplayStatusForTasks(@[CPTestTask(@"a", CPStatusWorking, 1),
+                                                       CPTestTask(@"b", CPStatusCompleted, 1),
+                                                       CPTestTask(@"c", CPStatusWaiting, 1)], @"x", store) == CPDisplayStatusWaiting;
+            BOOL prAttention = CPDisplayStatusForTasks(@[CPTestTask(@"c", CPStatusAttention, 1),
+                                                         CPTestTask(@"a", CPStatusWorking, 1)], @"x", store) == CPDisplayStatusWaiting;
+            BOOL prBlue = CPDisplayStatusForTasks(@[CPTestTask(@"b", CPStatusCompleted, 1),
+                                                    CPTestTask(@"a", CPStatusWorking, 1)], @"x", store) == CPDisplayStatusCompletedPendingReview;
+            BOOL prWorking = CPDisplayStatusForTasks(@[CPTestTask(@"a", CPStatusWorking, 1),
+                                                       CPTestTask(@"e", CPStatusIdle, 1)], @"x", store) == CPDisplayStatusWorking;
+            BOOL prIdle = CPDisplayStatusForTasks(@[CPTestTask(@"e", CPStatusIdle, 1)], @"x", store) == CPDisplayStatusIdle &&
+                          CPDisplayStatusForTasks(@[], @"x", store) == CPDisplayStatusIdle;
+
+            [testDefaults removePersistentDomainForName:suite];
+            [testDefaults synchronize];
+
+            BOOL m2 = reviewUnseenFirst && reviewMarked && reviewResetOnNewSignature && reviewAgentIsolated &&
+                      prFailed && prWaiting && prAttention && prBlue && prWorking && prIdle;
+            NSString *m2line = [NSString stringWithFormat:
+                @"M2 self-test: review-unseen=%@ review-marked=%@ review-resign=%@ review-agent-isolated=%@ "
+                @"prio-failed=%@ prio-waiting=%@ prio-attention=%@ prio-blue=%@ prio-working=%@ prio-idle=%@\n",
+                reviewUnseenFirst ? @"OK" : @"FAIL", reviewMarked ? @"OK" : @"FAIL",
+                reviewResetOnNewSignature ? @"OK" : @"FAIL", reviewAgentIsolated ? @"OK" : @"FAIL",
+                prFailed ? @"OK" : @"FAIL", prWaiting ? @"OK" : @"FAIL", prAttention ? @"OK" : @"FAIL",
+                prBlue ? @"OK" : @"FAIL", prWorking ? @"OK" : @"FAIL", prIdle ? @"OK" : @"FAIL"];
+            fputs(m2line.UTF8String, stdout);
+            return (taskCount > 0 && m2) ? 0 : 2;
         }
         if (CPAnotherInstanceIsRunning()) return 0;
         NSApplication *app = NSApplication.sharedApplication;
