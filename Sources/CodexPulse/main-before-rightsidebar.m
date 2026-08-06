@@ -971,7 +971,7 @@ static const CGFloat CPCardHeight = 440.0;
 @property NSPoint dragStartMouse;
 @property NSPoint dragStartOrigin;
 @property void (^onPillClicked)(void);
-@property NSImageView *badgeView;
+@property NSView *badgeView;
 @property NSTextField *badgeLabel;
 @property (nonatomic) NSInteger mode; // 0 = orb, 1 = bar
 @property NSTimer *unpeekTimer;
@@ -993,9 +993,9 @@ static const CGFloat CPCardHeight = 440.0;
 
 @implementation CPDockWindowController
 
-static const CGFloat CPOrbSize = 52.0;
+static const CGFloat CPOrbSize = 56.0;
 static const CGFloat CPStripWidth = 6.0;
-static const CGFloat CPHotZone = 24.0;
+static const CGFloat CPHotZone = 28.0;
 static const CGFloat CPMargin = 18.0;
 static const CGFloat CPSnapThreshold = 60.0;
 static const CGFloat CPBarHeight = 48.0;
@@ -1038,46 +1038,53 @@ static const CGFloat CPBarWorkbenchWidth = 82.0;
     floatingPill.wantsLayer = YES;
     floatingPill.layer.backgroundColor = CPSurface().CGColor;
     floatingPill.layer.cornerRadius = CPOrbSize / 2.0;
-    floatingPill.layer.borderWidth = 1.0;
+    floatingPill.layer.borderWidth = 1.5;
     floatingPill.layer.borderColor = CPBorder().CGColor;
-    floatingPill.layer.shadowColor = [NSColor colorWithSRGBRed:0.078 green:0.078 blue:0.086 alpha:0.14].CGColor;
-    floatingPill.layer.shadowOffset = CGSizeMake(0, 6);
-    floatingPill.layer.shadowRadius = 22.0;
+    floatingPill.layer.shadowColor = [NSColor colorWithSRGBRed:0.078 green:0.078 blue:0.086 alpha:0.18].CGColor;
+    floatingPill.layer.shadowOffset = CGSizeMake(0, 8);
+    floatingPill.layer.shadowRadius = 26.0;
     floatingPill.layer.shadowOpacity = 1.0;
     self.floatingPill = floatingPill;
     [pill addSubview:floatingPill];
 
-    // Subtle idle shadow pulse (does not fight with hover/mousedown scale transforms)
+    // Idle shadow pulse
     CABasicAnimation *pulse = [CABasicAnimation animationWithKeyPath:@"shadowOpacity"];
-    pulse.fromValue = @0.8;
+    pulse.fromValue = @0.72;
     pulse.toValue = @1.0;
-    pulse.duration = 2.2;
+    pulse.duration = 2.4;
     pulse.autoreverses = YES;
     pulse.repeatCount = HUGE_VALF;
     pulse.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
     [floatingPill.layer addAnimation:pulse forKey:@"idlePulse"];
 
-    NSImageView *iconView = [[NSImageView alloc] initWithFrame:NSMakeRect(14, 14, 24, 24)];
-    iconView.image = CPSymbol(@"circle.grid.cross.fill", 20, CPAccent());
+    NSImageView *iconView = [[NSImageView alloc] initWithFrame:NSMakeRect(15, 15, 26, 26)];
+    iconView.image = CPSymbol(@"circle.grid.cross.fill", 22, CPAccent());
     iconView.contentTintColor = CPAccent();
     [floatingPill addSubview:iconView];
     self.iconView = iconView;
 
-    NSImageView *badgeView = [[NSImageView alloc] initWithFrame:NSMakeRect(34, 34, 16, 16)];
-    badgeView.image = CPDotImage(16, CPAccent());
+    // Badge: dynamic width pill, positioned at top-right
+    NSView *badgeView = [[NSView alloc] initWithFrame:NSMakeRect(36, 36, 20, 18)];
+    badgeView.wantsLayer = YES;
+    badgeView.layer.backgroundColor = CPAccent().CGColor;
+    badgeView.layer.cornerRadius = 9.0;
+    badgeView.layer.shadowColor = [NSColor colorWithSRGBRed:0.0 green:0.0 blue:0.0 alpha:0.16].CGColor;
+    badgeView.layer.shadowOffset = CGSizeMake(0, 2);
+    badgeView.layer.shadowRadius = 4.0;
+    badgeView.layer.shadowOpacity = 1.0;
     badgeView.hidden = YES;
     [floatingPill addSubview:badgeView];
     self.badgeView = badgeView;
 
-    NSTextField *badgeLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(34, 34, 16, 16)];
+    NSTextField *badgeLabel = [[NSTextField alloc] initWithFrame:badgeView.bounds];
     badgeLabel.stringValue = @"";
-    badgeLabel.font = [NSFont systemFontOfSize:9 weight:NSFontWeightBold];
+    badgeLabel.font = [NSFont systemFontOfSize:10 weight:NSFontWeightBold];
     badgeLabel.textColor = NSColor.whiteColor;
     badgeLabel.alignment = NSTextAlignmentCenter;
     badgeLabel.bordered = NO;
     badgeLabel.backgroundColor = NSColor.clearColor;
-    badgeLabel.hidden = YES;
-    [floatingPill addSubview:badgeLabel];
+    badgeLabel.translatesAutoresizingMaskIntoConstraints = YES;
+    [badgeView addSubview:badgeLabel];
     self.badgeLabel = badgeLabel;
 
     // Docked strip (orb mode only)
@@ -1369,8 +1376,11 @@ static const CGFloat CPBarWorkbenchWidth = 82.0;
     } else if (!self.docked && self.mode == 0) {
         [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
             context.duration = 0.18;
-            self.floatingPill.animator.layer.transform = CATransform3DMakeScale(1.12, 1.12, 1.0);
-            self.floatingPill.animator.layer.shadowRadius = 28.0;
+            context.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+            self.floatingPill.animator.layer.transform = CATransform3DMakeScale(1.14, 1.14, 1.0);
+            self.floatingPill.animator.layer.shadowRadius = 32.0;
+            self.floatingPill.animator.layer.borderColor = CPAccent().CGColor;
+            self.iconView.animator.frame = NSMakeRect(13, 13, 30, 30);
         }];
     }
 }
@@ -1381,9 +1391,12 @@ static const CGFloat CPBarWorkbenchWidth = 82.0;
         [self scheduleUnpeek];
     } else if (!self.docked && self.mode == 0) {
         [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
-            context.duration = 0.18;
+            context.duration = 0.22;
+            context.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
             self.floatingPill.animator.layer.transform = CATransform3DIdentity;
-            self.floatingPill.animator.layer.shadowRadius = 22.0;
+            self.floatingPill.animator.layer.shadowRadius = 26.0;
+            self.floatingPill.animator.layer.borderColor = CPBorder().CGColor;
+            self.iconView.animator.frame = NSMakeRect(15, 15, 26, 26);
         }];
     }
 }
@@ -1416,9 +1429,10 @@ static const CGFloat CPBarWorkbenchWidth = 82.0;
         self.dragStartOrigin = self.window.frame.origin;
     }
     if (self.mode == 0) {
-        self.floatingPill.layer.transform = CATransform3DMakeScale(0.95, 0.95, 1.0);
+        self.floatingPill.layer.transform = CATransform3DMakeScale(0.90, 0.90, 1.0);
+        self.floatingPill.layer.shadowRadius = 18.0;
     } else {
-        self.barView.layer.transform = CATransform3DMakeScale(0.98, 0.98, 1.0);
+        self.barView.layer.transform = CATransform3DMakeScale(0.97, 0.97, 1.0);
     }
 }
 
@@ -1436,8 +1450,13 @@ static const CGFloat CPBarWorkbenchWidth = 82.0;
 - (void)pillMouseUp:(NSEvent *)event {
     if (!self.dragging) return;
     self.dragging = NO;
-    self.floatingPill.layer.transform = CATransform3DIdentity;
-    self.barView.layer.transform = CATransform3DIdentity;
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
+        context.duration = 0.18;
+        context.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+        self.floatingPill.animator.layer.transform = CATransform3DIdentity;
+        self.floatingPill.animator.layer.shadowRadius = 26.0;
+        self.barView.animator.layer.transform = CATransform3DIdentity;
+    }];
     if (self.didMove) {
         [self snapToEdge];
     } else if (self.onPillClicked) {
@@ -1477,9 +1496,20 @@ static const CGFloat CPBarWorkbenchWidth = 82.0;
     self.selectedAgent = agent;
     NSInteger attention = 0;
     for (CPAgent *a in agents) for (CPTask *t in a.tasks) if (t.status == CPStatusAttention || t.status == CPStatusFailed) attention++;
+
+    NSString *badgeText = [NSString stringWithFormat:@"%ld", (long)attention];
+    CGFloat badgeW = 20.0;
+    if (attention >= 10) badgeW = 24.0;
+    if (attention >= 100) badgeW = 28.0;
+    CGFloat badgeH = 18.0;
+    CGFloat badgeX = CPOrbSize - badgeW - 4.0;
+    CGFloat badgeY = CPOrbSize - badgeH - 4.0;
+
+    self.badgeView.frame = NSMakeRect(badgeX, badgeY, badgeW, badgeH);
+    self.badgeLabel.frame = self.badgeView.bounds;
+    self.badgeLabel.stringValue = badgeText;
     self.badgeView.hidden = attention == 0;
     self.badgeLabel.hidden = attention == 0;
-    self.badgeLabel.stringValue = [NSString stringWithFormat:@"%ld", (long)attention];
     [self renderDockAgents];
 }
 
@@ -1503,14 +1533,54 @@ static const CGFloat CPBarWorkbenchWidth = 82.0;
 
 #pragma mark - Status HUD
 
+@interface CPProgressBarView : NSView
+@property NSView *fillView;
+@property (nonatomic) CGFloat progress; // 0.0 - 100.0
+@end
+
+@implementation CPProgressBarView
+
+- (instancetype)initWithFrame:(NSRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+    self.wantsLayer = YES;
+    self.layer.backgroundColor = [NSColor colorWithSRGBRed:0.0 green:0.0 blue:0.0 alpha:0.06].CGColor;
+    self.layer.cornerRadius = 2.0;
+
+    NSView *fill = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 0, frame.size.height)];
+    fill.wantsLayer = YES;
+    fill.layer.backgroundColor = CPAccent().CGColor;
+    fill.layer.cornerRadius = 2.0;
+    [self addSubview:fill];
+    self.fillView = fill;
+    self.progress = 0.0;
+    return self;
+}
+
+- (void)setProgress:(CGFloat)progress {
+    _progress = MAX(0.0, MIN(100.0, progress));
+    CGFloat width = self.bounds.size.width * (_progress / 100.0);
+    self.fillView.frame = NSMakeRect(0, 0, width, self.bounds.size.height);
+}
+
+- (void)resizeSubviewsWithOldSize:(NSSize)oldSize {
+    [super resizeSubviewsWithOldSize:oldSize];
+    [self setProgress:self.progress];
+}
+
+@end
+
 @interface CPHUDWindowController : NSObject
 @property NSPanel *window;
 @property NSVisualEffectView *visualView;
 @property NSView *container;
-@property NSImageView *agentIcon;
-@property NSTextField *statusLabel;
-@property NSImageView *statusDot;
-@property NSButton *clickButton;
+@property NSArray<CPAgent *> *agents;
+@property CPAgent *selectedAgent;
+@property NSStackView *agentList;
+@property NSStackView *taskList;
+@property NSTextField *agentNameLabel;
+@property NSTextField *agentStatusLabel;
+@property CPProgressBarView *overallProgress;
 @property void (^onClicked)(void);
 - (void)show;
 - (void)updateWithAgents:(NSArray<CPAgent *> *)agents selectedAgent:(CPAgent *)agent;
@@ -1518,8 +1588,9 @@ static const CGFloat CPBarWorkbenchWidth = 82.0;
 
 @implementation CPHUDWindowController
 
-static const CGFloat CPHUDWidth = 170.0;
-static const CGFloat CPHUDHeight = 38.0;
+static const CGFloat CPHUDWidth = 320.0;
+static const CGFloat CPHUDHeight = 200.0;
+static const CGFloat CPHUDAgentColumn = 84.0;
 
 - (instancetype)init {
     self = [super init];
@@ -1531,7 +1602,7 @@ static const CGFloat CPHUDHeight = 38.0;
 - (void)buildWindow {
     NSScreen *screen = NSScreen.mainScreen ?: NSScreen.screens.firstObject;
     NSRect visible = screen.visibleFrame;
-    NSRect frame = NSMakeRect(NSMaxX(visible) - CPHUDWidth - 16, NSMaxY(visible) - CPHUDHeight - 8, CPHUDWidth, CPHUDHeight);
+    NSRect frame = NSMakeRect(NSMaxX(visible) - CPHUDWidth - 14, NSMaxY(visible) - CPHUDHeight - 10, CPHUDWidth, CPHUDHeight);
 
     self.window = [[NSPanel alloc] initWithContentRect:frame
                                              styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
@@ -1548,13 +1619,13 @@ static const CGFloat CPHUDHeight = 38.0;
     self.window.ignoresMouseEvents = NO;
 
     NSVisualEffectView *visualView = [[NSVisualEffectView alloc] initWithFrame:NSMakeRect(0, 0, CPHUDWidth, CPHUDHeight)];
-    visualView.material = NSVisualEffectMaterialMenu;
+    visualView.material = NSVisualEffectMaterialHUDWindow;
     visualView.blendingMode = NSVisualEffectBlendingModeBehindWindow;
     visualView.state = NSVisualEffectStateActive;
     visualView.wantsLayer = YES;
-    visualView.layer.cornerRadius = CPHUDHeight / 2.0;
+    visualView.layer.cornerRadius = 18.0;
     visualView.layer.borderWidth = 1.0;
-    visualView.layer.borderColor = [NSColor colorWithSRGBRed:1.0 green:1.0 blue:1.0 alpha:0.18].CGColor;
+    visualView.layer.borderColor = [NSColor colorWithSRGBRed:1.0 green:1.0 blue:1.0 alpha:0.22].CGColor;
     self.visualView = visualView;
     self.window.contentView = visualView;
 
@@ -1563,42 +1634,140 @@ static const CGFloat CPHUDHeight = 38.0;
     [visualView addSubview:container];
     self.container = container;
 
-    NSImageView *agentIcon = [[NSImageView alloc] initWithFrame:NSMakeRect(10, 9, 20, 20)];
-    agentIcon.imageScaling = NSImageScaleProportionallyDown;
-    [container addSubview:agentIcon];
-    self.agentIcon = agentIcon;
+    // Header
+    NSTextField *title = [NSTextField labelWithString:@"Pulse"];
+    title.font = [NSFont fontWithName:@"Georgia" size:16] ?: [NSFont systemFontOfSize:16 weight:NSFontWeightSemibold];
+    title.textColor = CPFg();
+    title.translatesAutoresizingMaskIntoConstraints = NO;
+    [container addSubview:title];
 
-    NSTextField *statusLabel = [NSTextField labelWithString:@"Codex · 空闲"];
-    statusLabel.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
-    statusLabel.textColor = CPFg();
-    statusLabel.alignment = NSTextAlignmentLeft;
-    statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    [container addSubview:statusLabel];
-    self.statusLabel = statusLabel;
+    NSTextField *time = [NSTextField labelWithString:[self currentTimeString]];
+    time.font = [NSFont systemFontOfSize:11 weight:NSFontWeightRegular];
+    time.textColor = CPMuted();
+    time.translatesAutoresizingMaskIntoConstraints = NO;
+    [container addSubview:time];
 
-    NSImageView *statusDot = [[NSImageView alloc] initWithFrame:NSMakeRect(0, 0, 8, 8)];
-    statusDot.image = CPStatusDot(8, CPStatusIdle);
-    statusDot.translatesAutoresizingMaskIntoConstraints = NO;
-    [container addSubview:statusDot];
-    self.statusDot = statusDot;
+    // Agent column
+    NSView *agentColumn = [[NSView alloc] initWithFrame:NSZeroRect];
+    agentColumn.wantsLayer = YES;
+    agentColumn.layer.backgroundColor = [NSColor colorWithSRGBRed:0.0 green:0.0 blue:0.0 alpha:0.03].CGColor;
+    agentColumn.layer.cornerRadius = 12.0;
+    agentColumn.translatesAutoresizingMaskIntoConstraints = NO;
+    [container addSubview:agentColumn];
 
+    NSTextField *agentHeader = [NSTextField labelWithString:@"AGENTS"];
+    agentHeader.font = [NSFont systemFontOfSize:9 weight:NSFontWeightSemibold];
+    agentHeader.textColor = CPMuted();
+    agentHeader.translatesAutoresizingMaskIntoConstraints = NO;
+    [agentColumn addSubview:agentHeader];
+
+    self.agentList = [NSStackView stackViewWithViews:@[]];
+    self.agentList.orientation = NSUserInterfaceLayoutOrientationVertical;
+    self.agentList.spacing = 2;
+    self.agentList.alignment = NSLayoutAttributeCenterX;
+    self.agentList.translatesAutoresizingMaskIntoConstraints = NO;
+    [agentColumn addSubview:self.agentList];
+
+    // Detail column
+    NSTextField *agentName = [NSTextField labelWithString:@"Codex"];
+    agentName.font = [NSFont systemFontOfSize:15 weight:NSFontWeightSemibold];
+    agentName.textColor = CPFg();
+    agentName.translatesAutoresizingMaskIntoConstraints = NO;
+    [container addSubview:agentName];
+    self.agentNameLabel = agentName;
+
+    NSTextField *agentStatus = [NSTextField labelWithString:@"空闲"];
+    agentStatus.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
+    agentStatus.textColor = CPMuted();
+    agentStatus.translatesAutoresizingMaskIntoConstraints = NO;
+    [container addSubview:agentStatus];
+    self.agentStatusLabel = agentStatus;
+
+    CPProgressBarView *progress = [[CPProgressBarView alloc] initWithFrame:NSMakeRect(0, 0, 100, 4)];
+    progress.translatesAutoresizingMaskIntoConstraints = NO;
+    [container addSubview:progress];
+    self.overallProgress = progress;
+
+    NSTextField *taskHeader = [NSTextField labelWithString:@"运行中"];
+    taskHeader.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
+    taskHeader.textColor = CPFg2();
+    taskHeader.translatesAutoresizingMaskIntoConstraints = NO;
+    [container addSubview:taskHeader];
+
+    self.taskList = [NSStackView stackViewWithViews:@[]];
+    self.taskList.orientation = NSUserInterfaceLayoutOrientationVertical;
+    self.taskList.spacing = 6;
+    self.taskList.alignment = NSLayoutAttributeLeading;
+    self.taskList.translatesAutoresizingMaskIntoConstraints = NO;
+    [container addSubview:self.taskList];
+
+    // Click overlay
     NSButton *clickButton = [NSButton buttonWithTitle:@"" target:self action:@selector(hudClicked:)];
     clickButton.bordered = NO;
     clickButton.translatesAutoresizingMaskIntoConstraints = NO;
     [container addSubview:clickButton];
-    self.clickButton = clickButton;
 
     [NSLayoutConstraint activateConstraints:@[
-        [statusLabel.leadingAnchor constraintEqualToAnchor:agentIcon.trailingAnchor constant:8],
-        [statusLabel.centerYAnchor constraintEqualToAnchor:container.centerYAnchor],
-        [statusLabel.trailingAnchor constraintLessThanOrEqualToAnchor:statusDot.leadingAnchor constant:-8],
-        [statusDot.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-12],
-        [statusDot.centerYAnchor constraintEqualToAnchor:container.centerYAnchor],
+        [title.leadingAnchor constraintEqualToAnchor:container.leadingAnchor constant:16],
+        [title.topAnchor constraintEqualToAnchor:container.topAnchor constant:14],
+        [time.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-16],
+        [time.centerYAnchor constraintEqualToAnchor:title.centerYAnchor],
+
+        [agentColumn.leadingAnchor constraintEqualToAnchor:container.leadingAnchor constant:12],
+        [agentColumn.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:12],
+        [agentColumn.bottomAnchor constraintEqualToAnchor:container.bottomAnchor constant:-12],
+        [agentColumn.widthAnchor constraintEqualToConstant:CPHUDAgentColumn],
+
+        [agentHeader.topAnchor constraintEqualToAnchor:agentColumn.topAnchor constant:10],
+        [agentHeader.centerXAnchor constraintEqualToAnchor:agentColumn.centerXAnchor],
+
+        [self.agentList.topAnchor constraintEqualToAnchor:agentHeader.bottomAnchor constant:8],
+        [self.agentList.leadingAnchor constraintEqualToAnchor:agentColumn.leadingAnchor constant:6],
+        [self.agentList.trailingAnchor constraintEqualToAnchor:agentColumn.trailingAnchor constant:-6],
+        [self.agentList.bottomAnchor constraintLessThanOrEqualToAnchor:agentColumn.bottomAnchor constant:-8],
+
+        [agentName.leadingAnchor constraintEqualToAnchor:agentColumn.trailingAnchor constant:14],
+        [agentName.topAnchor constraintEqualToAnchor:agentColumn.topAnchor constant:10],
+        [agentName.trailingAnchor constraintLessThanOrEqualToAnchor:container.trailingAnchor constant:-16],
+
+        [agentStatus.leadingAnchor constraintEqualToAnchor:agentName.leadingAnchor],
+        [agentStatus.topAnchor constraintEqualToAnchor:agentName.bottomAnchor constant:2],
+
+        [progress.leadingAnchor constraintEqualToAnchor:agentName.leadingAnchor],
+        [progress.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-16],
+        [progress.topAnchor constraintEqualToAnchor:agentStatus.bottomAnchor constant:8],
+        [progress.heightAnchor constraintEqualToConstant:4],
+
+        [taskHeader.leadingAnchor constraintEqualToAnchor:agentName.leadingAnchor],
+        [taskHeader.topAnchor constraintEqualToAnchor:progress.bottomAnchor constant:14],
+        [taskHeader.trailingAnchor constraintLessThanOrEqualToAnchor:container.trailingAnchor constant:-16],
+
+        [self.taskList.leadingAnchor constraintEqualToAnchor:taskHeader.leadingAnchor],
+        [self.taskList.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-16],
+        [self.taskList.topAnchor constraintEqualToAnchor:taskHeader.bottomAnchor constant:8],
+        [self.taskList.bottomAnchor constraintLessThanOrEqualToAnchor:container.bottomAnchor constant:-12],
+
         [clickButton.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
         [clickButton.trailingAnchor constraintEqualToAnchor:container.trailingAnchor],
         [clickButton.topAnchor constraintEqualToAnchor:container.topAnchor],
         [clickButton.bottomAnchor constraintEqualToAnchor:container.bottomAnchor]
     ]];
+
+    [self updateTimeLabel:time];
+}
+
+- (NSString *)currentTimeString {
+    NSDateFormatter *f = NSDateFormatter.new;
+    f.dateFormat = @"HH:mm";
+    return [f stringFromDate:NSDate.date];
+}
+
+- (void)updateTimeLabel:(NSTextField *)label {
+    label.stringValue = [self currentTimeString];
+    __weak NSTextField *weakLabel = label;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self updateTimeLabel:weakLabel];
+    });
 }
 
 - (void)hudClicked:(id)sender {
@@ -1609,13 +1778,116 @@ static const CGFloat CPHUDHeight = 38.0;
     [self.window orderFrontRegardless];
 }
 
+- (void)agentButtonClicked:(NSButton *)sender {
+    NSInteger idx = sender.tag;
+    if (idx < 0 || idx >= (NSInteger)self.agents.count) return;
+    self.selectedAgent = self.agents[(NSUInteger)idx];
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"CPSelectAgent" object:self.selectedAgent];
+    [self render];
+}
+
 - (void)updateWithAgents:(NSArray<CPAgent *> *)agents selectedAgent:(CPAgent *)agent {
-    CPAgent *displayAgent = agent ?: agents.firstObject;
-    CPStatus status = displayAgent ? displayAgent.status : CPStatusIdle;
-    self.agentIcon.image = CPSymbol(displayAgent.iconName ?: @"sparkles", 14, displayAgent.color ?: CPFg2());
-    self.agentIcon.contentTintColor = displayAgent.color ?: CPFg2();
-    self.statusLabel.stringValue = [NSString stringWithFormat:@"%@ · %@", displayAgent.name, CPStatusTitle(status)];
-    self.statusDot.image = CPStatusDot(8, status);
+    self.agents = agents;
+    self.selectedAgent = agent ?: agents.firstObject;
+    [self render];
+}
+
+- (void)render {
+    CPAgent *agent = self.selectedAgent ?: self.agents.firstObject;
+    if (!agent) return;
+
+    self.agentNameLabel.stringValue = agent.name;
+    self.agentStatusLabel.stringValue = CPStatusTitle(agent.status);
+    self.agentStatusLabel.textColor = CPStatusColor(agent.status);
+
+    NSInteger running = 0;
+    NSInteger completed = 0;
+    NSInteger failed = 0;
+    for (CPTask *t in agent.tasks) {
+        if (t.status == CPStatusWorking || t.status == CPStatusWaiting) running++;
+        else if (t.status == CPStatusCompleted) completed++;
+        else if (t.status == CPStatusFailed || t.status == CPStatusAttention) failed++;
+    }
+    NSInteger total = agent.tasks.count;
+    double progress = total > 0 ? ((double)completed + (double)running * 0.5) / (double)total * 100.0 : 0.0;
+    self.overallProgress.progress = MAX(0, MIN(100, progress));
+
+    // Agent list
+    while (self.agentList.arrangedSubviews.count > 0) {
+        NSView *v = self.agentList.arrangedSubviews.lastObject;
+        [self.agentList removeArrangedSubview:v];
+        [v removeFromSuperview];
+    }
+    for (NSUInteger i = 0; i < self.agents.count; i++) {
+        CPAgent *a = self.agents[i];
+        NSButton *btn = [NSButton buttonWithImage:CPSymbol(a.iconName ?: @"sparkles", 16, a == agent ? CPAccent() : CPFg2()) target:self action:@selector(agentButtonClicked:)];
+        btn.bordered = NO;
+        btn.tag = (NSInteger)i;
+        btn.toolTip = [NSString stringWithFormat:@"%@ · %@", a.name, CPStatusTitle(a.status)];
+        btn.translatesAutoresizingMaskIntoConstraints = NO;
+        btn.wantsLayer = YES;
+        btn.layer.cornerRadius = 8.0;
+        btn.layer.backgroundColor = (a == agent ? [NSColor colorWithSRGBRed:0.91 green:0.94 blue:1.0 alpha:1.0] : NSColor.clearColor).CGColor;
+        [btn.widthAnchor constraintEqualToConstant:38].active = YES;
+        [btn.heightAnchor constraintEqualToConstant:38].active = YES;
+        [self.agentList addArrangedSubview:btn];
+    }
+
+    // Task list
+    while (self.taskList.arrangedSubviews.count > 0) {
+        NSView *v = self.taskList.arrangedSubviews.lastObject;
+        [self.taskList removeArrangedSubview:v];
+        [v removeFromSuperview];
+    }
+
+    NSMutableArray<CPTask *> *displayTasks = NSMutableArray.array;
+    for (CPTask *t in agent.tasks) {
+        if (t.status == CPStatusWorking || t.status == CPStatusWaiting || t.status == CPStatusAttention) {
+            [displayTasks addObject:t];
+        }
+    }
+    if (displayTasks.count == 0) {
+        NSTextField *empty = [NSTextField labelWithString:@"当前没有运行中任务"];
+        empty.font = [NSFont systemFontOfSize:12 weight:NSFontWeightRegular];
+        empty.textColor = CPMuted();
+        [self.taskList addArrangedSubview:empty];
+    } else {
+        for (NSUInteger i = 0; i < displayTasks.count && i < 4; i++) {
+            CPTask *t = displayTasks[i];
+            NSStackView *row = [NSStackView stackViewWithViews:@[
+                [self taskDot:t.status],
+                [self taskLabel:t]
+            ]];
+            row.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+            row.spacing = 8;
+            row.alignment = NSLayoutAttributeCenterY;
+            [self.taskList addArrangedSubview:row];
+        }
+    }
+}
+
+- (NSImageView *)taskDot:(CPStatus)status {
+    NSImageView *v = [[NSImageView alloc] initWithFrame:NSMakeRect(0, 0, 7, 7)];
+    v.image = CPStatusDot(7, status);
+    v.translatesAutoresizingMaskIntoConstraints = NO;
+    [v.widthAnchor constraintEqualToConstant:7].active = YES;
+    [v.heightAnchor constraintEqualToConstant:7].active = YES;
+    return v;
+}
+
+- (NSStackView *)taskLabel:(CPTask *)task {
+    NSTextField *title = [NSTextField labelWithString:task.title];
+    title.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
+    title.textColor = CPFg();
+    title.lineBreakMode = NSLineBreakByTruncatingTail;
+    title.maximumNumberOfLines = 1;
+    NSTextField *meta = [NSTextField labelWithString:[NSString stringWithFormat:@"%@ · %@", task.projectName, CPStatusTitle(task.status)]];
+    meta.font = [NSFont systemFontOfSize:10 weight:NSFontWeightRegular];
+    meta.textColor = CPMuted();
+    NSStackView *s = [NSStackView stackViewWithViews:@[title, meta]];
+    s.orientation = NSUserInterfaceLayoutOrientationVertical;
+    s.spacing = 0;
+    return s;
 }
 
 @end
