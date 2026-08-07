@@ -4,17 +4,40 @@
 
 #pragma mark - Constants
 
-static NSColor *CPAccent(void) { return [NSColor colorWithSRGBRed:0.118 green:0.353 blue:0.961 alpha:1.0]; }
-static NSColor *CPBg(void) { return [NSColor colorWithSRGBRed:0.961 green:0.961 blue:0.957 alpha:1.0]; }
-static NSColor *CPSurface(void) { return NSColor.whiteColor; }
-static NSColor *CPBorder(void) { return [NSColor colorWithSRGBRed:0.886 green:0.886 blue:0.878 alpha:1.0]; }
-static NSColor *CPFg(void) { return [NSColor colorWithSRGBRed:0.078 green:0.078 blue:0.086 alpha:1.0]; }
-static NSColor *CPFg2(void) { return [NSColor colorWithSRGBRed:0.290 green:0.290 blue:0.310 alpha:1.0]; }
-static NSColor *CPMuted(void) { return [NSColor colorWithSRGBRed:0.431 green:0.431 blue:0.451 alpha:1.0]; }
-static NSColor *CPBlue(void) { return [NSColor colorWithSRGBRed:0.145 green:0.388 blue:0.922 alpha:1.0]; }
-static NSColor *CPOrange(void) { return [NSColor colorWithSRGBRed:0.851 green:0.467 blue:0.024 alpha:1.0]; }
-static NSColor *CPRed(void) { return [NSColor colorWithSRGBRed:0.863 green:0.149 blue:0.149 alpha:1.0]; }
-static NSColor *CPGreen(void) { return [NSColor colorWithSRGBRed:0.086 green:0.639 blue:0.290 alpha:1.0]; }
+// 高对比通道调整：亮通道更亮、暗通道更暗，提高对比度。
+static CGFloat CPContrastAdjustChannel(CGFloat v) {
+    return v >= 0.5 ? MIN(1.0, v + 0.12) : MAX(0.0, v * 0.72);
+}
+
+// 动态颜色：按 effectiveAppearance 区分浅色/深色，并在高对比模式下提高对比。
+static NSColor *CPDyn(CGFloat lr, CGFloat lg, CGFloat lb, CGFloat dr, CGFloat dg, CGFloat db) {
+    return [NSColor colorWithName:nil dynamicProvider:^NSColor *(NSAppearance *appearance) {
+        NSString *match = [appearance bestMatchFromAppearancesWithNames:@[NSAppearanceNameAqua, NSAppearanceNameDarkAqua]];
+        BOOL dark = [match isEqualToString:NSAppearanceNameDarkAqua];
+        CGFloat r = dark ? dr : lr, g = dark ? dg : lg, b = dark ? db : lb;
+        if (NSWorkspace.sharedWorkspace.accessibilityDisplayShouldIncreaseContrast) {
+            r = CPContrastAdjustChannel(r);
+            g = CPContrastAdjustChannel(g);
+            b = CPContrastAdjustChannel(b);
+        }
+        return [NSColor colorWithSRGBRed:r green:g blue:b alpha:1.0];
+    }];
+}
+
+// 主基调为深石墨/深海军蓝：工作台、HUD、Dock 三处窗口始终深色，不随系统浅色外观变白。
+// CPDyn 的 light 槽即深色主基调（CGColor 快照与浅色外观下也保持深色），dark 槽为 DarkAqua 下的微调。
+static NSColor *CPAccent(void) { return CPDyn(0.320, 0.500, 1.000, 0.400, 0.560, 1.000); }
+static NSColor *CPBg(void) { return CPDyn(0.093, 0.102, 0.133, 0.075, 0.082, 0.110); }
+static NSColor *CPSurface(void) { return CPDyn(0.145, 0.155, 0.196, 0.125, 0.133, 0.172); }
+static NSColor *CPBorder(void) { return CPDyn(0.300, 0.315, 0.375, 0.335, 0.350, 0.410); }
+static NSColor *CPFg(void) { return CPDyn(0.930, 0.930, 0.945, 0.950, 0.950, 0.960); }
+static NSColor *CPFg2(void) { return CPDyn(0.740, 0.745, 0.775, 0.780, 0.780, 0.810); }
+static NSColor *CPMuted(void) { return CPDyn(0.580, 0.585, 0.620, 0.620, 0.625, 0.660); }
+// 状态色：饱和度调高，在深石墨/深海军蓝底上清晰可见。
+static NSColor *CPBlue(void) { return CPDyn(0.420, 0.590, 1.000, 0.480, 0.640, 1.000); }
+static NSColor *CPOrange(void) { return CPDyn(1.000, 0.620, 0.240, 1.000, 0.660, 0.300); }
+static NSColor *CPRed(void) { return CPDyn(1.000, 0.420, 0.430, 1.000, 0.470, 0.480); }
+static NSColor *CPGreen(void) { return CPDyn(0.330, 0.860, 0.450, 0.380, 0.890, 0.500); }
 
 #pragma mark - Status
 
@@ -48,10 +71,10 @@ static NSColor *CPStatusColor(CPStatus s) {
     switch (s) {
         case CPStatusWorking: return CPBlue();
         case CPStatusWaiting: return CPOrange();
-        case CPStatusAttention: return [NSColor colorWithSRGBRed:0.918 green:0.345 blue:0.047 alpha:1.0];
+        case CPStatusAttention: return CPDyn(1.000, 0.560, 0.220, 1.000, 0.600, 0.270);
         case CPStatusCompleted: return CPGreen();
         case CPStatusFailed: return CPRed();
-        case CPStatusIdle: return [NSColor colorWithSRGBRed:0.431 green:0.431 blue:0.451 alpha:1.0];
+        case CPStatusIdle: return CPMuted();
     }
 }
 
@@ -72,7 +95,41 @@ static NSDate *CPDateFromSeconds(sqlite3_int64 v) { return v <= 0 ? nil : [NSDat
 static NSString *CPCleanTitle(const unsigned char *text) {
     if (!text) return @"未命名任务";
     NSString *value = [NSString stringWithUTF8String:(const char *)text] ?: @"未命名任务";
-    value = [[value stringByReplacingOccurrencesOfString:@"\n" withString:@" "] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+
+    // 1) 移除成对的 XML 块(如 <in-app-browser-context>…</in-app-browser-context>),含跨行内容。
+    NSRegularExpression *blockRe = [NSRegularExpression regularExpressionWithPattern:@"<([A-Za-z][\\w-]*)[^>]*>.*?</\\1>"
+                                                                           options:NSRegularExpressionDotMatchesLineSeparators
+                                                                             error:nil];
+    value = [blockRe stringByReplacingMatchesInString:value options:0 range:NSMakeRange(0, value.length) withTemplate:@" "];
+    // 2) 移除不成对的残留标签。
+    NSRegularExpression *tagRe = [NSRegularExpression regularExpressionWithPattern:@"</?[A-Za-z][^>]*>" options:0 error:nil];
+    value = [tagRe stringByReplacingMatchesInString:value options:0 range:NSMakeRange(0, value.length) withTemplate:@" "];
+    // 3) 逐行挑选首个简洁非空行;去掉 "[11] user:" 之类前缀,跳过 TRANSCRIPT 包装与审查样板文本。
+    NSRegularExpression *anywherePrefixRe = [NSRegularExpression regularExpressionWithPattern:@"\\[\\d+\\]\\s*(user|assistant|system)\\s*:\\s*"
+                                                                                      options:NSRegularExpressionCaseInsensitive
+                                                                                        error:nil];
+    NSRegularExpression *headPrefixRe = [NSRegularExpression regularExpressionWithPattern:@"^\\s*(user|assistant|system)\\s*:\\s*"
+                                                                                  options:NSRegularExpressionCaseInsensitive
+                                                                                    error:nil];
+    NSString *picked = nil;
+    for (NSString *rawLine in [value componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
+        NSString *line = [anywherePrefixRe stringByReplacingMatchesInString:rawLine options:0 range:NSMakeRange(0, rawLine.length) withTemplate:@" "];
+        line = [headPrefixRe stringByReplacingMatchesInString:line options:0 range:NSMakeRange(0, line.length) withTemplate:@""];
+        line = [line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (!line.length) continue;
+        // 去掉行首行尾的 ">" 与空白后判断 transcript 标记(大小写不敏感):
+        // "TRANSCRIPT", ">>> TRANSCRIPT START", "transcript end >" 等都跳过。
+        NSString *marker = [line stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"> \t"]].lowercaseString;
+        if ([marker isEqualToString:@"transcript"] ||
+            [marker isEqualToString:@"transcript start"] ||
+            [marker isEqualToString:@"transcript end"]) continue;
+        NSString *lower = line.lowercaseString;
+        if ([lower hasPrefix:@"the following is"]) continue; // "The following is the Codex agent history…" 样板
+        picked = line;
+        break;
+    }
+    value = picked.length ? picked : @"未命名任务";
+    // 4) 清洗完成后再做最终截断。
     return value.length > 58 ? [[value substringToIndex:58] stringByAppendingString:@"…"] : value;
 }
 
@@ -181,8 +238,57 @@ static NSTextField *CPLabel(NSString *text, CGFloat size, NSFontWeight weight, N
     return l;
 }
 
+// 通用 hover/pressed 反馈按钮：圆角背景 + 边框，hover 高亮，pressed 下沉变色。
+@interface CPHoverButton : NSButton
+@property (nonatomic, strong) NSColor *cpBaseBackground;
+@end
+
+@implementation CPHoverButton
+
+- (instancetype)initWithFrame:(NSRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+    self.wantsLayer = YES;
+    self.layer.cornerRadius = 6.0;
+    // 静止态不显示描边;hover/pressed 时才出现轻微描边与底色。
+    self.layer.borderWidth = 0.0;
+    self.layer.borderColor = CPBorder().CGColor;
+    return self;
+}
+
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    for (NSTrackingArea *area in self.trackingAreas) {
+        if (area.owner == self) [self removeTrackingArea:area];
+    }
+    NSTrackingArea *area = [[NSTrackingArea alloc] initWithRect:self.bounds
+                                                        options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect
+                                                          owner:self
+                                                       userInfo:nil];
+    [self addTrackingArea:area];
+}
+
+- (void)cpApplyBackground {
+    if (self.isHighlighted) {
+        self.layer.borderWidth = 1.0;
+        self.layer.backgroundColor = [CPMuted() colorWithAlphaComponent:0.30].CGColor;
+    } else {
+        NSPoint p = [self convertPoint:self.window.mouseLocationOutsideOfEventStream fromView:nil];
+        BOOL hovered = self.window && NSPointInRect(p, self.bounds);
+        self.layer.borderWidth = hovered ? 1.0 : 0.0;
+        self.layer.backgroundColor = (hovered ? [CPMuted() colorWithAlphaComponent:0.16] : (self.cpBaseBackground ?: NSColor.clearColor)).CGColor;
+    }
+}
+
+- (void)mouseEntered:(NSEvent *)event { [super mouseEntered:event]; [self cpApplyBackground]; }
+- (void)mouseExited:(NSEvent *)event { [super mouseExited:event]; [self cpApplyBackground]; }
+- (void)setHighlighted:(BOOL)highlighted { [super setHighlighted:highlighted]; [self cpApplyBackground]; }
+- (void)setCpBaseBackground:(NSColor *)color { _cpBaseBackground = color; [self cpApplyBackground]; }
+
+@end
+
 static NSButton *CPIconButton(NSString *symbol, id target, SEL action, NSString *tooltip) {
-    NSButton *b = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:symbol accessibilityDescription:@""] target:target action:action];
+    NSButton *b = [CPHoverButton buttonWithImage:[NSImage imageWithSystemSymbolName:symbol accessibilityDescription:@""] target:target action:action];
     b.bordered = NO;
     b.imageScaling = NSImageScaleProportionallyDown;
     b.contentTintColor = CPMuted();
@@ -217,17 +323,17 @@ static NSColor *CPDisplayStatusColor(CPDisplayStatus s) {
         case CPDisplayStatusWaiting: return CPOrange();
         case CPDisplayStatusCompletedPendingReview: return CPBlue();
         case CPDisplayStatusWorking: return CPGreen();
-        case CPDisplayStatusIdle: return [NSColor colorWithSRGBRed:0.0 green:0.72 blue:0.78 alpha:1.0];
+        case CPDisplayStatusIdle: return CPDyn(0.300, 0.850, 0.900, 0.350, 0.900, 0.950);
     }
 }
 
-static CGFloat CPDisplayStatusBreathDuration(CPDisplayStatus s) {
+static CGFloat CPDisplayStatusRippleDuration(CPDisplayStatus s) {
     switch (s) {
-        case CPDisplayStatusFailed: return 0.5;                 // 红色快速脉冲
-        case CPDisplayStatusWaiting: return 1.2;                // 橙色较快呼吸
-        case CPDisplayStatusCompletedPendingReview: return 1.8; // 蓝色双层呼吸
-        case CPDisplayStatusWorking: return 2.0;                // 绿色呼吸
-        case CPDisplayStatusIdle: return 3.2;                   // 青色慢呼吸
+        case CPDisplayStatusFailed: return 0.9;                 // 红色快速涟漪
+        case CPDisplayStatusWaiting: return 1.4;                // 橙色较快涟漪
+        case CPDisplayStatusCompletedPendingReview: return 1.8; // 蓝色双层涟漪
+        case CPDisplayStatusWorking: return 2.0;                // 绿色涟漪
+        case CPDisplayStatusIdle: return 3.2;                   // 青色慢涟漪
     }
 }
 
@@ -238,6 +344,8 @@ static CGFloat CPDisplayStatusBreathDuration(CPDisplayStatus s) {
 @property BOOL statusSelected;
 @property CAShapeLayer *ringLayer;
 @property CAShapeLayer *innerRingLayer;
+@property CAShapeLayer *rippleLayerA;
+@property CAShapeLayer *rippleLayerB;
 @property NSView *statusDot;
 @property NSImageView *iconView;
 - (void)updateWithAgent:(CPAgent *)agent displayStatus:(CPDisplayStatus)status selected:(BOOL)selected;
@@ -263,6 +371,19 @@ static CGFloat CPDisplayStatusBreathDuration(CPDisplayStatus s) {
     self.innerRingLayer.lineWidth = 1.5;
     [self.layer addSublayer:self.innerRingLayer];
 
+    // Ripple layers: 由内向外扩散并淡出的错峰波纹。
+    self.rippleLayerA = [CAShapeLayer layer];
+    self.rippleLayerA.fillColor = NSColor.clearColor.CGColor;
+    self.rippleLayerA.lineWidth = 1.5;
+    self.rippleLayerA.hidden = YES;
+    [self.layer addSublayer:self.rippleLayerA];
+
+    self.rippleLayerB = [CAShapeLayer layer];
+    self.rippleLayerB.fillColor = NSColor.clearColor.CGColor;
+    self.rippleLayerB.lineWidth = 1.5;
+    self.rippleLayerB.hidden = YES;
+    [self.layer addSublayer:self.rippleLayerB];
+
     self.iconView = [[NSImageView alloc] initWithFrame:NSZeroRect];
     [self addSubview:self.iconView];
 
@@ -286,6 +407,11 @@ static CGFloat CPDisplayStatusBreathDuration(CPDisplayStatus s) {
     CGFloat innerR = MAX(outerR - 4.0, 1.0);
     self.innerRingLayer.frame = b;
     self.innerRingLayer.path = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(c.x - innerR, c.y - innerR, innerR * 2, innerR * 2)].CGPath;
+    // 波纹与外圈同路径，动画里从 0.55 倍放大到 1.0（由内向外扩散）。
+    self.rippleLayerA.frame = b;
+    self.rippleLayerA.path = self.ringLayer.path;
+    self.rippleLayerB.frame = b;
+    self.rippleLayerB.path = self.ringLayer.path;
     self.iconView.frame = NSMakeRect(c.x - 10, c.y - 10, 20, 20);
     self.statusDot.frame = NSMakeRect(b.size.width - 12, 1, 10, 10);
 }
@@ -304,7 +430,7 @@ static CGFloat CPDisplayStatusBreathDuration(CPDisplayStatus s) {
     self.image = nil;
     self.iconView.image = CPSymbol(agent.iconName ?: @"sparkles", 16, selected ? CPAccent() : CPFg2());
     self.iconView.contentTintColor = selected ? CPAccent() : CPFg2();
-    self.layer.backgroundColor = (selected ? [NSColor colorWithSRGBRed:0.91 green:0.94 blue:1.0 alpha:1.0] : NSColor.clearColor).CGColor;
+    self.layer.backgroundColor = (selected ? CPDyn(0.24, 0.32, 0.50, 0.20, 0.28, 0.45) : NSColor.clearColor).CGColor;
 
     self.ringLayer.strokeColor = color.CGColor;
     self.ringLayer.opacity = 1.0;
@@ -312,6 +438,8 @@ static CGFloat CPDisplayStatusBreathDuration(CPDisplayStatus s) {
     self.innerRingLayer.hidden = !doubleRing;
     self.innerRingLayer.strokeColor = color.CGColor;
     self.innerRingLayer.opacity = 1.0;
+    self.rippleLayerA.strokeColor = color.CGColor;
+    self.rippleLayerB.strokeColor = color.CGColor;
     self.statusDot.layer.backgroundColor = color.CGColor;
 
     self.toolTip = [NSString stringWithFormat:@"%@ · %@", agent.name, CPDisplayStatusTitle(status)];
@@ -322,28 +450,53 @@ static CGFloat CPDisplayStatusBreathDuration(CPDisplayStatus s) {
     [self applyAnimations];
 }
 
+- (CAAnimationGroup *)rippleAnimationWithDuration:(CGFloat)duration timeOffset:(CGFloat)timeOffset {
+    CABasicAnimation *scale = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
+    scale.fromValue = @0.55;
+    scale.toValue = @1.0;
+
+    CABasicAnimation *fade = [CABasicAnimation animationWithKeyPath:@"opacity"];
+    fade.fromValue = @0.85;
+    fade.toValue = @0.0;
+
+    CAAnimationGroup *group = [CAAnimationGroup animation];
+    group.animations = @[scale, fade];
+    group.duration = duration;
+    group.timeOffset = timeOffset; // 错峰：两条波纹错开半个周期
+    group.repeatCount = HUGE_VALF;
+    group.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+    group.removedOnCompletion = NO;
+    return group;
+}
+
 - (void)applyAnimations {
     [self.ringLayer removeAllAnimations];
     [self.innerRingLayer removeAllAnimations];
+    [self.rippleLayerA removeAllAnimations];
+    [self.rippleLayerB removeAllAnimations];
     self.ringLayer.opacity = 1.0;
     self.innerRingLayer.opacity = 1.0;
-    if (self.reduceMotion) return; // 减少动态效果：只保留静态外圈与状态点
+    if (self.reduceMotion) {
+        // 减少动态效果：不加任何动画，保留静态外圈与状态点。
+        self.rippleLayerA.hidden = YES;
+        self.rippleLayerB.hidden = YES;
+        self.rippleLayerA.opacity = 1.0;
+        self.rippleLayerB.opacity = 1.0;
+        return;
+    }
 
-    CGFloat duration = CPDisplayStatusBreathDuration(self.displayStatus);
-    CABasicAnimation *breath = [CABasicAnimation animationWithKeyPath:@"opacity"];
-    breath.fromValue = @1.0;
-    breath.toValue = self.displayStatus == CPDisplayStatusFailed ? @0.25 : @0.45;
-    breath.duration = duration;
-    breath.autoreverses = YES;
-    breath.repeatCount = HUGE_VALF;
-    breath.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
-    [self.ringLayer addAnimation:breath forKey:@"breath"];
+    CGFloat duration = CPDisplayStatusRippleDuration(self.displayStatus);
+    self.rippleLayerA.hidden = NO;
+    self.rippleLayerB.hidden = NO;
+    // 静态终值设为 0，动画从 timeOffset 相位接管，避免闪烁。
+    self.rippleLayerA.opacity = 0.0;
+    self.rippleLayerB.opacity = 0.0;
+    [self.rippleLayerA addAnimation:[self rippleAnimationWithDuration:duration timeOffset:0.0] forKey:@"rippleA"];
+    [self.rippleLayerB addAnimation:[self rippleAnimationWithDuration:duration timeOffset:duration / 2.0] forKey:@"rippleB"];
 
     if (!self.innerRingLayer.hidden) {
-        CABasicAnimation *inner = [breath copy];
-        inner.toValue = @0.55;
-        inner.timeOffset = duration / 2.0; // 相位错开，形成双层呼吸
-        [self.innerRingLayer addAnimation:inner forKey:@"breath"];
+        // 待查验：内圈保留一条蓝色涟漪，形成双层蓝色波纹。
+        [self.innerRingLayer addAnimation:[self rippleAnimationWithDuration:duration timeOffset:duration / 4.0] forKey:@"rippleInner"];
     }
 }
 
@@ -612,6 +765,7 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
                                              styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
                                                backing:NSBackingStoreBuffered
                                                  defer:NO];
+    self.window.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]; // 工作台始终深色
     self.window.level = NSFloatingWindowLevel;
     self.window.opaque = NO;
     self.window.backgroundColor = NSColor.clearColor;
@@ -727,7 +881,7 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
 
     self.leftColumn = [self columnWithBackground:CPBg()];
     self.middleColumn = [self columnWithBackground:CPSurface()];
-    self.rightColumn = [self columnWithBackground:[NSColor colorWithSRGBRed:0.980 green:0.980 blue:0.976 alpha:1.0]];
+    self.rightColumn = [self columnWithBackground:CPDyn(0.110, 0.120, 0.160, 0.095, 0.105, 0.140)];
 
     [self.leftColumn setContentHuggingPriority:NSLayoutPriorityDefaultHigh forOrientation:NSLayoutConstraintOrientationHorizontal];
     [self.middleColumn setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
@@ -826,7 +980,7 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     [head.heightAnchor constraintEqualToConstant:36].active = YES;
 
     self.centerTitle = CPLabel(@"Codex", 22, NSFontWeightSemibold, CPFg());
-    self.centerTitle.font = [NSFont fontWithName:@"Georgia" size:22] ?: [NSFont systemFontOfSize:22 weight:NSFontWeightSemibold];
+    self.centerTitle.font = [NSFont systemFontOfSize:22 weight:NSFontWeightSemibold];
     self.centerMeta = CPLabel(@"0 个活动", 11, NSFontWeightRegular, CPMuted());
     NSStackView *text = [NSStackView stackViewWithViews:@[self.centerTitle, self.centerMeta]];
     text.orientation = NSUserInterfaceLayoutOrientationVertical;
@@ -881,12 +1035,13 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
 }
 
 - (NSButton *)agentRow:(CPAgent *)agent selected:(BOOL)selected {
-    NSButton *row = [NSButton buttonWithTitle:@"" target:self action:@selector(agentClicked:)];
+    NSButton *row = [CPHoverButton buttonWithTitle:@"" target:self action:@selector(agentClicked:)];
     row.bordered = NO;
     [row setButtonType:NSButtonTypeMomentaryChange];
     row.wantsLayer = YES;
     row.layer.cornerRadius = 8.0;
-    row.layer.backgroundColor = selected ? [NSColor colorWithSRGBRed:0.945 green:0.957 blue:1.0 alpha:1.0].CGColor : [NSColor clearColor].CGColor;
+    row.layer.borderWidth = 0.0;
+    ((CPHoverButton *)row).cpBaseBackground = selected ? CPDyn(0.24, 0.32, 0.50, 0.20, 0.28, 0.45) : NSColor.clearColor;
     row.tag = [self.agents indexOfObject:agent];
     row.translatesAutoresizingMaskIntoConstraints = NO;
     [row.heightAnchor constraintEqualToConstant:36].active = YES;
@@ -929,12 +1084,13 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
 }
 
 - (NSButton *)taskRow:(CPTask *)task index:(NSInteger)index {
-    NSButton *row = [NSButton buttonWithTitle:@"" target:self action:@selector(taskClicked:)];
+    NSButton *row = [CPHoverButton buttonWithTitle:@"" target:self action:@selector(taskClicked:)];
     row.bordered = NO;
     [row setButtonType:NSButtonTypeMomentaryChange];
     row.wantsLayer = YES;
     row.layer.cornerRadius = 10.0;
-    row.layer.backgroundColor = [NSColor clearColor].CGColor;
+    row.layer.borderWidth = 0.0;
+    ((CPHoverButton *)row).cpBaseBackground = NSColor.clearColor;
     row.tag = index;
     row.translatesAutoresizingMaskIntoConstraints = NO;
     [row.heightAnchor constraintEqualToConstant:56].active = YES;
@@ -1008,7 +1164,7 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     }
 
     // Add Agent placeholder
-    NSButton *add = [NSButton buttonWithTitle:@"+ 添加 Agent" target:self action:@selector(addAgent:)];
+    NSButton *add = [CPHoverButton buttonWithTitle:@"+ 添加 Agent" target:self action:@selector(addAgent:)];
     add.bordered = NO;
     add.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
     add.contentTintColor = CPMuted();
@@ -1290,6 +1446,7 @@ static const CGFloat CPBarWorkbenchWidth = 82.0;
                                              styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
                                                backing:NSBackingStoreBuffered
                                                  defer:NO];
+    self.window.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]; // Dock 始终深色
     self.window.level = NSStatusWindowLevel + 1;
     self.window.opaque = NO;
     self.window.backgroundColor = NSColor.clearColor;
@@ -1397,8 +1554,9 @@ static const CGFloat CPBarWorkbenchWidth = 82.0;
     self.barView = barView;
     [self.pill addSubview:barView];
 
-    NSButton *logo = [NSButton buttonWithTitle:@"工作台" target:self action:@selector(barLogoClicked:)];
+    NSButton *logo = [CPHoverButton buttonWithTitle:@"工作台" target:self action:@selector(barLogoClicked:)];
     logo.bordered = NO;
+    logo.layer.cornerRadius = 16.0;
     logo.image = CPSymbol(@"waveform.path.ecg", 17, CPAccent());
     logo.imagePosition = NSImageLeading;
     logo.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
@@ -1464,8 +1622,9 @@ static const CGFloat CPBarWorkbenchWidth = 82.0;
     for (CPAgent *agent in self.agents) {
         if (agent.placeholder) continue;
         NSString *buttonTitle = [NSString stringWithFormat:@"%@ · %@", agent.name, CPStatusTitle(agent.status)];
-        NSButton *btn = [NSButton buttonWithTitle:buttonTitle target:self action:@selector(barAgentClicked:)];
+        NSButton *btn = [CPHoverButton buttonWithTitle:buttonTitle target:self action:@selector(barAgentClicked:)];
         btn.bordered = NO;
+        btn.layer.borderWidth = 0.0;
         btn.image = CPSymbol(agent.iconName, 14, agent == self.selectedAgent ? CPAccent() : CPFg2());
         btn.imagePosition = NSImageLeading;
         btn.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
@@ -1475,7 +1634,7 @@ static const CGFloat CPBarWorkbenchWidth = 82.0;
         btn.accessibilityLabel = [NSString stringWithFormat:@"%@，%@", agent.name, CPStatusTitle(agent.status)];
         btn.wantsLayer = YES;
         btn.layer.cornerRadius = CPBarItem / 2.0;
-        btn.layer.backgroundColor = (agent == self.selectedAgent ? [NSColor colorWithSRGBRed:0.91 green:0.94 blue:1.0 alpha:1.0] : NSColor.clearColor).CGColor;
+        ((CPHoverButton *)btn).cpBaseBackground = agent == self.selectedAgent ? CPDyn(0.24, 0.32, 0.50, 0.20, 0.28, 0.45) : NSColor.clearColor;
         btn.translatesAutoresizingMaskIntoConstraints = NO;
         CGFloat labelWidth = [buttonTitle sizeWithAttributes:@{NSFontAttributeName: btn.font}].width;
         CGFloat itemWidth = MAX(68.0, labelWidth + 36.0);
@@ -1822,7 +1981,7 @@ static const CGFloat CPBarWorkbenchWidth = 82.0;
     self = [super initWithFrame:frame];
     if (!self) return nil;
     self.wantsLayer = YES;
-    self.layer.backgroundColor = [NSColor colorWithSRGBRed:0.0 green:0.0 blue:0.0 alpha:0.06].CGColor;
+    self.layer.backgroundColor = [NSColor colorWithSRGBRed:1.0 green:1.0 blue:1.0 alpha:0.12].CGColor;
     self.layer.cornerRadius = 2.0;
 
     NSView *fill = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 0, frame.size.height)];
@@ -1920,6 +2079,7 @@ static const CGFloat CPHUDAgentColumn = 84.0;
                                              styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
                                                backing:NSBackingStoreBuffered
                                                  defer:NO];
+    self.window.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]; // HUD 始终深色
     self.window.level = NSStatusWindowLevel + 2;
     self.window.opaque = NO;
     self.window.backgroundColor = NSColor.clearColor;
@@ -1971,7 +2131,7 @@ static const CGFloat CPHUDAgentColumn = 84.0;
 
     // Header
     NSTextField *title = [NSTextField labelWithString:@"Pulse"];
-    title.font = [NSFont fontWithName:@"Georgia" size:16] ?: [NSFont systemFontOfSize:16 weight:NSFontWeightSemibold];
+    title.font = [NSFont systemFontOfSize:16 weight:NSFontWeightSemibold];
     title.textColor = CPFg();
     title.translatesAutoresizingMaskIntoConstraints = NO;
     [container addSubview:title];
@@ -1985,7 +2145,7 @@ static const CGFloat CPHUDAgentColumn = 84.0;
     // Agent column
     NSView *agentColumn = [[NSView alloc] initWithFrame:NSZeroRect];
     agentColumn.wantsLayer = YES;
-    agentColumn.layer.backgroundColor = [NSColor colorWithSRGBRed:0.0 green:0.0 blue:0.0 alpha:0.03].CGColor;
+    agentColumn.layer.backgroundColor = [NSColor colorWithSRGBRed:1.0 green:1.0 blue:1.0 alpha:0.06].CGColor;
     agentColumn.layer.cornerRadius = 12.0;
     agentColumn.translatesAutoresizingMaskIntoConstraints = NO;
     [container addSubview:agentColumn];
@@ -2349,7 +2509,7 @@ static const CGFloat CPHUDAgentColumn = 84.0;
     ]];
 
     NSTextField *title = CPLabel(@"Codex Pulse", 18, NSFontWeightSemibold, CPFg());
-    title.font = [NSFont fontWithName:@"Georgia" size:18] ?: title.font;
+    title.font = [NSFont systemFontOfSize:18 weight:NSFontWeightSemibold];
     [stack addArrangedSubview:title];
 }
 
@@ -2720,17 +2880,27 @@ int main(int argc, const char *argv[]) {
                 BOOL expectDouble = s == CPDisplayStatusCompletedPendingReview;
                 if (b.innerRingLayer.hidden != !expectDouble) blueDoubleOK = NO;
                 if (expectDouble && !CGColorEqualToColor(b.innerRingLayer.strokeColor, CPBlue().CGColor)) blueDoubleOK = NO;
-                if (b.ringLayer.animationKeys.count != 0 || b.innerRingLayer.animationKeys.count != 0) reduceMotionOK = NO;
+                if (b.ringLayer.animationKeys.count != 0 || b.innerRingLayer.animationKeys.count != 0 ||
+                    b.rippleLayerA.animationKeys.count != 0 || b.rippleLayerB.animationKeys.count != 0 ||
+                    !b.rippleLayerA.hidden || !b.rippleLayerB.hidden) reduceMotionOK = NO;
             }
             CPAgentStatusButton *motionBtn = [[CPAgentStatusButton alloc] initWithFrame:NSMakeRect(0, 0, 38, 38)];
             motionBtn.reduceMotion = NO;
             [motionBtn updateWithAgent:CPTestAgent(@"motion-test", @[]) displayStatus:CPDisplayStatusWorking selected:NO];
-            BOOL motionAnimOK = [motionBtn.ringLayer.animationKeys containsObject:@"breath"];
+            CAAnimation *rippleA = [motionBtn.rippleLayerA animationForKey:@"rippleA"];
+            CAAnimation *rippleB = [motionBtn.rippleLayerB animationForKey:@"rippleB"];
+            BOOL motionAnimOK = rippleA != nil && rippleB != nil &&
+                                rippleA.timeOffset != rippleB.timeOffset &&
+                                rippleA.repeatCount > 1000.0f && rippleB.repeatCount > 1000.0f;
             CPAgentStatusButton *blueBtn = [[CPAgentStatusButton alloc] initWithFrame:NSMakeRect(0, 0, 38, 38)];
             blueBtn.reduceMotion = NO;
             [blueBtn updateWithAgent:CPTestAgent(@"blue-test", @[]) displayStatus:CPDisplayStatusCompletedPendingReview selected:NO];
-            BOOL blueAnimOK = [blueBtn.ringLayer.animationKeys containsObject:@"breath"] &&
-                              [blueBtn.innerRingLayer.animationKeys containsObject:@"breath"];
+            BOOL blueAnimOK = [blueBtn.rippleLayerA.animationKeys containsObject:@"rippleA"] &&
+                              [blueBtn.rippleLayerB.animationKeys containsObject:@"rippleB"] &&
+                              [blueBtn.innerRingLayer.animationKeys containsObject:@"rippleInner"] &&
+                              CGColorEqualToColor(blueBtn.rippleLayerA.strokeColor, CPBlue().CGColor) &&
+                              CGColorEqualToColor(blueBtn.rippleLayerB.strokeColor, CPBlue().CGColor) &&
+                              CGColorEqualToColor(blueBtn.innerRingLayer.strokeColor, CPBlue().CGColor);
 
             CPHUDWindowController *hud2 = CPHUDWindowController.new;
             hud2.reviewStore = uiStore;
@@ -2846,8 +3016,10 @@ int main(int argc, const char *argv[]) {
             for (NSInteger i = 0; i < 3; i++) {
                 [hBtn updateWithAgent:hAgent displayStatus:CPDisplayStatusWorking selected:YES];
             }
-            BOOL singleBreathKey = [hBtn.ringLayer.animationKeys isEqualToArray:@[@"breath"]] &&
-                                   hBtn.innerRingLayer.animationKeys.count == 0;
+            BOOL singleRippleKeys = [hBtn.rippleLayerA.animationKeys isEqualToArray:@[@"rippleA"]] &&
+                                    [hBtn.rippleLayerB.animationKeys isEqualToArray:@[@"rippleB"]] &&
+                                    hBtn.ringLayer.animationKeys.count == 0 &&
+                                    hBtn.innerRingLayer.animationKeys.count == 0;
 
             CPDockWindowController *dock4 = CPDockWindowController.new;
             [dock4 renderWithAgents:@[hAgent] selectedAgent:hAgent];
@@ -2866,15 +3038,88 @@ int main(int argc, const char *argv[]) {
             [m4Defaults synchronize];
 
             BOOL m4ui = refreshNewInstances && drawerKeptOnRefresh && refreshNoMark &&
-                        agentFallback && taskGoneClosesDrawer && hudNoDupButtons && singleBreathKey &&
+                        agentFallback && taskGoneClosesDrawer && hudNoDupButtons && singleRippleKeys &&
                         dockOrbVisible && dockBarVisible && dockCallbackOK && sqliteReadonly && singleInstanceGuard;
+
+            // M5: 深色动态 token、窗口强制深色、标题截断、任务卡数量上限与空态
+            NSAppearance *aquaApp = [NSAppearance appearanceNamed:NSAppearanceNameAqua];
+            NSAppearance *darkApp = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+            NSColor * (^resolveWith)(NSColor *, NSAppearance *) = ^NSColor *(NSColor *c, NSAppearance *app) {
+                __block NSColor *rgb = nil;
+                [app performAsCurrentDrawingAppearance:^{
+                    rgb = [c colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
+                }];
+                return rgb;
+            };
+            NSColor *fgAqua = resolveWith(CPFg(), aquaApp);
+            NSColor *fgDarkAqua = resolveWith(CPFg(), darkApp);
+            NSColor *surfaceAqua = resolveWith(CPSurface(), aquaApp);
+            NSColor *surfaceDarkAqua = resolveWith(CPSurface(), darkApp);
+            CGFloat fgar = 0, fgdr = 0, sgdr = 0, sgdg = 0, sgdb = 0;
+            [fgAqua getRed:&fgar green:NULL blue:NULL alpha:NULL];
+            [fgDarkAqua getRed:&fgdr green:NULL blue:NULL alpha:NULL];
+            [surfaceDarkAqua getRed:&sgdr green:&sgdg blue:&sgdb alpha:NULL];
+            BOOL dynamicTokensOK = fabs(fgar - fgdr) > 0.001 &&
+                                   !CGColorEqualToColor(surfaceAqua.CGColor, surfaceDarkAqua.CGColor);
+            BOOL darkBaseOK = fgdr > 0.8 && sgdr < 0.3 && sgdg < 0.3 && sgdb < 0.3; // 主基调为深色
+            BOOL contrastAdjustOK = CPContrastAdjustChannel(0.9) > 0.9 && CPContrastAdjustChannel(0.2) < 0.2;
+            BOOL darkWindowsOK = [card.window.appearance.name isEqualToString:NSAppearanceNameDarkAqua] &&
+                                 [hud.window.appearance.name isEqualToString:NSAppearanceNameDarkAqua] &&
+                                 [dock.window.appearance.name isEqualToString:NSAppearanceNameDarkAqua];
+
+            NSString *longTitle = [@"" stringByPaddingToLength:200 withString:@"超长任务标题" startingAtIndex:0];
+            NSString *cleaned = CPCleanTitle((const unsigned char *)longTitle.UTF8String);
+            BOOL cleanTruncates = cleaned.length <= 59 && [cleaned hasSuffix:@"…"];
+            CPTask *longTask = CPTestTask(@"lt", CPStatusWorking, 1);
+            longTask.title = longTitle;
+            CPAgent *manyAgent = CPTestAgent(@"many", @[longTask,
+                                                         CPTestTask(@"m2", CPStatusWorking, 2),
+                                                         CPTestTask(@"m3", CPStatusWaiting, 3),
+                                                         CPTestTask(@"m4", CPStatusWorking, 4),
+                                                         CPTestTask(@"m5", CPStatusWorking, 5)]);
+            CPHUDWindowController *hud5 = CPHUDWindowController.new;
+            [hud5 updateWithAgents:@[manyAgent] selectedAgent:manyAgent];
+            BOOL taskCapOK = hud5.taskList.arrangedSubviews.count == 3; // HUD 最多 3 张任务卡
+            BOOL titleTruncates = cleanTruncates;
+            if (taskCapOK) {
+                NSStackView *row = (NSStackView *)hud5.taskList.arrangedSubviews.firstObject;
+                NSStackView *labelStack = row.arrangedSubviews.count > 1 ? (NSStackView *)row.arrangedSubviews[1] : nil;
+                NSTextField *titleLabel = labelStack.arrangedSubviews.count ? (NSTextField *)labelStack.arrangedSubviews.firstObject : nil;
+                titleTruncates = titleTruncates &&
+                                 [titleLabel isKindOfClass:NSTextField.class] &&
+                                 titleLabel.lineBreakMode == NSLineBreakByTruncatingTail &&
+                                 titleLabel.maximumNumberOfLines == 1 &&
+                                 titleLabel.intrinsicContentSize.width > 150.0; // 内容超宽,靠截断不破版
+            }
+            CPAgent *emptyAgent = CPTestAgent(@"empty", @[]);
+            [hud5 updateWithAgents:@[emptyAgent] selectedAgent:emptyAgent];
+            NSView *emptyView = hud5.taskList.arrangedSubviews.firstObject;
+            BOOL emptyStateOK = hud5.taskList.arrangedSubviews.count == 1 &&
+                                [emptyView isKindOfClass:NSTextField.class] &&
+                                [((NSTextField *)emptyView).stringValue isEqualToString:@"当前没有任务"];
+
+            CPWorkbenchCardController *card5 = CPWorkbenchCardController.new;
+            card5.reviewStore = [[CPReviewStore alloc] initWithDefaults:m4Defaults];
+            [card5 renderAgents:@[manyAgent]];
+            BOOL workTitleTruncates = NO;
+            if (card5.taskStack.arrangedSubviews.count > 1) {
+                NSButton *rowBtn = (NSButton *)card5.taskStack.arrangedSubviews[1];
+                NSStackView *hStack = (NSStackView *)rowBtn.subviews.firstObject;
+                NSStackView *textStack = hStack.arrangedSubviews.count > 1 ? (NSStackView *)hStack.arrangedSubviews[1] : nil;
+                NSTextField *rowTitle = textStack.arrangedSubviews.count ? (NSTextField *)textStack.arrangedSubviews.firstObject : nil;
+                workTitleTruncates = [rowTitle isKindOfClass:NSTextField.class] &&
+                                     rowTitle.lineBreakMode == NSLineBreakByTruncatingTail;
+            }
+
+            BOOL m5ui = dynamicTokensOK && darkBaseOK && contrastAdjustOK && darkWindowsOK &&
+                        titleTruncates && taskCapOK && emptyStateOK && workTitleTruncates;
 
             BOOL passed = centered && draggableHeader && labeledWorkbench && onlyRealAgents && labeledAgent && buttonReceivesClick &&
                           cardMasksToBounds && shadowCarrierNoMasks && cardIsChildOfShadowCarrier && windowHasWorkbenchInset &&
                           fixedCardSize && twoColumn && rightOverlayHidden &&
                           hudCollapsed6x72 && hudCollapsedOnMainScreen && hudExpanded344x224 && hudExpandedOnMainScreen &&
                           shadowCarrierScales && handleAnchoredTopRight && contentNotSizable && hudClickViewIsBackgroundView &&
-                          hudVisualFrameExact && hudHandleTopRight && m2ui && m3ui && m3entries && m4ui;
+                          hudVisualFrameExact && hudHandleTopRight && m2ui && m3ui && m3entries && m4ui && m5ui;
             NSMutableString *result = [NSMutableString stringWithFormat:
                 @"Codex Pulse UI self-test: center=%@ drag=%@ workbench-label=%@ real-agents=%@ agent-label=%@ button-hit=%@ "
                 @"card-mask=%@ carrier-mask=%@ card-child=%@ win-inset=%@ card-520x360=%@ two-column=%@ right-overlay=%@ "
@@ -2904,7 +3149,7 @@ int main(int argc, const char *argv[]) {
                 hudClickViewIsBackgroundView ? @"OK" : @"FAIL",
                 hudVisualFrameExact ? @"OK" : @"FAIL",
                 hudHandleTopRight ? @"OK" : @"FAIL"];
-            [result appendFormat:@"M2 UI self-test: ring-colors=%@ blue-double=%@ reduce-motion=%@ motion-anim=%@ blue-anim=%@ hud-agent-scope=%@ hud-select-by-id=%@\n",
+            [result appendFormat:@"M2 UI self-test: ring-colors=%@ blue-double=%@ reduce-motion=%@ ripple-anim=%@ ripple-blue=%@ hud-agent-scope=%@ hud-select-by-id=%@\n",
                 ringColorsOK ? @"OK" : @"FAIL",
                 blueDoubleOK ? @"OK" : @"FAIL",
                 reduceMotionOK ? @"OK" : @"FAIL",
@@ -2923,19 +3168,28 @@ int main(int argc, const char *argv[]) {
                 reshowVisible ? @"OK" : @"FAIL",
                 reshowCentered ? @"OK" : @"FAIL",
                 reshowFixedSize ? @"OK" : @"FAIL"];
-            [result appendFormat:@"M4 UI self-test: refresh-new-instances=%@ drawer-kept=%@ refresh-no-mark=%@ agent-fallback=%@ task-gone-close=%@ hud-no-dup=%@ single-breath=%@ dock-orb=%@ dock-bar=%@ dock-callback=%@ sqlite-readonly=%@ single-instance=%@\n",
+            [result appendFormat:@"M4 UI self-test: refresh-new-instances=%@ drawer-kept=%@ refresh-no-mark=%@ agent-fallback=%@ task-gone-close=%@ hud-no-dup=%@ single-ripple=%@ dock-orb=%@ dock-bar=%@ dock-callback=%@ sqlite-readonly=%@ single-instance=%@\n",
                 refreshNewInstances ? @"OK" : @"FAIL",
                 drawerKeptOnRefresh ? @"OK" : @"FAIL",
                 refreshNoMark ? @"OK" : @"FAIL",
                 agentFallback ? @"OK" : @"FAIL",
                 taskGoneClosesDrawer ? @"OK" : @"FAIL",
                 hudNoDupButtons ? @"OK" : @"FAIL",
-                singleBreathKey ? @"OK" : @"FAIL",
+                singleRippleKeys ? @"OK" : @"FAIL",
                 dockOrbVisible ? @"OK" : @"FAIL",
                 dockBarVisible ? @"OK" : @"FAIL",
                 dockCallbackOK ? @"OK" : @"FAIL",
                 sqliteReadonly ? @"OK" : @"FAIL",
                 singleInstanceGuard ? @"OK" : @"FAIL"];
+            [result appendFormat:@"M5 UI self-test: dynamic-tokens=%@ dark-base=%@ contrast-adjust=%@ dark-windows=%@ title-truncate=%@ task-cap=%@ empty-state=%@ work-title-truncate=%@\n",
+                dynamicTokensOK ? @"OK" : @"FAIL",
+                darkBaseOK ? @"OK" : @"FAIL",
+                contrastAdjustOK ? @"OK" : @"FAIL",
+                darkWindowsOK ? @"OK" : @"FAIL",
+                titleTruncates ? @"OK" : @"FAIL",
+                taskCapOK ? @"OK" : @"FAIL",
+                emptyStateOK ? @"OK" : @"FAIL",
+                workTitleTruncates ? @"OK" : @"FAIL"];
             if (!centered) {
                 [result appendFormat:@"  diagnostic: testVisible=%@ cardFrame=%@ hasScreen=%@\n",
                  NSStringFromRect(testVisible), NSStringFromRect(cardFrame), hasScreen ? @"YES" : @"NO"];
@@ -2999,7 +3253,26 @@ int main(int argc, const char *argv[]) {
                 prFailed ? @"OK" : @"FAIL", prWaiting ? @"OK" : @"FAIL", prAttention ? @"OK" : @"FAIL",
                 prBlue ? @"OK" : @"FAIL", prWorking ? @"OK" : @"FAIL", prIdle ? @"OK" : @"FAIL"];
             fputs(m2line.UTF8String, stdout);
-            return (taskCount > 0 && m2) ? 0 : 2;
+
+            // M6: CPCleanTitle 脏文本清洗
+            BOOL ctDirty = [CPCleanTitle((const unsigned char *)"想让你设计一个loop [11] user: <in-app-browser-context>秘密上下文</in-app-browser-context>")
+                            isEqualToString:@"想让你设计一个loop"];
+            BOOL ctLooseTag = [CPCleanTitle((const unsigned char *)"<in-app-browser-context> 修复登录页崩溃")
+                               isEqualToString:@"修复登录页崩溃"];
+            BOOL ctTranscript = [CPCleanTitle((const unsigned char *)"The following is the Codex agent history.\n>>> TRANSCRIPT START\n[3] user: 帮我修复构建错误\n>>> TRANSCRIPT END")
+                                 isEqualToString:@"帮我修复构建错误"];
+            BOOL ctPlain = [CPCleanTitle((const unsigned char *)"普通标题") isEqualToString:@"普通标题"];
+            BOOL ctNil = [CPCleanTitle(NULL) isEqualToString:@"未命名任务"];
+            NSString *longRaw = [@"" stringByPaddingToLength:100 withString:@"a" startingAtIndex:0];
+            NSString *ctLong = CPCleanTitle((const unsigned char *)longRaw.UTF8String);
+            BOOL ctTrunc = ctLong.length == 59 && [ctLong hasSuffix:@"…"];
+            BOOL m6 = ctDirty && ctLooseTag && ctTranscript && ctPlain && ctNil && ctTrunc;
+            NSString *m6line = [NSString stringWithFormat:
+                @"M6 self-test: clean-dirty=%@ clean-loose-tag=%@ clean-transcript=%@ clean-plain=%@ clean-nil=%@ clean-truncate=%@\n",
+                ctDirty ? @"OK" : @"FAIL", ctLooseTag ? @"OK" : @"FAIL", ctTranscript ? @"OK" : @"FAIL",
+                ctPlain ? @"OK" : @"FAIL", ctNil ? @"OK" : @"FAIL", ctTrunc ? @"OK" : @"FAIL"];
+            fputs(m6line.UTF8String, stdout);
+            return (taskCount > 0 && m2 && m6) ? 0 : 2;
         }
         if (CPAnotherInstanceIsRunning()) return 0;
         NSApplication *app = NSApplication.sharedApplication;
