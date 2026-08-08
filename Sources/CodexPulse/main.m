@@ -38,8 +38,6 @@ static NSColor *CPBlue(void) { return CPDyn(0.420, 0.590, 1.000, 0.480, 0.640, 1
 static NSColor *CPOrange(void) { return CPDyn(1.000, 0.620, 0.240, 1.000, 0.660, 0.300); }
 static NSColor *CPRed(void) { return CPDyn(1.000, 0.420, 0.430, 1.000, 0.470, 0.480); }
 static NSColor *CPGreen(void) { return CPDyn(0.330, 0.860, 0.450, 0.380, 0.890, 0.500); }
-// 悬浮球涟漪：清晰的蓝青 accent，深底上可辨、不像灰色系统描边。
-static NSColor *CPOrbRippleColor(void) { return CPDyn(0.300, 0.720, 1.000, 0.360, 0.780, 1.000); }
 
 #pragma mark - Status
 
@@ -249,6 +247,199 @@ static CPDisplayStatus CPDisplayStatusForTasks(NSArray<CPTask *> *tasks, NSStrin
     return CPDisplayStatusIdle;
 }
 
+#pragma mark - Unified Ripple Component (CPRippleView)
+
+// 前向声明:涟漪组件需要在其实际定义(见下文 Agent Status Button 段)之前取状态色/标题。
+static NSString *CPDisplayStatusTitle(CPDisplayStatus s);
+static NSColor *CPDisplayStatusColor(CPDisplayStatus s);
+
+// 定稿涟漪参数(ripple-selection-preview.html 逐轮确认):
+// 8 层同心涟漪,每层明暗成对(一圈半透明白峰 + 一圈半透明黑谷紧邻,两层描边 CALayer 成对扩散);
+// 基准周期 12s,层间错峰 1/8 周期(1.5s),缓入缓出(出发极平缓、中后程荡到外围);
+// scale 1.0→1.55,线宽 2.0→0.5(能量摊薄),透明度长尾巴衰减(场上同时保持四五层)。
+// 状态差异只调周期:失败最快、待机最慢;层数、曲线、错峰比例统一。
+static CGFloat CPRippleDurationForStatus(CPDisplayStatus s) {
+    switch (s) {
+        case CPDisplayStatusFailed: return 8.0;                 // 失败,最快
+        case CPDisplayStatusWaiting: return 9.6;                // 等待处理
+        case CPDisplayStatusCompletedPendingReview: return 10.8;// 完成待查验
+        case CPDisplayStatusWorking: return 12.0;               // 运行中,基准周期
+        case CPDisplayStatusIdle: return 14.0;                  // 待机,最慢
+    }
+}
+
+// 水波时间曲线:缓入缓出,等价 CSS cubic-bezier(0.45, 0.08, 0.35, 1)——波刚出发几乎不推进,中后程荡到外围。
+static CAMediaTimingFunction *CPRippleTimingFunction(void) {
+    return [CAMediaTimingFunction functionWithControlPoints:0.45 :0.08 :0.35 :1.0];
+}
+
+// 8 层错峰涟漪公共参数:scale 1.0→1.55,lineWidth 2.0→0.5,层间错峰 = duration/8。
+static const CGFloat CPRippleScaleTo = 1.55;
+static const CGFloat CPRippleLineWidthFrom = 2.0;
+static const CGFloat CPRippleLineWidthTo = 0.5;
+static const NSInteger CPRippleLayerCount = 8;
+
+// 明暗对的整体强度(HUD 深色底):白峰峰值 alpha ~0.22,黑谷 ~0.18;悬浮球(底更亮)略高。
+static const CGFloat CPRippleCrestAlpha = 0.22;
+static const CGFloat CPRippleTroughAlpha = 0.18;
+
+// 单个涟漪动画组:扩散 + 透明度时间轴 + 线宽渐细,同一缓入缓出曲线,无限重复。
+// 透明度时间轴(相对值乘 peakAlpha):0%→0,26%→峰值,45%→0.647,70%→0.329,88%→~0.06,100%→0。
+static CAAnimationGroup *CPRippleAnimationGroup(CGFloat duration, CGFloat timeOffset, CGFloat peakAlpha) {
+    CABasicAnimation *scale = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
+    scale.fromValue = @1.0;
+    scale.toValue = @(CPRippleScaleTo);
+    CAKeyframeAnimation *fade = [CAKeyframeAnimation animationWithKeyPath:@"opacity"];
+    fade.keyTimes = @[@0.0, @0.26, @0.45, @0.70, @0.88, @1.0];
+    fade.values = @[@0.0,
+                    @(peakAlpha),
+                    @(peakAlpha * 0.55 / 0.85),
+                    @(peakAlpha * 0.28 / 0.85),
+                    @(peakAlpha * 0.05 / 0.85),
+                    @0.0];
+    CABasicAnimation *thin = [CABasicAnimation animationWithKeyPath:@"lineWidth"];
+    thin.fromValue = @(CPRippleLineWidthFrom);
+    thin.toValue = @(CPRippleLineWidthTo);
+    CAAnimationGroup *group = [CAAnimationGroup animation];
+    group.animations = @[scale, fade, thin];
+    group.duration = duration;
+    group.timeOffset = timeOffset;
+    group.repeatCount = HUGE_VALF;
+    group.timingFunction = CPRippleTimingFunction();
+    group.removedOnCompletion = NO;
+    return group;
+}
+
+// 明暗成对扩散:白峰(crest)与黑谷(trough)同相位、同周期,只 alpha 不同,层间错峰 duration/8。
+static void CPRippleApplyPairAnimations(CAShapeLayer *crest, CAShapeLayer *trough, NSInteger index,
+                                        CGFloat duration, CGFloat crestAlpha, CGFloat troughAlpha) {
+    CGFloat offset = duration * (CGFloat)index / (CGFloat)CPRippleLayerCount;
+    crest.hidden = NO;
+    crest.opacity = 0.0; // 静态终值 0,动画从 timeOffset 相位接管,避免闪烁
+    [crest addAnimation:CPRippleAnimationGroup(duration, offset, crestAlpha)
+                 forKey:[NSString stringWithFormat:@"ripple%ld", (long)index]];
+    trough.hidden = NO;
+    trough.opacity = 0.0;
+    [trough addAnimation:CPRippleAnimationGroup(duration, offset, troughAlpha)
+                  forKey:[NSString stringWithFormat:@"trough%ld", (long)index]];
+}
+
+// 汇聚全部 agent 的最高优先状态(CPDisplayStatus 枚举值随严重度递增:idle < working < pending-review < waiting < failed)。
+static CPDisplayStatus CPDisplayStatusForAgents(NSArray<CPAgent *> *agents, CPReviewStore *reviewStore) {
+    CPDisplayStatus overall = CPDisplayStatusIdle;
+    for (CPAgent *a in agents) {
+        if (a.placeholder) continue;
+        CPDisplayStatus s = CPDisplayStatusForTasks(a.tasks, a.agentID, reviewStore);
+        if (s > overall) overall = s;
+    }
+    return overall;
+}
+
+// CPRippleView:统一水波组件(定稿规范)。
+// - 固定中心:自身只承载描边圆环 layer,中心图标由宿主提供且永不缩放;
+// - 固定基础环 baseRingLayer:固定半径、固定线宽,始终静止显示状态色;
+// - 8 层明暗成对涟漪 rippleLayers(白峰)/rippleTroughLayers(黑谷):scale 1.0 → 1.55,
+//   透明度 0→峰值→长尾巴衰减→0,lineWidth 2.0 → 0.5,缓入缓出(0.45,0.08,0.35,1),
+//   repeat forever,层间 timeOffset = duration/8(基准 12s 即 1.5s)错拍;
+// - 波层在组件内先于基础环加入,宿主把组件放在图标之下,波从图标边缘水面露出;
+// - reduce motion:停止所有 CAAnimation,只留固定状态环(实色),不缩放不闪烁;
+// - 组件按 1.55 倍扩散预留自身 frame,不改变父视图尺寸,也不改变宿主按钮 frame。
+@interface CPRippleView : NSView
+@property (nonatomic) CPDisplayStatus displayStatus; // 决定颜色与扩散速度
+@property (nonatomic) BOOL reduceMotion;             // 停止动画,只留固定状态环(实色)
+@property (nonatomic) BOOL rippleSuppressed;         // hover/drag 时暂时隐藏动效
+@property (nonatomic) CGFloat ripplePeakOpacity;     // 白峰峰值 alpha(默认 0.22,悬浮球用 0.28 更明显)
+@property (nonatomic, readonly) CAShapeLayer *baseRingLayer;
+@property (nonatomic, readonly) NSArray<CAShapeLayer *> *rippleLayers;       // 8 层白峰
+@property (nonatomic, readonly) NSArray<CAShapeLayer *> *rippleTroughLayers; // 8 层黑谷
+- (instancetype)initWithRingDiameter:(CGFloat)diameter lineWidth:(CGFloat)lineWidth;
+- (void)updateRipples;
+@end
+
+@implementation CPRippleView {
+    CGFloat _ringLineWidth; // 基础环静态线宽
+}
+
+- (instancetype)initWithRingDiameter:(CGFloat)diameter lineWidth:(CGFloat)lineWidth {
+    // frame 预留 1.55 倍扩散空间,放大后不会超出自身 bounds。
+    CGFloat side = ceil(diameter * CPRippleScaleTo + 3.0);
+    self = [super initWithFrame:NSMakeRect(0, 0, side, side)];
+    if (!self) return nil;
+    _displayStatus = CPDisplayStatusIdle;
+    _ripplePeakOpacity = CPRippleCrestAlpha;
+    _ringLineWidth = lineWidth;
+    self.wantsLayer = YES;
+
+    CGPoint center = CGPointMake(side / 2.0, side / 2.0);
+    CAShapeLayer * (^makeRing)(CGFloat ringDiameter, NSColor *stroke) = ^CAShapeLayer *(CGFloat ringDiameter, NSColor *stroke) {
+        CAShapeLayer *ring = [CAShapeLayer layer];
+        // layer 必须有明确 bounds/position/anchorPoint,path 画在 layer-local bounds 内,
+        // 否则 transform.scale 围绕默认零点缩放,弧线会漂移而不是绕中心同心扩散。
+        ring.bounds = NSMakeRect(0, 0, side, side);
+        ring.anchorPoint = CGPointMake(0.5, 0.5);
+        ring.position = center;
+        ring.fillColor = NSColor.clearColor.CGColor;
+        ring.lineWidth = lineWidth;
+        ring.path = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(center.x - ringDiameter / 2.0,
+                                                                      center.y - ringDiameter / 2.0,
+                                                                      ringDiameter, ringDiameter)].CGPath;
+        ring.strokeColor = stroke.CGColor;
+        ring.hidden = YES;
+        return ring;
+    };
+    // 波层沉在最底:先加 8 对涟漪(黑谷略靠外 1.2pt,与白峰紧邻成对),基础环在最上。
+    NSMutableArray<CAShapeLayer *> *crests = [NSMutableArray arrayWithCapacity:CPRippleLayerCount];
+    NSMutableArray<CAShapeLayer *> *troughs = [NSMutableArray arrayWithCapacity:CPRippleLayerCount];
+    for (NSInteger i = 0; i < CPRippleLayerCount; i++) {
+        CAShapeLayer *trough = makeRing(diameter + 2.4, NSColor.blackColor);
+        CAShapeLayer *crest = makeRing(diameter, NSColor.whiteColor);
+        [self.layer addSublayer:trough];
+        [self.layer addSublayer:crest];
+        [troughs addObject:trough];
+        [crests addObject:crest];
+    }
+    _rippleLayers = crests;
+    _rippleTroughLayers = troughs;
+    _baseRingLayer = makeRing(diameter, NSColor.clearColor);
+    _baseRingLayer.hidden = NO;
+    [self.layer addSublayer:_baseRingLayer];
+    return self;
+}
+
+- (NSArray<CAShapeLayer *> *)cpAllRippleLayers {
+    return [self.rippleTroughLayers arrayByAddingObjectsFromArray:self.rippleLayers];
+}
+
+- (void)updateRipples {
+    for (CAShapeLayer *ring in [self cpAllRippleLayers]) [ring removeAllAnimations];
+    NSColor *color = CPDisplayStatusColor(self.displayStatus);
+    // 固定基础环:固定半径、固定线宽、固定状态色,永不动画;reduce motion 时提升为实色固定环。
+    self.baseRingLayer.strokeColor = [color colorWithAlphaComponent:self.reduceMotion ? 1.0 : 0.5].CGColor;
+    self.baseRingLayer.lineWidth = _ringLineWidth;
+    self.baseRingLayer.opacity = 1.0;
+    self.baseRingLayer.hidden = NO;
+    if (self.reduceMotion) {
+        // 停止所有动画:只留固定状态环(实色),不缩放不闪烁。
+        for (CAShapeLayer *ring in [self cpAllRippleLayers]) {
+            ring.hidden = YES;
+            ring.opacity = 1.0;
+        }
+        return;
+    }
+    if (self.rippleSuppressed) {
+        for (CAShapeLayer *ring in [self cpAllRippleLayers]) ring.hidden = YES;
+        return;
+    }
+    CGFloat duration = CPRippleDurationForStatus(self.displayStatus);
+    CGFloat troughAlpha = self.ripplePeakOpacity * (CPRippleTroughAlpha / CPRippleCrestAlpha);
+    for (NSInteger i = 0; i < CPRippleLayerCount; i++) {
+        CPRippleApplyPairAnimations(self.rippleLayers[(NSUInteger)i], self.rippleTroughLayers[(NSUInteger)i],
+                                    i, duration, self.ripplePeakOpacity, troughAlpha);
+    }
+}
+
+@end
+
 #pragma mark - Helpers
 
 static NSTextField *CPLabel(NSString *text, CGFloat size, NSFontWeight weight, NSColor *color) {
@@ -266,7 +457,9 @@ static NSTextField *CPLabel(NSString *text, CGFloat size, NSFontWeight weight, N
 @property (nonatomic) BOOL cpAlwaysBorder; // 常驻 1px 描边(如详情关闭按钮)
 @end
 
-@implementation CPHoverButton
+@implementation CPHoverButton {
+    BOOL _cpHovered; // 显式 hover 状态:mouseEntered/Exited 维护,hide/移出窗口时强制复位
+}
 
 - (instancetype)initWithFrame:(NSRect)frame {
     self = [super initWithFrame:frame];
@@ -296,15 +489,62 @@ static NSTextField *CPLabel(NSString *text, CGFloat size, NSFontWeight weight, N
         self.layer.borderWidth = 1.0;
         self.layer.backgroundColor = [CPMuted() colorWithAlphaComponent:0.30].CGColor;
     } else {
-        NSPoint p = [self convertPoint:self.window.mouseLocationOutsideOfEventStream fromView:nil];
-        BOOL hovered = self.window && NSPointInRect(p, self.bounds);
+        BOOL hovered = _cpHovered && self.window && !self.isHiddenOrHasHiddenAncestor;
         self.layer.borderWidth = (hovered || self.cpAlwaysBorder) ? 1.0 : 0.0;
         self.layer.backgroundColor = (hovered ? [CPMuted() colorWithAlphaComponent:0.16] : (self.cpBaseBackground ?: NSColor.clearColor)).CGColor;
     }
 }
 
-- (void)mouseEntered:(NSEvent *)event { [super mouseEntered:event]; [self cpApplyBackground]; }
-- (void)mouseExited:(NSEvent *)event { [super mouseExited:event]; [self cpApplyBackground]; }
+// hover 残留修复:视图被隐藏/移出窗口/换窗口时收不到 mouseExited,蒙层会停留;
+// 在这些生命周期点强制复位 hover 状态并重刷外观,保证 mouseExited 语义一定恢复。
+- (void)cpClearHover {
+    _cpHovered = NO;
+    [self cpApplyBackground];
+}
+
+// 指针真实位置重校验:窗口移动/缩放(如切换 dock 模式、面板展开收回)时,静止的鼠标
+// 相对按钮已经移出,但 tracking area 不会补发 mouseExited —— 必须按真实位置清掉 hover。
+- (void)cpRevalidateHover {
+    if (_cpHovered) {
+        NSWindow *w = self.window;
+        if (!w || self.isHiddenOrHasHiddenAncestor) {
+            _cpHovered = NO;
+        } else {
+            NSPoint p = [self convertPoint:w.mouseLocationOutsideOfEventStream fromView:nil];
+            if (!NSPointInRect(p, self.bounds)) _cpHovered = NO;
+        }
+    }
+    [self cpApplyBackground];
+}
+
+- (void)cpObserveWindow:(NSWindow *)window {
+    NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+    [center removeObserver:self name:NSWindowDidMoveNotification object:nil];
+    [center removeObserver:self name:NSWindowDidResizeNotification object:nil];
+    if (window) {
+        [center addObserver:self selector:@selector(cpRevalidateHover) name:NSWindowDidMoveNotification object:window];
+        [center addObserver:self selector:@selector(cpRevalidateHover) name:NSWindowDidResizeNotification object:window];
+    }
+}
+
+- (void)dealloc {
+    [NSNotificationCenter.defaultCenter removeObserver:self];
+}
+
+- (void)viewDidHide { [super viewDidHide]; [self cpClearHover]; }
+- (void)viewDidMoveToWindow {
+    [super viewDidMoveToWindow];
+    [self cpObserveWindow:self.window];
+    [self cpClearHover];
+}
+- (void)removeFromSuperview { [self cpClearHover]; [super removeFromSuperview]; }
+
+- (void)cpSetHovered:(BOOL)hovered { // mouseEntered/Exited 与自测共用的置态入口
+    _cpHovered = hovered;
+    [self cpApplyBackground];
+}
+- (void)mouseEntered:(NSEvent *)event { [super mouseEntered:event]; [self cpSetHovered:YES]; }
+- (void)mouseExited:(NSEvent *)event { [super mouseExited:event]; [self cpSetHovered:NO]; }
 - (void)setHighlighted:(BOOL)highlighted { [super setHighlighted:highlighted]; [self cpApplyBackground]; }
 - (void)setCpBaseBackground:(NSColor *)color { _cpBaseBackground = color; [self cpApplyBackground]; }
 - (void)setCpAlwaysBorder:(BOOL)flag { _cpAlwaysBorder = flag; [self cpApplyBackground]; }
@@ -327,6 +567,41 @@ static NSImage *CPSymbol(NSString *name, CGFloat pointSize, NSColor *color) {
     img = [img imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:pointSize weight:NSFontWeightMedium]];
     if (color) img = [img imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithHierarchicalColor:color]];
     return img;
+}
+
+// 把官方 app 图标裁成 side x side 的圆形,放进状态环内。
+static NSImage *CPCircularIcon(NSImage *source, CGFloat side) {
+    NSSize size = NSMakeSize(side, side);
+    NSImage *result = [[NSImage alloc] initWithSize:size];
+    [result lockFocus];
+    [[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(0, 0, side, side)] addClip];
+    [source drawInRect:NSMakeRect(0, 0, side, side)
+              fromRect:NSMakeRect(0, 0, source.size.width, source.size.height)
+             operation:NSCompositingOperationSourceOver fraction:1.0];
+    [result unlockFocus];
+    return result;
+}
+
+// 官方图标回退:系统里装了对应 app(如 Codex / Claude / Terminal / VS Code)就用 NSWorkspace
+// 官方图标(圆形裁切);取不到返回 nil,调用方回退到现有 SF Symbol 自绘方案。
+static NSImage *CPAppIconForAgent(NSString *agentID, CGFloat side) {
+    static NSDictionary<NSString *, NSArray<NSString *> *> *bundleMap = nil;
+    if (!bundleMap) {
+        bundleMap = @{
+            @"codex": @[@"com.openai.codex", @"com.openai.chat"],
+            @"kimi": @[@"com.moonshot.kimi", @"com.moonshot.kimichat"],
+            @"claude": @[@"com.anthropic.claudefordesktop", @"com.anthropic.claude"],
+            @"terminal": @[@"com.apple.Terminal"],
+            @"vscode": @[@"com.microsoft.VSCode"],
+        };
+    }
+    for (NSString *bundleID in bundleMap[agentID.lowercaseString] ?: @[]) {
+        NSURL *appURL = [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:bundleID];
+        if (!appURL) continue;
+        NSImage *icon = [NSWorkspace.sharedWorkspace iconForFile:appURL.path];
+        if (icon) return CPCircularIcon(icon, side);
+    }
+    return nil;
 }
 
 #pragma mark - Agent Status Button
@@ -375,16 +650,11 @@ static NSInteger CPBadgeCountForAgents(NSArray<CPAgent *> *agents, CPReviewStore
     return count;
 }
 
-static CGFloat CPDisplayStatusRippleDuration(CPDisplayStatus s) {
-    switch (s) {
-        case CPDisplayStatusFailed: return 0.9;                 // 红色快速涟漪
-        case CPDisplayStatusWaiting: return 1.4;                // 橙色较快涟漪
-        case CPDisplayStatusCompletedPendingReview: return 1.8; // 蓝色双层涟漪
-        case CPDisplayStatusWorking: return 2.0;                // 绿色涟漪
-        case CPDisplayStatusIdle: return 3.2;                   // 青色慢涟漪
-    }
-}
-
+// CPAgentStatusButton:HUD rail 的 Agent 状态按钮(方向 A 选中态)。
+// 选中信息完全由状态环与涟漪承载:未选中 = 状态色细环(1.5px,opacity ~0.28)+ 涟漪静止;
+// 选中 = 环变实色(opacity 1,线宽 2px)+ 8 层明暗成对涟漪常开(按状态周期);
+// hover 未选中项只把环透明度提到 ~0.55,不起涟漪、不加背景蒙层(背景永远透明)。
+// 无描边、无左侧指示条、无背景蒙层。
 @interface CPAgentStatusButton : NSButton
 @property NSString *agentID;
 @property (nonatomic) BOOL reduceMotion;
@@ -392,25 +662,58 @@ static CGFloat CPDisplayStatusRippleDuration(CPDisplayStatus s) {
 @property BOOL statusSelected;
 @property CAShapeLayer *ringLayer;
 @property CAShapeLayer *innerRingLayer;
-@property CAShapeLayer *rippleLayerA;
-@property CAShapeLayer *rippleLayerB;
-@property NSView *statusDot;
+@property NSArray<CAShapeLayer *> *rippleLayers;       // 8 层白峰(波层在图标之下)
+@property NSArray<CAShapeLayer *> *rippleTroughLayers; // 8 层黑谷
 @property NSImageView *iconView;
 - (void)updateWithAgent:(CPAgent *)agent displayStatus:(CPDisplayStatus)status selected:(BOOL)selected;
 @end
 
-@implementation CPAgentStatusButton
+@implementation CPAgentStatusButton {
+    BOOL _hovered; // 显式 hover 状态,hide/移出窗口时强制复位,防止状态残留
+}
 
 - (instancetype)initWithFrame:(NSRect)frame {
     self = [super initWithFrame:frame];
     if (!self) return nil;
     self.bordered = NO;
+    // NSButton 用 initWithFrame: 创建时会保留本地化默认标题（中文系统下是“按钮”）。
+    // 图标由 iconView 单独绘制，必须清空 cell 标题，否则会压在图标下面。
+    self.title = @"";
+    self.image = nil;
+    self.imagePosition = NSNoImage;
+    // 阻止 NSButtonCell 在按下/highlight 时叠加系统高亮蒙层(用户感知的"蓝灰色罩子"):
+    // 按钮的所有视觉(环/涟漪/hover)全部由自有 layer 与 iconView 绘制。
+    ((NSButtonCell *)self.cell).highlightsBy = NSNoCellMask;
+    ((NSButtonCell *)self.cell).showsStateBy = NSNoCellMask;
     self.wantsLayer = YES;
-    self.layer.cornerRadius = 8.0;
+    self.layer.cornerRadius = 7.0;
+
+    // 8 层明暗成对涟漪:白峰 + 黑谷紧邻,沉在所有 layer 最底(图标 iconView 是 subview,天然在波层之上)。
+    NSMutableArray<CAShapeLayer *> *crests = [NSMutableArray arrayWithCapacity:CPRippleLayerCount];
+    NSMutableArray<CAShapeLayer *> *troughs = [NSMutableArray arrayWithCapacity:CPRippleLayerCount];
+    for (NSInteger i = 0; i < CPRippleLayerCount; i++) {
+        CAShapeLayer *trough = [CAShapeLayer layer];
+        trough.fillColor = NSColor.clearColor.CGColor;
+        trough.strokeColor = NSColor.blackColor.CGColor;
+        trough.lineWidth = 0.75;
+        trough.hidden = YES;
+        [self.layer addSublayer:trough];
+        [troughs addObject:trough];
+        CAShapeLayer *crest = [CAShapeLayer layer];
+        crest.fillColor = NSColor.clearColor.CGColor;
+        crest.strokeColor = NSColor.whiteColor.CGColor;
+        crest.lineWidth = 0.75;
+        crest.hidden = YES;
+        [self.layer addSublayer:crest];
+        [crests addObject:crest];
+    }
+    self.rippleTroughLayers = troughs;
+    self.rippleLayers = crests;
 
     self.ringLayer = [CAShapeLayer layer];
     self.ringLayer.fillColor = NSColor.clearColor.CGColor;
-    self.ringLayer.lineWidth = 2.0;
+    self.ringLayer.lineWidth = 1.5;
+    self.ringLayer.opacity = 0.28; // 未选中:低透明度细环
     [self.layer addSublayer:self.ringLayer];
 
     // Second ring used only by the blue completed-pending-review double layer.
@@ -419,28 +722,8 @@ static CGFloat CPDisplayStatusRippleDuration(CPDisplayStatus s) {
     self.innerRingLayer.lineWidth = 1.5;
     [self.layer addSublayer:self.innerRingLayer];
 
-    // Ripple layers: 由内向外扩散并淡出的错峰波纹。
-    self.rippleLayerA = [CAShapeLayer layer];
-    self.rippleLayerA.fillColor = NSColor.clearColor.CGColor;
-    self.rippleLayerA.lineWidth = 1.5;
-    self.rippleLayerA.hidden = YES;
-    [self.layer addSublayer:self.rippleLayerA];
-
-    self.rippleLayerB = [CAShapeLayer layer];
-    self.rippleLayerB.fillColor = NSColor.clearColor.CGColor;
-    self.rippleLayerB.lineWidth = 1.5;
-    self.rippleLayerB.hidden = YES;
-    [self.layer addSublayer:self.rippleLayerB];
-
     self.iconView = [[NSImageView alloc] initWithFrame:NSZeroRect];
     [self addSubview:self.iconView];
-
-    self.statusDot = [[NSView alloc] initWithFrame:NSZeroRect];
-    self.statusDot.wantsLayer = YES;
-    self.statusDot.layer.cornerRadius = 5.0;
-    self.statusDot.layer.borderWidth = 1.5;
-    self.statusDot.layer.borderColor = NSColor.whiteColor.CGColor;
-    [self addSubview:self.statusDot];
     return self;
 }
 
@@ -449,22 +732,26 @@ static CGFloat CPDisplayStatusRippleDuration(CPDisplayStatus s) {
     CGRect b = self.bounds;
     CGFloat side = MIN(b.size.width, b.size.height);
     CGPoint c = CGPointMake(CGRectGetMidX(b), CGRectGetMidY(b));
-    CGFloat outerR = side / 2.0 - 2.0;
+    // 状态环比按钮收小一圈(各留 3pt),按钮整体缩到 30x30 后视觉更轻。
+    CGFloat outerR = side / 2.0 - 3.0;
     self.ringLayer.frame = b;
     self.ringLayer.path = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(c.x - outerR, c.y - outerR, outerR * 2, outerR * 2)].CGPath;
     CGFloat innerR = MAX(outerR - 4.0, 1.0);
     self.innerRingLayer.frame = b;
     self.innerRingLayer.path = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(c.x - innerR, c.y - innerR, innerR * 2, innerR * 2)].CGPath;
-    // 波纹与外圈同路径，动画里从 0.55 倍放大到 1.0（由内向外扩散）。
-    self.rippleLayerA.frame = b;
-    self.rippleLayerA.path = self.ringLayer.path;
-    self.rippleLayerB.frame = b;
-    self.rippleLayerB.path = self.ringLayer.path;
-    self.iconView.frame = NSMakeRect(c.x - 10, c.y - 10, 20, 20);
-    // 状态点固定在"视觉"右下角,向外偏 1pt,浅色描边与头像/选中底隔开。
-    // 注意坐标系:flipped 视图 y 向下增长,视觉底部是大 y;unflipped 视图视觉底部是小 y。
-    CGFloat dotY = self.isFlipped ? (b.size.height - 9.0) : -1.0;
-    self.statusDot.frame = NSMakeRect(b.size.width - 11, dotY, 10, 10);
+    // 波纹与外圈同路径(黑谷略靠外 1.2pt 与白峰成对),动画按定稿规范从 1.0 倍扩散到 1.55 倍(绕中心同心外扩)。
+    CGPathRef troughPath = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(c.x - outerR - 1.2, c.y - outerR - 1.2,
+                                                                             (outerR + 1.2) * 2, (outerR + 1.2) * 2)].CGPath;
+    for (NSInteger i = 0; i < CPRippleLayerCount; i++) {
+        CAShapeLayer *crest = self.rippleLayers[(NSUInteger)i];
+        crest.frame = b;
+        crest.path = self.ringLayer.path;
+        CAShapeLayer *trough = self.rippleTroughLayers[(NSUInteger)i];
+        trough.frame = b;
+        trough.path = troughPath;
+    }
+    // 图标缩到 13x13(原 16x16),与缩小的按钮/状态环比例协调。
+    self.iconView.frame = NSMakeRect(c.x - 6.5, c.y - 6.5, 13, 13);
 }
 
 - (void)setReduceMotion:(BOOL)reduceMotion {
@@ -479,75 +766,100 @@ static CGFloat CPDisplayStatusRippleDuration(CPDisplayStatus s) {
     NSColor *color = CPDisplayStatusColor(status);
 
     self.image = nil;
-    self.iconView.image = CPSymbol(agent.iconName ?: @"sparkles", 16, selected ? CPAccent() : CPFg2());
-    self.iconView.contentTintColor = selected ? CPAccent() : CPFg2();
-    self.layer.backgroundColor = (selected ? CPDyn(0.24, 0.32, 0.50, 0.20, 0.28, 0.45) : NSColor.clearColor).CGColor;
+    NSImage *officialIcon = CPAppIconForAgent(agent.agentID, 13.0);
+    if (officialIcon) {
+        self.iconView.image = officialIcon;
+        self.iconView.contentTintColor = nil; // 官方彩色图标不做单色 tint
+    } else {
+        self.iconView.image = CPSymbol(agent.iconName ?: @"sparkles", 11, CPFg2());
+        self.iconView.contentTintColor = CPFg2();
+    }
+    // 方向 A 选中态:选中信息完全由状态环与涟漪承载,按钮背景永远透明、无描边、无指示条。
+    self.layer.backgroundColor = NSColor.clearColor.CGColor;
+    self.layer.borderWidth = 0.0;
 
     self.ringLayer.strokeColor = color.CGColor;
-    self.ringLayer.opacity = 1.0;
     BOOL doubleRing = status == CPDisplayStatusCompletedPendingReview;
     self.innerRingLayer.hidden = !doubleRing;
     self.innerRingLayer.strokeColor = color.CGColor;
-    self.innerRingLayer.opacity = 1.0;
-    self.rippleLayerA.strokeColor = color.CGColor;
-    self.rippleLayerB.strokeColor = color.CGColor;
-    self.statusDot.layer.backgroundColor = color.CGColor;
 
     self.toolTip = [NSString stringWithFormat:@"%@ · %@", agent.name, CPDisplayStatusTitle(status)];
     self.accessibilityLabel = [NSString stringWithFormat:@"%@，%@", agent.name, CPDisplayStatusTitle(status)];
 
     [self setNeedsLayout:YES];
     [self layout];
+    [self cpApplyRingState];
     [self applyAnimations];
 }
 
-- (CAAnimationGroup *)rippleAnimationWithDuration:(CGFloat)duration timeOffset:(CGFloat)timeOffset {
-    CABasicAnimation *scale = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
-    scale.fromValue = @0.55;
-    scale.toValue = @1.0;
+// 状态环三档:选中实色(opacity 1,线宽 2px);hover 未选中 ~0.55(不起涟漪);未选中 ~0.28 细环。
+- (void)cpApplyRingState {
+    CGFloat opacity = self.statusSelected ? 1.0 : (_hovered ? 0.55 : 0.28);
+    self.ringLayer.opacity = opacity;
+    self.ringLayer.lineWidth = self.statusSelected ? 2.0 : 1.5;
+    self.innerRingLayer.opacity = opacity;
+}
 
-    CABasicAnimation *fade = [CABasicAnimation animationWithKeyPath:@"opacity"];
-    fade.fromValue = @0.85;
-    fade.toValue = @0.0;
+// hover 只提状态环透明度一档,背景永远透明(蒙层 alpha 0 ≤ 0.03);hide/移出窗口时强制复位防残留。
+- (void)cpApplyHover {
+    if (self.isHighlighted) return;
+    self.layer.backgroundColor = NSColor.clearColor.CGColor;
+    [self cpApplyRingState];
+}
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    for (NSTrackingArea *area in self.trackingAreas) {
+        if (area.owner == self) [self removeTrackingArea:area];
+    }
+    NSTrackingArea *area = [[NSTrackingArea alloc] initWithRect:self.bounds
+                                                        options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect
+                                                          owner:self
+                                                       userInfo:nil];
+    [self addTrackingArea:area];
+}
+- (void)mouseEntered:(NSEvent *)event { [super mouseEntered:event]; _hovered = YES; [self cpApplyHover]; }
+- (void)mouseExited:(NSEvent *)event { [super mouseExited:event]; _hovered = NO; [self cpApplyHover]; }
+- (void)viewDidHide { [super viewDidHide]; _hovered = NO; [self cpApplyHover]; }
+- (void)viewDidMoveToWindow { [super viewDidMoveToWindow]; _hovered = NO; [self cpApplyHover]; }
+- (void)setStatusSelected:(BOOL)selected {
+    _statusSelected = selected;
+    [self cpApplyHover];
+}
 
-    CAAnimationGroup *group = [CAAnimationGroup animation];
-    group.animations = @[scale, fade];
-    group.duration = duration;
-    group.timeOffset = timeOffset; // 错峰：两条波纹错开半个周期
-    group.repeatCount = HUGE_VALF;
-    group.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
-    group.removedOnCompletion = NO;
-    return group;
+- (NSArray<CAShapeLayer *> *)cpAllRippleLayers {
+    return [self.rippleTroughLayers arrayByAddingObjectsFromArray:self.rippleLayers];
 }
 
 - (void)applyAnimations {
-    [self.ringLayer removeAllAnimations];
+    for (CAShapeLayer *ring in [self cpAllRippleLayers]) [ring removeAllAnimations];
     [self.innerRingLayer removeAllAnimations];
-    [self.rippleLayerA removeAllAnimations];
-    [self.rippleLayerB removeAllAnimations];
-    self.ringLayer.opacity = 1.0;
-    self.innerRingLayer.opacity = 1.0;
     if (self.reduceMotion) {
-        // 减少动态效果：不加任何动画，保留静态外圈与状态点。
-        self.rippleLayerA.hidden = YES;
-        self.rippleLayerB.hidden = YES;
-        self.rippleLayerA.opacity = 1.0;
-        self.rippleLayerB.opacity = 1.0;
+        // 减少动态效果:停止所有 CAAnimation,只留固定状态环(实色/细环由 cpApplyRingState 决定),不缩放不闪烁。
+        for (CAShapeLayer *ring in [self cpAllRippleLayers]) {
+            ring.hidden = YES;
+            ring.opacity = 1.0;
+            ring.lineWidth = 0.75;
+        }
+        return;
+    }
+    if (!self.statusSelected) {
+        // 未选中:涟漪静止(隐藏),选中时才常开。
+        for (CAShapeLayer *ring in [self cpAllRippleLayers]) ring.hidden = YES;
         return;
     }
 
-    CGFloat duration = CPDisplayStatusRippleDuration(self.displayStatus);
-    self.rippleLayerA.hidden = NO;
-    self.rippleLayerB.hidden = NO;
-    // 静态终值设为 0，动画从 timeOffset 相位接管，避免闪烁。
-    self.rippleLayerA.opacity = 0.0;
-    self.rippleLayerB.opacity = 0.0;
-    [self.rippleLayerA addAnimation:[self rippleAnimationWithDuration:duration timeOffset:0.0] forKey:@"rippleA"];
-    [self.rippleLayerB addAnimation:[self rippleAnimationWithDuration:duration timeOffset:duration / 2.0] forKey:@"rippleB"];
+    CGFloat duration = CPRippleDurationForStatus(self.displayStatus); // 定稿周期表 8s~14s
+    for (NSInteger i = 0; i < CPRippleLayerCount; i++) {
+        CAShapeLayer *crest = self.rippleLayers[(NSUInteger)i];
+        CAShapeLayer *trough = self.rippleTroughLayers[(NSUInteger)i];
+        crest.lineWidth = 0.75; // 静态终值;动画期内由 lineWidth 动画接管
+        trough.lineWidth = 0.75;
+        CPRippleApplyPairAnimations(crest, trough, i, duration, CPRippleCrestAlpha, CPRippleTroughAlpha);
+    }
 
     if (!self.innerRingLayer.hidden) {
-        // 待查验：内圈保留一条蓝色涟漪，形成双层蓝色波纹。
-        [self.innerRingLayer addAnimation:[self rippleAnimationWithDuration:duration timeOffset:duration / 4.0] forKey:@"rippleInner"];
+        // 待查验:内圈保留一条涟漪,形成双层波纹(特色保留)。
+        [self.innerRingLayer addAnimation:CPRippleAnimationGroup(duration, duration / 4.0, CPRippleCrestAlpha) forKey:@"rippleInner"];
     }
 }
 
@@ -571,6 +883,8 @@ static CGFloat CPDisplayStatusRippleDuration(CPDisplayStatus s) {
     CPAgent *agent = CPAgent.new;
     agent.agentID = @"codex";
     agent.name = @"Codex";
+    // 品牌图标近似:官方 Codex logo 位图不可直接打包(不引入外部资源),用 SF Symbol terminal.fill
+    // 表达 CLI 形态 + accent 品牌色代替。
     agent.iconName = @"terminal.fill";
     agent.color = CPAccent();
     agent.placeholder = NO;
@@ -623,6 +937,7 @@ static CGFloat CPDisplayStatusRippleDuration(CPDisplayStatus s) {
     CPAgent *agent = CPAgent.new;
     agent.agentID = @"kimi";
     agent.name = @"Kimi";
+    // 品牌图标近似:Kimi(月之暗面)官方 logo 不可用,用 SF Symbol moon 呼应品牌名 + 次要色。
     agent.iconName = @"moon";
     agent.color = CPMuted();
     agent.placeholder = YES;
@@ -752,6 +1067,24 @@ static CGFloat CPDisplayStatusRippleDuration(CPDisplayStatus s) {
 @end
 @implementation CPFlippedStackView
 - (BOOL)isFlipped { return YES; }
+@end
+
+// 详情抽屉容器:显示时吞掉覆盖区内的全部命中与鼠标事件,点击不得穿透到下层任务列表。
+@interface CPClickBarrierView : NSView
+@end
+@implementation CPClickBarrierView
+- (NSView *)hitTest:(NSPoint)point {
+    if (self.hidden || self.alphaValue <= 0.0) return nil;
+    NSView *hit = [super hitTest:point];
+    if (hit) return hit;
+    // hitTest: 的 point 在父视图坐标系,必须先转换到本地坐标再判断 bounds,
+    // 否则兜底判定失效,点击穿透到下层任务列表(L1 回归)。
+    NSPoint local = [self convertPoint:point fromView:self.superview];
+    return NSPointInRect(local, self.bounds) ? self : nil;
+}
+- (void)mouseDown:(NSEvent *)event { (void)event; /* 吞掉,不沿 responder chain 上抛 */ }
+- (void)mouseUp:(NSEvent *)event { (void)event; }
+- (void)scrollWheel:(NSEvent *)event { (void)event; /* 详情打开时滚动也不落到下层列表 */ }
 @end
 
 @interface CPWorkbenchCardController : NSObject
@@ -952,7 +1285,8 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
 
     self.leftColumn = [self columnWithBackground:CPBg()];
     self.middleColumn = [self columnWithBackground:CPSurface()];
-    self.rightColumn = [self columnWithBackground:CPDyn(0.110, 0.120, 0.160, 0.095, 0.105, 0.140)];
+    // 详情列用命中拦截容器:盖住任务列表时,下层完全不可点击(修复穿透 bug)。
+    self.rightColumn = [self barrierColumnWithBackground:CPDyn(0.110, 0.120, 0.160, 0.095, 0.105, 0.140)];
 
     [self.leftColumn setContentHuggingPriority:NSLayoutPriorityDefaultHigh forOrientation:NSLayoutConstraintOrientationHorizontal];
     [self.middleColumn setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
@@ -991,6 +1325,13 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
 
 - (NSView *)columnWithBackground:(NSColor *)color {
     NSView *v = [[NSView alloc] initWithFrame:NSZeroRect];
+    v.wantsLayer = YES;
+    v.layer.backgroundColor = color.CGColor;
+    return v;
+}
+
+- (NSView *)barrierColumnWithBackground:(NSColor *)color {
+    NSView *v = [[CPClickBarrierView alloc] initWithFrame:NSZeroRect];
     v.wantsLayer = YES;
     v.layer.backgroundColor = color.CGColor;
     return v;
@@ -1610,8 +1951,7 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
 @property NSArray<CPAgent *> *agents;
 @property CPAgent *selectedAgent;
 @property CPReviewStore *reviewStore;
-@property CAShapeLayer *orbRippleA;
-@property CAShapeLayer *orbRippleB;
+@property CPRippleView *orbRippleView;
 @property BOOL orbReduceMotion;
 @property BOOL orbHovered;
 - (void)show;
@@ -1628,9 +1968,9 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
 
 @implementation CPDockWindowController
 
-static const CGFloat CPOrbSize = 56.0;
-static const CGFloat CPOrbMargin = 20.0; // 透明安全边距:容纳 hover 1.18 倍放大、阴影与角标
-static const CGFloat CPOrbWindowSize = CPOrbSize + CPOrbMargin * 2.0; // 96
+static const CGFloat CPOrbSize = 48.0;
+static const CGFloat CPOrbMargin = 18.0; // 透明安全边距:容纳涟漪 1.55 倍扩散、阴影与角标
+static const CGFloat CPOrbWindowSize = CPOrbSize + CPOrbMargin * 2.0; // 84
 static const CGFloat CPStripWidth = 6.0;
 static const CGFloat CPHotZone = 28.0;
 static const CGFloat CPMargin = 18.0;
@@ -1672,37 +2012,19 @@ static const CGFloat CPBarWorkbenchWidth = 82.0;
     self.pill = pill;
     self.window.contentView = pill;
 
-    // 双层涟漪圆环(在球体下层,静止时由内向外扩散淡出、错峰重复)。
-    // 关键:layer 必须有明确 frame/bounds/position/anchorPoint,且 path 画在 layer-local bounds 内;
-    // 否则 transform.scale 围绕默认零点(左下角)缩放,弧线会向右下漂移而不是绕球心同心扩散。
+    // 统一涟漪组件(在球体下层):固定基础环 + 8 层明暗成对错峰涟漪,由球心向外同心扩散。
+    // CPRippleView 自身 frame 已预留 1.55 倍扩散空间,不改变 pill/球体尺寸。
     NSRect orbRect = NSMakeRect(CPOrbMargin, CPOrbMargin, CPOrbSize, CPOrbSize);
     CGPoint orbCenter = CGPointMake(NSMidX(orbRect), NSMidY(orbRect));
-    CGFloat rippleSide = CPOrbSize + 4.0; // 圆环比球体各大 2pt
-    NSRect rippleFrame = NSMakeRect(orbCenter.x - rippleSide / 2.0, orbCenter.y - rippleSide / 2.0, rippleSide, rippleSide);
-    CGPathRef ringPath = [NSBezierPath bezierPathWithOvalInRect:NSInsetRect(NSMakeRect(0, 0, rippleSide, rippleSide), 1.0, 1.0)].CGPath;
-    CGColorRef rippleStroke = [CPOrbRippleColor() colorWithAlphaComponent:0.9].CGColor;
-    self.orbRippleA = [CAShapeLayer layer];
-    self.orbRippleA.frame = rippleFrame;
-    self.orbRippleA.anchorPoint = CGPointMake(0.5, 0.5);
-    self.orbRippleA.position = orbCenter;
-    self.orbRippleA.fillColor = NSColor.clearColor.CGColor;
-    self.orbRippleA.strokeColor = rippleStroke;
-    self.orbRippleA.lineWidth = 1.5;
-    self.orbRippleA.path = ringPath;
-    self.orbRippleA.hidden = YES;
-    [pill.layer addSublayer:self.orbRippleA];
-    self.orbRippleB = [CAShapeLayer layer];
-    self.orbRippleB.frame = rippleFrame;
-    self.orbRippleB.anchorPoint = CGPointMake(0.5, 0.5);
-    self.orbRippleB.position = orbCenter;
-    self.orbRippleB.fillColor = NSColor.clearColor.CGColor;
-    self.orbRippleB.strokeColor = rippleStroke;
-    self.orbRippleB.lineWidth = 1.5;
-    self.orbRippleB.path = ringPath;
-    self.orbRippleB.hidden = YES;
-    [pill.layer addSublayer:self.orbRippleB];
+    self.orbRippleView = [[CPRippleView alloc] initWithRingDiameter:CPOrbSize + 4.0 lineWidth:0.75]; // 圆环比球体各大 2pt
+    self.orbRippleView.ripplePeakOpacity = 0.28; // 球体底色更亮,白峰峰值略高(黑谷按比例 0.23)
+    NSRect rippleFrame = self.orbRippleView.frame;
+    self.orbRippleView.frame = NSMakeRect(orbCenter.x - rippleFrame.size.width / 2.0,
+                                          orbCenter.y - rippleFrame.size.height / 2.0,
+                                          rippleFrame.size.width, rippleFrame.size.height);
+    [pill addSubview:self.orbRippleView];
 
-    // Orb floating pill：56x56 球体居中于 96x96 安全窗口内
+    // Orb floating pill：48x48 球体居中于 84x84 安全窗口内
     NSView *floatingPill = [[NSView alloc] initWithFrame:orbRect];
     floatingPill.wantsLayer = YES;
     floatingPill.layer.backgroundColor = CPSurface().CGColor;
@@ -1717,7 +2039,7 @@ static const CGFloat CPBarWorkbenchWidth = 82.0;
     self.floatingPill = floatingPill;
     [pill addSubview:floatingPill];
 
-    NSImageView *iconView = [[NSImageView alloc] initWithFrame:NSMakeRect(15, 15, 26, 26)];
+    NSImageView *iconView = [[NSImageView alloc] initWithFrame:NSMakeRect(11, 11, 26, 26)];
     iconView.image = CPSymbol(@"waveform.path.ecg", 22, CPAccent());
     iconView.contentTintColor = CPAccent();
     [floatingPill addSubview:iconView];
@@ -2046,14 +2368,11 @@ static const CGFloat CPBarWorkbenchWidth = 82.0;
     } else if (!self.docked && self.mode == 0) {
         self.orbHovered = YES;
         [self updateOrbRipples];
+        // hover 反馈只允许静态颜色变化:禁止整体放大、阴影呼吸、图标跳动。
         [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
             context.duration = 0.18;
             context.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
-            self.floatingPill.animator.layer.transform = CATransform3DMakeScale(1.18, 1.18, 1.0);
-            self.floatingPill.animator.layer.shadowRadius = 36.0;
-            self.floatingPill.animator.layer.shadowColor = [CPAccent() colorWithAlphaComponent:0.28].CGColor;
             self.floatingPill.animator.layer.borderColor = CPAccent().CGColor;
-            self.iconView.animator.frame = NSMakeRect(12, 12, 32, 32);
         }];
     }
 }
@@ -2068,11 +2387,7 @@ static const CGFloat CPBarWorkbenchWidth = 82.0;
         [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
             context.duration = 0.22;
             context.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
-            self.floatingPill.animator.layer.transform = CATransform3DIdentity;
-            self.floatingPill.animator.layer.shadowRadius = 26.0;
-            self.floatingPill.animator.layer.shadowColor = [NSColor colorWithSRGBRed:0.078 green:0.078 blue:0.086 alpha:0.18].CGColor;
             self.floatingPill.animator.layer.borderColor = CPBorder().CGColor;
-            self.iconView.animator.frame = NSMakeRect(15, 15, 26, 26);
         }];
     }
 }
@@ -2081,53 +2396,20 @@ static const CGFloat CPBarWorkbenchWidth = 82.0;
     [self updateOrbRipples];
 }
 
-// 悬浮球双层涟漪:scale 由内向外扩散 + opacity 淡出,错峰无限重复。
-// reduce motion 时只留一个静态淡圈;hover/drag 时隐藏波纹。
+// 悬浮球统一涟漪:状态色 + 速度由全部 agent 的最高优先状态决定。
+// reduce motion 时只留固定状态环(实色);hover/drag 时隐藏动效。
 - (void)updateOrbRipples {
-    [self.orbRippleA removeAllAnimations];
-    [self.orbRippleB removeAllAnimations];
-    self.orbRippleA.opacity = 1.0;
-    self.orbRippleB.opacity = 1.0;
     BOOL orbVisible = (self.mode == 0 && !self.docked && !self.floatingPill.hidden);
+    self.orbRippleView.hidden = !orbVisible;
     if (!orbVisible) {
-        self.orbRippleA.hidden = YES;
-        self.orbRippleB.hidden = YES;
+        for (CAShapeLayer *ring in self.orbRippleView.rippleLayers) [ring removeAllAnimations];
+        for (CAShapeLayer *ring in self.orbRippleView.rippleTroughLayers) [ring removeAllAnimations];
         return;
     }
-    if (self.orbReduceMotion) {
-        self.orbRippleA.hidden = NO;  // 静态淡圈
-        self.orbRippleA.opacity = 0.25;
-        self.orbRippleB.hidden = YES;
-        return;
-    }
-    if (self.orbHovered || self.dragging) {
-        self.orbRippleA.hidden = YES;
-        self.orbRippleB.hidden = YES;
-        return;
-    }
-    self.orbRippleA.hidden = NO;
-    self.orbRippleB.hidden = NO;
-    self.orbRippleA.opacity = 0.0;
-    self.orbRippleB.opacity = 0.0;
-    CGFloat duration = 2.8;
-    CAAnimationGroup * (^makeRipple)(CGFloat) = ^CAAnimationGroup *(CGFloat timeOffset) {
-        CABasicAnimation *scale = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
-        scale.fromValue = @1.0;
-        scale.toValue = @1.35;
-        CABasicAnimation *fade = [CABasicAnimation animationWithKeyPath:@"opacity"];
-        fade.fromValue = @0.55;
-        fade.toValue = @0.0;
-        CAAnimationGroup *group = [CAAnimationGroup animation];
-        group.animations = @[scale, fade];
-        group.duration = duration;
-        group.timeOffset = timeOffset;
-        group.repeatCount = HUGE_VALF;
-        group.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
-        group.removedOnCompletion = NO;
-        return group;
-    };
-    [self.orbRippleA addAnimation:makeRipple(0.0) forKey:@"orbRippleA"];
-    [self.orbRippleB addAnimation:makeRipple(duration / 2.0) forKey:@"orbRippleB"];
+    self.orbRippleView.displayStatus = CPDisplayStatusForAgents(self.agents, self.reviewStore);
+    self.orbRippleView.reduceMotion = self.orbReduceMotion;
+    self.orbRippleView.rippleSuppressed = self.orbHovered || self.dragging;
+    [self.orbRippleView updateRipples];
 }
 
 - (void)pillMouseDown:(NSEvent *)event {
@@ -2146,11 +2428,8 @@ static const CGFloat CPBarWorkbenchWidth = 82.0;
     }
     [self updateOrbRipples];
     if (self.mode == 0) {
-        self.floatingPill.layer.transform = CATransform3DMakeScale(0.86, 0.86, 1.0);
-        self.floatingPill.layer.shadowRadius = 18.0;
-        self.floatingPill.layer.shadowColor = [CPAccent() colorWithAlphaComponent:0.35].CGColor;
-    } else {
-        self.barView.layer.transform = CATransform3DMakeScale(0.97, 0.97, 1.0);
+        // pressed 反馈只做静态颜色变化,禁止悬浮球缩放与阴影变化。
+        self.floatingPill.layer.borderColor = CPAccent().CGColor;
     }
 }
 
@@ -2168,14 +2447,7 @@ static const CGFloat CPBarWorkbenchWidth = 82.0;
 - (void)pillMouseUp:(NSEvent *)event {
     if (!self.dragging) return;
     self.dragging = NO;
-    [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
-        context.duration = 0.18;
-        context.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
-        self.floatingPill.animator.layer.transform = CATransform3DIdentity;
-        self.floatingPill.animator.layer.shadowRadius = 26.0;
-        self.floatingPill.animator.layer.shadowColor = [NSColor colorWithSRGBRed:0.078 green:0.078 blue:0.086 alpha:0.18].CGColor;
-        self.barView.animator.layer.transform = CATransform3DIdentity;
-    }];
+    self.floatingPill.layer.borderColor = self.orbHovered ? CPAccent().CGColor : CPBorder().CGColor;
     if (self.didMove) {
         [self snapToEdge];
     } else if (self.onPillClicked) {
@@ -2226,7 +2498,7 @@ static const CGFloat CPBarWorkbenchWidth = 82.0;
         CGFloat textW = ceil([badgeText sizeWithAttributes:@{NSFontAttributeName: badgeFont}].width);
         badgeW = MAX(badgeH, textW + 8.0); // 胶囊,宽度随文字
     }
-    // 球体右上角外沿(45° 方向),仍在 96x96 安全区内,不遮图标。
+    // 球体右上角外沿(45° 方向),仍在 84x84 安全区内,不遮图标。
     CGFloat cx = CPOrbMargin + CPOrbSize / 2.0 + (CPOrbSize / 2.0) * 0.7071;
     CGFloat cy = cx;
     self.badgeView.frame = NSMakeRect(round(cx - badgeW / 2.0), round(cy - badgeH / 2.0), badgeW, badgeH);
@@ -2306,10 +2578,12 @@ static const CGFloat CPBarWorkbenchWidth = 82.0;
 @end
 
 static const CGFloat CPHUDContentWidth = 400.0;
-static const CGFloat CPHUDContentHeight = 212.0;
+static const CGFloat CPHUDContentHeight = 244.0;
 static const CGFloat CPHUDInset = 14.0;
 static const CGFloat CPHUDCollapsedWidth = 6.0;
 static const CGFloat CPHUDCollapsedHeight = 72.0;
+static const CGFloat CPHUDHandleVisualWidth = 3.0;
+static const CGFloat CPHUDHandleVisualHeight = 44.0;
 
 @interface CPHUDBackgroundView : NSView
 @property (weak) id target;
@@ -2327,6 +2601,12 @@ static const CGFloat CPHUDCollapsedHeight = 72.0;
 }
 @end
 
+@class CPHUDWindowController;
+// 图例「?」小圆钮:hover(或点击,键盘可达)时在其上方展开状态图例浮层。
+@interface CPLegendButton : CPHoverButton
+@property (weak) CPHUDWindowController *hud;
+@end
+
 @interface CPHUDWindowController : NSObject
 @property NSPanel *window;
 @property NSView *shadowCarrier;
@@ -2340,6 +2620,7 @@ static const CGFloat CPHUDCollapsedHeight = 72.0;
 @property BOOL expanded;
 @property BOOL stickyExpanded; // --visual-test-hud: 强制展开不收回
 @property BOOL pendingCollapse;
+@property NSUInteger transitionGen; // 展开/收回动画代际:新动画使旧 completion 失效,防止快速进出时互相收尾留残影
 @property NSArray<CPAgent *> *agents;
 @property CPAgent *selectedAgent;
 @property CPReviewStore *reviewStore;
@@ -2348,16 +2629,27 @@ static const CGFloat CPHUDCollapsedHeight = 72.0;
 @property NSTextField *agentNameLabel;
 @property NSTextField *agentStatusLabel;
 @property NSTextField *agentUpdatedLabel;
+@property NSView *bottomBar;      // 底行:左侧「另有 N 个活动」汇总,右侧图例「?」钮
+@property NSTextField *moreLabel;
+@property NSButton *legendButton;
+@property NSPanel *legendPanel;
 @property void (^onClicked)(void);
 - (void)show;
 - (void)updateWithAgents:(NSArray<CPAgent *> *)agents selectedAgent:(CPAgent *)agent;
 - (NSRect)expandedFrameInVisibleRect:(NSRect)visible;
 - (NSRect)collapsedFrameInVisibleRect:(NSRect)visible;
+- (void)showLegend;
+- (void)hideLegend;
+@end
+
+@implementation CPLegendButton
+- (void)mouseEntered:(NSEvent *)event { [super mouseEntered:event]; [self.hud showLegend]; }
+- (void)mouseExited:(NSEvent *)event { [super mouseExited:event]; [self.hud hideLegend]; }
 @end
 
 @implementation CPHUDWindowController
 
-static const CGFloat CPHUDAgentRail = 60.0;
+static const CGFloat CPHUDAgentRail = 64.0;
 
 - (instancetype)init {
     self = [super init];
@@ -2397,10 +2689,13 @@ static const CGFloat CPHUDAgentRail = 60.0;
     self.shadowCarrier.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     self.window.contentView = self.shadowCarrier;
 
-    self.handleView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, CPHUDCollapsedWidth, CPHUDCollapsedHeight)];
+    self.handleView = [[NSView alloc] initWithFrame:NSMakeRect(CPHUDCollapsedWidth - CPHUDHandleVisualWidth,
+                                                               (CPHUDCollapsedHeight - CPHUDHandleVisualHeight) / 2.0,
+                                                               CPHUDHandleVisualWidth,
+                                                               CPHUDHandleVisualHeight)];
     self.handleView.wantsLayer = YES;
-    self.handleView.layer.backgroundColor = CPAccent().CGColor;
-    self.handleView.layer.cornerRadius = CPHUDCollapsedWidth / 2.0;
+    self.handleView.layer.backgroundColor = [CPAccent() colorWithAlphaComponent:0.58].CGColor;
+    self.handleView.layer.cornerRadius = CPHUDHandleVisualWidth / 2.0;
     self.handleView.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
     [self.shadowCarrier addSubview:self.handleView];
 
@@ -2439,7 +2734,7 @@ static const CGFloat CPHUDAgentRail = 60.0;
 
     self.agentList = [NSStackView stackViewWithViews:@[]];
     self.agentList.orientation = NSUserInterfaceLayoutOrientationVertical;
-    self.agentList.spacing = 6;
+    self.agentList.spacing = 10; // 图标/环缩小后同步收紧节奏
     self.agentList.alignment = NSLayoutAttributeCenterX;
     self.agentList.translatesAutoresizingMaskIntoConstraints = NO;
     [rail addSubview:self.agentList];
@@ -2463,6 +2758,11 @@ static const CGFloat CPHUDAgentRail = 60.0;
     NSTextField *agentStatus = [NSTextField labelWithString:@"空闲"];
     agentStatus.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
     agentStatus.textColor = CPMuted();
+    agentStatus.lineBreakMode = NSLineBreakByTruncatingTail;
+    agentStatus.maximumNumberOfLines = 1;
+    // 与更新时间竞争宽度时,状态标签先截断,保证时间不重叠、不被挤没。
+    [agentStatus setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
+                                         forOrientation:NSLayoutConstraintOrientationHorizontal];
     agentStatus.translatesAutoresizingMaskIntoConstraints = NO;
     [container addSubview:agentStatus];
     self.agentStatusLabel = agentStatus;
@@ -2483,13 +2783,40 @@ static const CGFloat CPHUDAgentRail = 60.0;
     self.taskList.translatesAutoresizingMaskIntoConstraints = NO;
     [container addSubview:self.taskList];
 
+    // 底行(单行,不拉长 HUD 高度):左侧「另有 N 个活动」汇总,右侧 14x14 图例「?」小圆钮。
+    NSView *bottomBar = [[NSView alloc] initWithFrame:NSZeroRect];
+    bottomBar.translatesAutoresizingMaskIntoConstraints = NO;
+    [container addSubview:bottomBar];
+    self.bottomBar = bottomBar;
+
+    NSTextField *more = CPLabel(@"", 11, NSFontWeightRegular, CPMuted());
+    more.maximumNumberOfLines = 1;
+    more.translatesAutoresizingMaskIntoConstraints = NO;
+    [bottomBar addSubview:more];
+    self.moreLabel = more;
+
+    // 图例钮:低对比 1px 描边 + muted 文字,无 accent、无系统默认按钮样式。
+    CPLegendButton *legend = [CPLegendButton buttonWithTitle:@"?" target:self action:@selector(legendClicked:)];
+    legend.bordered = NO;
+    legend.hud = self;
+    legend.title = @"?";
+    legend.font = [NSFont systemFontOfSize:10 weight:NSFontWeightMedium];
+    legend.contentTintColor = CPMuted();
+    legend.toolTip = @"状态图例";
+    legend.accessibilityLabel = @"状态图例";
+    legend.cpAlwaysBorder = YES;
+    legend.layer.cornerRadius = 7.0;
+    legend.translatesAutoresizingMaskIntoConstraints = NO;
+    [bottomBar addSubview:legend];
+    self.legendButton = legend;
+
     [NSLayoutConstraint activateConstraints:@[
         [rail.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
         [rail.topAnchor constraintEqualToAnchor:container.topAnchor],
         [rail.bottomAnchor constraintEqualToAnchor:container.bottomAnchor],
         [rail.widthAnchor constraintEqualToConstant:CPHUDAgentRail],
 
-        [self.agentList.topAnchor constraintEqualToAnchor:rail.topAnchor constant:14],
+        [self.agentList.topAnchor constraintEqualToAnchor:rail.topAnchor constant:16],
         [self.agentList.centerXAnchor constraintEqualToAnchor:rail.centerXAnchor],
         [self.agentList.bottomAnchor constraintLessThanOrEqualToAnchor:rail.bottomAnchor constant:-12],
 
@@ -2498,21 +2825,37 @@ static const CGFloat CPHUDAgentRail = 60.0;
         [railSep.bottomAnchor constraintEqualToAnchor:container.bottomAnchor],
         [railSep.widthAnchor constraintEqualToConstant:1],
 
-        [agentName.leadingAnchor constraintEqualToAnchor:railSep.trailingAnchor constant:14],
-        [agentName.topAnchor constraintEqualToAnchor:container.topAnchor constant:14],
-        [agentName.trailingAnchor constraintLessThanOrEqualToAnchor:container.trailingAnchor constant:-14],
+        [agentName.leadingAnchor constraintEqualToAnchor:railSep.trailingAnchor constant:18],
+        [agentName.topAnchor constraintEqualToAnchor:container.topAnchor constant:18],
+        [agentName.trailingAnchor constraintLessThanOrEqualToAnchor:container.trailingAnchor constant:-18],
 
         [agentStatus.leadingAnchor constraintEqualToAnchor:agentName.leadingAnchor],
-        [agentStatus.topAnchor constraintEqualToAnchor:agentName.bottomAnchor constant:3],
+        [agentStatus.topAnchor constraintEqualToAnchor:agentName.bottomAnchor constant:5],
+        // 状态长文本先截断,绝不让它压到右侧更新时间;两者之间至少留 12pt。
+        [agentStatus.trailingAnchor constraintLessThanOrEqualToAnchor:agentUpdated.leadingAnchor constant:-12],
 
-        [agentUpdated.leadingAnchor constraintEqualToAnchor:agentName.leadingAnchor],
-        [agentUpdated.topAnchor constraintEqualToAnchor:agentStatus.bottomAnchor constant:2],
-        [agentUpdated.trailingAnchor constraintLessThanOrEqualToAnchor:container.trailingAnchor constant:-14],
+        [agentUpdated.leadingAnchor constraintGreaterThanOrEqualToAnchor:agentStatus.trailingAnchor constant:12],
+        [agentUpdated.centerYAnchor constraintEqualToAnchor:agentStatus.centerYAnchor],
+        [agentUpdated.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-18],
 
         [self.taskList.leadingAnchor constraintEqualToAnchor:agentName.leadingAnchor],
-        [self.taskList.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-14],
-        [self.taskList.topAnchor constraintEqualToAnchor:agentUpdated.bottomAnchor constant:10],
-        [self.taskList.bottomAnchor constraintLessThanOrEqualToAnchor:container.bottomAnchor constant:-12]
+        [self.taskList.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-18],
+        [self.taskList.topAnchor constraintEqualToAnchor:agentStatus.bottomAnchor constant:16],
+        [self.taskList.bottomAnchor constraintLessThanOrEqualToAnchor:bottomBar.topAnchor constant:-8],
+
+        [bottomBar.leadingAnchor constraintEqualToAnchor:agentName.leadingAnchor],
+        [bottomBar.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-18],
+        [bottomBar.bottomAnchor constraintEqualToAnchor:container.bottomAnchor constant:-12],
+        [bottomBar.heightAnchor constraintEqualToConstant:20],
+
+        [more.leadingAnchor constraintEqualToAnchor:bottomBar.leadingAnchor],
+        [more.centerYAnchor constraintEqualToAnchor:bottomBar.centerYAnchor],
+        [more.trailingAnchor constraintLessThanOrEqualToAnchor:legend.leadingAnchor constant:-8],
+
+        [legend.trailingAnchor constraintEqualToAnchor:bottomBar.trailingAnchor],
+        [legend.centerYAnchor constraintEqualToAnchor:bottomBar.centerYAnchor],
+        [legend.widthAnchor constraintEqualToConstant:14],
+        [legend.heightAnchor constraintEqualToConstant:14]
     ]];
 
     [self updateTracking];
@@ -2595,48 +2938,62 @@ static const CGFloat CPHUDAgentRail = 60.0;
         x = MAX(0, sz.width - CPHUDInset - CPHUDCollapsedWidth);
         y = MAX(0, sz.height - CPHUDInset - CPHUDCollapsedHeight);
     } else {
-        x = MAX(0, sz.width - CPHUDCollapsedWidth);
-        y = MAX(0, sz.height - CPHUDCollapsedHeight);
+        x = MAX(0, sz.width - CPHUDHandleVisualWidth);
+        y = MAX(0, (sz.height - CPHUDHandleVisualHeight) / 2.0);
     }
-    self.handleView.frame = NSMakeRect(x, y, CPHUDCollapsedWidth, CPHUDCollapsedHeight);
+    CGFloat width = self.expanded ? CPHUDCollapsedWidth : CPHUDHandleVisualWidth;
+    CGFloat height = self.expanded ? CPHUDCollapsedHeight : CPHUDHandleVisualHeight;
+    self.handleView.frame = NSMakeRect(x, y, width, height);
 }
 
 - (void)expand {
     if (self.expanded) return;
     self.expanded = YES;
+    NSUInteger gen = ++self.transitionGen;
+    self.visualView.alphaValue = 0.0;
     self.visualView.hidden = NO;
-    // 把手融入卡片右缘:同卡片色系,保持可见可辨。
-    self.handleView.hidden = NO;
-    self.handleView.layer.backgroundColor = CPSurface().CGColor;
-    self.handleView.layer.borderWidth = 1.0;
-    self.handleView.layer.borderColor = CPBorder().CGColor;
-    self.handleView.layer.cornerRadius = 3.0;
-    [self.shadowCarrier addSubview:self.handleView positioned:NSWindowAbove relativeTo:self.visualView];
+    // 把手只负责唤出。展开后隐藏，避免在右上角形成一条“滚动条/障碍物”。
+    self.handleView.hidden = YES;
     NSRect frame = [self expandedFrame];
-    [self.window setFrame:frame display:YES animate:YES];
-    [self layoutHandleToTopRightOfCarrier]; // 窗口尺寸确定后再贴卡片右缘
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
+        context.duration = 0.22;
+        context.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+        [[self.window animator] setFrame:frame display:YES];
+        self.visualView.animator.alphaValue = 1.0;
+    } completionHandler:^{
+        if (gen != self.transitionGen) return; // 期间已开始收回,放弃本次收尾
+        [self updateTracking];
+    }];
     self.shadowCarrier.layer.shadowColor = [NSColor colorWithSRGBRed:0.078 green:0.078 blue:0.086 alpha:0.18].CGColor;
     self.shadowCarrier.layer.shadowOffset = CGSizeMake(0, 8);
     self.shadowCarrier.layer.shadowRadius = 24.0;
     self.shadowCarrier.layer.shadowOpacity = 1.0;
     self.shadowCarrier.layer.shadowPath = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(CPHUDInset, CPHUDInset, CPHUDContentWidth, CPHUDContentHeight) xRadius:16 yRadius:16].CGPath;
-    [self updateTracking];
 }
 
 - (void)collapse {
     if (!self.expanded || self.stickyExpanded) return;
+    [self hideLegend]; // 收回 HUD 时图例浮层一并收起
     self.expanded = NO;
-    self.visualView.hidden = YES;
-    // 收回时把手恢复为右上角 accent 把手。
-    self.handleView.layer.backgroundColor = CPAccent().CGColor;
-    self.handleView.layer.borderWidth = 0.0;
-    self.handleView.layer.cornerRadius = CPHUDCollapsedWidth / 2.0;
-    self.handleView.hidden = NO;
+    NSUInteger gen = ++self.transitionGen;
     self.shadowCarrier.layer.shadowOpacity = 0.0;
     NSRect frame = [self collapsedFrame];
-    [self.window setFrame:frame display:YES animate:YES];
-    [self layoutHandleToTopRightOfCarrier];
-    [self updateTracking];
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
+        context.duration = 0.18;
+        context.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseIn];
+        self.visualView.animator.alphaValue = 0.0;
+        [[self.window animator] setFrame:frame display:YES];
+    } completionHandler:^{
+        if (gen != self.transitionGen) return; // 期间已重新展开,放弃本次收尾
+        self.visualView.hidden = YES;
+        self.visualView.alphaValue = 1.0;
+        self.handleView.layer.backgroundColor = [CPAccent() colorWithAlphaComponent:0.58].CGColor;
+        self.handleView.layer.borderWidth = 0.0;
+        self.handleView.layer.cornerRadius = CPHUDHandleVisualWidth / 2.0;
+        self.handleView.hidden = NO;
+        [self layoutHandleToTopRightOfCarrier];
+        [self updateTracking];
+    }];
 }
 
 - (void)agentButtonClicked:(NSButton *)sender {
@@ -2696,15 +3053,15 @@ static const CGFloat CPHUDAgentRail = 60.0;
     for (NSUInteger i = 0; i < self.agents.count; i++) {
         CPAgent *a = self.agents[i];
         CPDisplayStatus ds = CPDisplayStatusForTasks(a.tasks, a.agentID, self.reviewStore);
-        CPAgentStatusButton *btn = [[CPAgentStatusButton alloc] initWithFrame:NSMakeRect(0, 0, 38, 38)];
+        CPAgentStatusButton *btn = [[CPAgentStatusButton alloc] initWithFrame:NSMakeRect(0, 0, 30, 30)];
         btn.reduceMotion = reduceMotion;
         btn.target = self;
         btn.action = @selector(agentButtonClicked:);
         btn.tag = (NSInteger)i;
         btn.translatesAutoresizingMaskIntoConstraints = NO;
         [btn updateWithAgent:a displayStatus:ds selected:(a == agent)];
-        [btn.widthAnchor constraintEqualToConstant:38].active = YES;
-        [btn.heightAnchor constraintEqualToConstant:38].active = YES;
+        [btn.widthAnchor constraintEqualToConstant:30].active = YES;
+        [btn.heightAnchor constraintEqualToConstant:30].active = YES;
         [self.agentList addArrangedSubview:btn];
     }
 
@@ -2722,20 +3079,101 @@ static const CGFloat CPHUDAgentRail = 60.0;
         empty.font = [NSFont systemFontOfSize:12 weight:NSFontWeightRegular];
         empty.textColor = CPMuted();
         [self.taskList addArrangedSubview:empty];
+        self.moreLabel.stringValue = @"";
     } else {
         for (NSUInteger i = 0; i < displayTasks.count && i < 2; i++) {
             NSButton *card = [self taskCard:displayTasks[i]];
             [self.taskList addArrangedSubview:card];
             [card.widthAnchor constraintEqualToAnchor:self.taskList.widthAnchor].active = YES;
         }
-        // 超过 2 张未显示时,底部给出摘要而不是留白。
-        if (displayTasks.count > 2) {
-            NSTextField *more = [NSTextField labelWithString:[NSString stringWithFormat:@"另有 %lu 个活动", (unsigned long)(displayTasks.count - 2)]];
-            more.font = [NSFont systemFontOfSize:11 weight:NSFontWeightRegular];
-            more.textColor = CPMuted();
-            [self.taskList addArrangedSubview:more];
-        }
+        // 超过 2 张未显示时,摘要进底行左侧而不是占任务卡列表。
+        self.moreLabel.stringValue = displayTasks.count > 2
+            ? [NSString stringWithFormat:@"另有 %lu 个活动", (unsigned long)(displayTasks.count - 2)]
+            : @"";
     }
+}
+
+// 状态图例浮层:深色 surface-warm 底 + 1px border-soft 描边 + 圆角 8 + 阴影;
+// 五行速查(7px 色点 + 状态名),底部一行小字说明取值规则。
+- (void)buildLegendPanel {
+    CGFloat width = 200.0, rowH = 20.0, padX = 12.0, padTop = 10.0, footerH = 28.0;
+    CGFloat height = padTop + rowH * 5 + footerH + 10.0;
+    NSPanel *panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, width, height)
+                                                styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
+                                                  backing:NSBackingStoreBuffered
+                                                    defer:NO];
+    panel.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+    panel.level = NSStatusWindowLevel + 3;
+    panel.opaque = NO;
+    panel.backgroundColor = NSColor.clearColor;
+    panel.hasShadow = YES;
+    panel.hidesOnDeactivate = NO;
+    panel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
+                               NSWindowCollectionBehaviorFullScreenAuxiliary |
+                               NSWindowCollectionBehaviorStationary;
+
+    NSView *card = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
+    card.wantsLayer = YES;
+    card.layer.backgroundColor = CPSurface().CGColor; // surface-warm
+    card.layer.cornerRadius = 8.0;
+    card.layer.borderWidth = 1.0;
+    card.layer.borderColor = CPBorder().CGColor; // border-soft
+    card.layer.masksToBounds = YES;
+    panel.contentView = card;
+
+    NSArray<NSArray *> *rows = @[
+        @[@"失败", CPRed()],
+        @[@"等待处理", CPOrange()],
+        @[@"完成待查验", CPBlue()],
+        @[@"运行中", CPGreen()],
+        @[@"待机", CPDisplayStatusColor(CPDisplayStatusIdle)],
+    ];
+    for (NSUInteger i = 0; i < rows.count; i++) {
+        CGFloat y = height - padTop - rowH * (CGFloat)(i + 1) + (rowH - 7.0) / 2.0;
+        NSImageView *dot = [[NSImageView alloc] initWithFrame:NSMakeRect(padX, y, 7, 7)];
+        dot.image = CPDotImage(7, rows[i][1]);
+        [card addSubview:dot];
+        NSTextField *label = CPLabel(rows[i][0], 12, NSFontWeightRegular, CPFg2());
+        label.maximumNumberOfLines = 1;
+        label.frame = NSMakeRect(padX + 13.0, height - padTop - rowH * (CGFloat)(i + 1) + 2.0, width - padX * 2 - 13.0, rowH - 4.0);
+        [card addSubview:label];
+    }
+
+    NSView *sep = [[NSView alloc] initWithFrame:NSMakeRect(padX, footerH + 4.0, width - padX * 2, 1)];
+    sep.wantsLayer = YES;
+    sep.layer.backgroundColor = CPBorder().CGColor;
+    [card addSubview:sep];
+
+    NSTextField *footer = CPLabel(@"Agent 环取任务中最紧急状态", 10, NSFontWeightRegular, CPMuted());
+    footer.maximumNumberOfLines = 1;
+    footer.frame = NSMakeRect(padX, 8.0, width - padX * 2, 14.0);
+    [card addSubview:footer];
+
+    self.legendPanel = panel;
+}
+
+// hover/点击(键盘可达)在「?」钮上方展开图例;移走/失焦/收回 HUD 时收起。
+- (void)showLegend {
+    if (!self.legendPanel) [self buildLegendPanel];
+    if (self.legendButton.window) {
+        NSRect inWindow = [self.legendButton convertRect:self.legendButton.bounds toView:nil];
+        NSRect onScreen = [self.legendButton.window convertRectToScreen:inWindow];
+        NSRect frame = self.legendPanel.frame;
+        frame.origin.x = NSMaxX(onScreen) - frame.size.width;
+        frame.origin.y = NSMaxY(onScreen) + 6.0;
+        [self.legendPanel setFrame:frame display:NO];
+    }
+    [self.legendPanel orderFront:nil];
+}
+
+- (void)hideLegend {
+    [self.legendPanel orderOut:nil];
+}
+
+- (void)legendClicked:(id)sender {
+    (void)sender;
+    if (self.legendPanel.isVisible) [self hideLegend];
+    else [self showLegend];
 }
 
 // 任务卡:标题(截断) + 一行真实活动/状态,点击打开工作台。
@@ -2744,12 +3182,12 @@ static const CGFloat CPHUDAgentRail = 60.0;
     card.bordered = NO;
     [card setButtonType:NSButtonTypeMomentaryChange];
     card.wantsLayer = YES;
-    card.layer.cornerRadius = 10.0;
+    card.layer.cornerRadius = 12.0;
     card.layer.borderWidth = 1.0;
     card.layer.borderColor = CPBorder().CGColor;
     ((CPHoverButton *)card).cpBaseBackground = CPBg();
     card.translatesAutoresizingMaskIntoConstraints = NO;
-    [card.heightAnchor constraintEqualToConstant:50].active = YES;
+    [card.heightAnchor constraintEqualToConstant:54].active = YES;
 
     NSImageView *dot = [[NSImageView alloc] initWithFrame:NSMakeRect(0, 0, 8, 8)];
     dot.image = CPStatusDot(8, task.status);
@@ -2758,7 +3196,7 @@ static const CGFloat CPHUDAgentRail = 60.0;
     [dot.heightAnchor constraintEqualToConstant:8].active = YES;
 
     NSTextField *title = [NSTextField labelWithString:task.title];
-    title.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
+    title.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
     title.textColor = CPFg();
     title.lineBreakMode = NSLineBreakByTruncatingTail;
     title.maximumNumberOfLines = 1;
@@ -2782,8 +3220,8 @@ static const CGFloat CPHUDAgentRail = 60.0;
     h.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:h];
     [NSLayoutConstraint activateConstraints:@[
-        [h.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
-        [h.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
+        [h.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:14],
+        [h.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
         [h.centerYAnchor constraintEqualToAnchor:card.centerYAnchor]
     ]];
     return card;
@@ -3159,8 +3597,8 @@ int main(int argc, const char *argv[]) {
                                     fabs(collapsedSize.height - CPHUDCollapsedHeight) <= 0.5;
             BOOL hudCollapsedOnMainScreen = fabs(collapsedFrame.origin.x - (NSMaxX(testVisible) - CPHUDCollapsedWidth)) <= 0.5 &&
                                             fabs(collapsedFrame.origin.y - (NSMaxY(testVisible) - CPHUDCollapsedHeight)) <= 0.5;
-            BOOL hudExpanded344x224 = fabs(expandedSize.width - (CPHUDContentWidth + CPHUDInset * 2.0)) <= 0.5 &&
-                                      fabs(expandedSize.height - (CPHUDContentHeight + CPHUDInset * 2.0)) <= 0.5;
+            BOOL hudExpandedSizeOK = fabs(expandedSize.width - (CPHUDContentWidth + CPHUDInset * 2.0)) <= 0.5 &&
+                                     fabs(expandedSize.height - (CPHUDContentHeight + CPHUDInset * 2.0)) <= 0.5;
             BOOL hudExpandedOnMainScreen = fabs(expandedFrame.origin.x - (NSMaxX(testVisible) - expandedSize.width)) <= 0.5 &&
                                            fabs(expandedFrame.origin.y - (NSMaxY(testVisible) - expandedSize.height)) <= 0.5;
             BOOL shadowCarrierScales = hud.shadowCarrier.autoresizingMask == (NSViewWidthSizable | NSViewHeightSizable);
@@ -3172,16 +3610,22 @@ int main(int argc, const char *argv[]) {
             [hud expand];
             [hud.shadowCarrier layoutSubtreeIfNeeded];
             NSRect visualFrame = hud.visualView.frame;
-            NSRect carrierBounds = hud.shadowCarrier.bounds;
-            NSRect handleFrame = hud.handleView.frame;
             BOOL hudVisualFrameExact = fabs(visualFrame.origin.x - CPHUDInset) <= 0.5 &&
                                        fabs(visualFrame.origin.y - CPHUDInset) <= 0.5 &&
                                        fabs(visualFrame.size.width - CPHUDContentWidth) <= 0.5 &&
                                        fabs(visualFrame.size.height - CPHUDContentHeight) <= 0.5;
-            BOOL hudHandleTopRight = fabs(handleFrame.origin.x - (carrierBounds.size.width - CPHUDInset - CPHUDCollapsedWidth)) <= 0.5 &&
-                                     fabs(handleFrame.origin.y - (carrierBounds.size.height - CPHUDInset - CPHUDCollapsedHeight)) <= 0.5 &&
-                                     fabs(handleFrame.size.width - CPHUDCollapsedWidth) <= 0.5 &&
-                                     fabs(handleFrame.size.height - CPHUDCollapsedHeight) <= 0.5;
+            BOOL hudExpandedHandleHidden = hud.handleView.hidden;
+
+            // 快速进出回归:展开动画进行中立即收回、再立即展开,旧的 completion 不得
+            // 把 visualView 隐藏或把手重新显示(动画代际守卫)。
+            CPHUDWindowController *hudRapid = CPHUDWindowController.new;
+            [hudRapid.window orderFrontRegardless];
+            [hudRapid expand];
+            [hudRapid collapse];
+            [hudRapid expand];
+            [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.6]];
+            BOOL hudRapidOK = hudRapid.expanded && !hudRapid.visualView.hidden && hudRapid.handleView.hidden;
+            [hudRapid.window orderOut:nil];
 
             // M2: CPAgentStatusButton rings, reduce-motion, HUD per-agent scoping
             NSString *uiSuite = [NSString stringWithFormat:@"com.codexpulse.uitest.%d", NSProcessInfo.processInfo.processIdentifier];
@@ -3204,27 +3648,119 @@ int main(int argc, const char *argv[]) {
                 BOOL expectDouble = s == CPDisplayStatusCompletedPendingReview;
                 if (b.innerRingLayer.hidden != !expectDouble) blueDoubleOK = NO;
                 if (expectDouble && !CGColorEqualToColor(b.innerRingLayer.strokeColor, CPBlue().CGColor)) blueDoubleOK = NO;
+                // reduce motion:无任何 CAAnimation,8 对波层全隐藏,只保留固定状态环。
                 if (b.ringLayer.animationKeys.count != 0 || b.innerRingLayer.animationKeys.count != 0 ||
-                    b.rippleLayerA.animationKeys.count != 0 || b.rippleLayerB.animationKeys.count != 0 ||
-                    !b.rippleLayerA.hidden || !b.rippleLayerB.hidden) reduceMotionOK = NO;
+                    b.ringLayer.hidden || b.rippleLayers.count != CPRippleLayerCount ||
+                    b.rippleTroughLayers.count != CPRippleLayerCount) reduceMotionOK = NO;
+                for (NSInteger li = 0; li < CPRippleLayerCount; li++) {
+                    if (!b.rippleLayers[(NSUInteger)li].hidden || b.rippleLayers[(NSUInteger)li].animationKeys.count != 0 ||
+                        !b.rippleTroughLayers[(NSUInteger)li].hidden || b.rippleTroughLayers[(NSUInteger)li].animationKeys.count != 0)
+                        reduceMotionOK = NO;
+                }
             }
+            // 8 层定稿涟漪:选中时常开,层间错峰 duration/8(基准 12s 即 1.5s),周期取定稿时长表。
             CPAgentStatusButton *motionBtn = [[CPAgentStatusButton alloc] initWithFrame:NSMakeRect(0, 0, 38, 38)];
             motionBtn.reduceMotion = NO;
-            [motionBtn updateWithAgent:CPTestAgent(@"motion-test", @[]) displayStatus:CPDisplayStatusWorking selected:NO];
-            CAAnimation *rippleA = [motionBtn.rippleLayerA animationForKey:@"rippleA"];
-            CAAnimation *rippleB = [motionBtn.rippleLayerB animationForKey:@"rippleB"];
-            BOOL motionAnimOK = rippleA != nil && rippleB != nil &&
-                                rippleA.timeOffset != rippleB.timeOffset &&
-                                rippleA.repeatCount > 1000.0f && rippleB.repeatCount > 1000.0f;
+            [motionBtn updateWithAgent:CPTestAgent(@"motion-test", @[]) displayStatus:CPDisplayStatusWorking selected:YES];
+            CGFloat motionDuration = CPRippleDurationForStatus(CPDisplayStatusWorking);
+            BOOL motionAnimOK = YES;
+            for (NSInteger li = 0; li < CPRippleLayerCount; li++) {
+                CAAnimation *crest = [motionBtn.rippleLayers[(NSUInteger)li]
+                                      animationForKey:[NSString stringWithFormat:@"ripple%ld", (long)li]];
+                CAAnimation *trough = [motionBtn.rippleTroughLayers[(NSUInteger)li]
+                                       animationForKey:[NSString stringWithFormat:@"trough%ld", (long)li]];
+                CGFloat expectOffset = motionDuration * (CGFloat)li / (CGFloat)CPRippleLayerCount;
+                if (!crest || !trough ||
+                    fabs(crest.timeOffset - expectOffset) > 0.01 ||
+                    fabs(crest.duration - motionDuration) > 0.01 ||
+                    fabs(trough.duration - motionDuration) > 0.01 ||
+                    crest.repeatCount <= 1000.0f || trough.repeatCount <= 1000.0f) motionAnimOK = NO;
+            }
+            // 未选中:涟漪静止(无动画、波层隐藏)。
+            CPAgentStatusButton *stillBtn = [[CPAgentStatusButton alloc] initWithFrame:NSMakeRect(0, 0, 38, 38)];
+            stillBtn.reduceMotion = NO;
+            [stillBtn updateWithAgent:CPTestAgent(@"still-test", @[]) displayStatus:CPDisplayStatusWorking selected:NO];
+            for (NSInteger li = 0; li < CPRippleLayerCount; li++) {
+                if (stillBtn.rippleLayers[(NSUInteger)li].animationKeys.count != 0 ||
+                    !stillBtn.rippleLayers[(NSUInteger)li].hidden) motionAnimOK = NO;
+            }
+            // 曲线必须与 CPRippleView 同一定稿规范:scale 1.0→1.55,透明度 0→峰值→长尾巴→0,
+            // lineWidth 2.0→0.5,缓入缓出控制点 (0.45,0.08,0.35,1)。
+            CAAnimation *ripple0 = [motionBtn.rippleLayers.firstObject animationForKey:@"ripple0"];
+            if ([ripple0 isKindOfClass:CAAnimationGroup.class]) {
+                CAAnimationGroup *g = (CAAnimationGroup *)ripple0;
+                CABasicAnimation *scale = nil, *thin = nil;
+                CAKeyframeAnimation *fade = nil;
+                for (CAAnimation *anim in g.animations) {
+                    CAPropertyAnimation *pa = (CAPropertyAnimation *)anim;
+                    if ([pa.keyPath isEqualToString:@"transform.scale"]) scale = (CABasicAnimation *)anim;
+                    if ([pa.keyPath isEqualToString:@"opacity"]) fade = (CAKeyframeAnimation *)anim;
+                    if ([pa.keyPath isEqualToString:@"lineWidth"]) thin = (CABasicAnimation *)anim;
+                }
+                float cp1[2] = {0, 0}, cp2[2] = {0, 0};
+                [g.timingFunction getControlPointAtIndex:1 values:cp1];
+                [g.timingFunction getControlPointAtIndex:2 values:cp2];
+                CGFloat peak = fade.values.count > 1 ? [(NSNumber *)fade.values[1] doubleValue] : 0.0;
+                BOOL fadeMonotoneTail = fade.values.count == 6 &&
+                                        peak > [(NSNumber *)fade.values[2] doubleValue] &&
+                                        [(NSNumber *)fade.values[2] doubleValue] > [(NSNumber *)fade.values[3] doubleValue] &&
+                                        [(NSNumber *)fade.values[3] doubleValue] > [(NSNumber *)fade.values[4] doubleValue] &&
+                                        [(NSNumber *)fade.values[4] doubleValue] > 0.0 &&
+                                        fabs([(NSNumber *)fade.values[0] doubleValue]) < 0.001 &&
+                                        fabs([(NSNumber *)fade.values[5] doubleValue]) < 0.001;
+                motionAnimOK = motionAnimOK && scale && fade && thin && fadeMonotoneTail &&
+                               fabs([(NSNumber *)scale.fromValue doubleValue] - 1.0) < 0.01 &&
+                               fabs([(NSNumber *)scale.toValue doubleValue] - 1.55) < 0.01 &&
+                               peak >= 0.15 && peak <= 0.30 && // 白峰峰值 alpha ~0.22(范围断言)
+                               fabs([(NSNumber *)thin.fromValue doubleValue] - 2.0) < 0.01 &&
+                               fabs([(NSNumber *)thin.toValue doubleValue] - 0.5) < 0.01 &&
+                               fabs(cp1[0] - 0.45) < 0.01 && fabs(cp1[1] - 0.08) < 0.01 &&
+                               fabs(cp2[0] - 0.35) < 0.01 && fabs(cp2[1] - 1.0) < 0.01;
+            } else {
+                motionAnimOK = NO;
+            }
+            // 波层 z 序:白峰/黑谷在状态环之下(iconView 是 subview,天然压在所有波层之上)。
+            motionAnimOK = motionAnimOK &&
+                           [motionBtn.layer.sublayers indexOfObject:motionBtn.rippleTroughLayers.firstObject] <
+                               [motionBtn.layer.sublayers indexOfObject:motionBtn.ringLayer] &&
+                           [motionBtn.layer.sublayers indexOfObject:motionBtn.rippleLayers.lastObject] <
+                               [motionBtn.layer.sublayers indexOfObject:motionBtn.ringLayer];
             CPAgentStatusButton *blueBtn = [[CPAgentStatusButton alloc] initWithFrame:NSMakeRect(0, 0, 38, 38)];
             blueBtn.reduceMotion = NO;
-            [blueBtn updateWithAgent:CPTestAgent(@"blue-test", @[]) displayStatus:CPDisplayStatusCompletedPendingReview selected:NO];
-            BOOL blueAnimOK = [blueBtn.rippleLayerA.animationKeys containsObject:@"rippleA"] &&
-                              [blueBtn.rippleLayerB.animationKeys containsObject:@"rippleB"] &&
-                              [blueBtn.innerRingLayer.animationKeys containsObject:@"rippleInner"] &&
-                              CGColorEqualToColor(blueBtn.rippleLayerA.strokeColor, CPBlue().CGColor) &&
-                              CGColorEqualToColor(blueBtn.rippleLayerB.strokeColor, CPBlue().CGColor) &&
-                              CGColorEqualToColor(blueBtn.innerRingLayer.strokeColor, CPBlue().CGColor);
+            [blueBtn updateWithAgent:CPTestAgent(@"blue-test", @[]) displayStatus:CPDisplayStatusCompletedPendingReview selected:YES];
+            BOOL blueAnimOK = [blueBtn.innerRingLayer.animationKeys containsObject:@"rippleInner"] &&
+                              CGColorEqualToColor(blueBtn.ringLayer.strokeColor, CPBlue().CGColor) &&
+                              CGColorEqualToColor(blueBtn.innerRingLayer.strokeColor, CPBlue().CGColor) &&
+                              CGColorEqualToColor(blueBtn.rippleLayers.firstObject.strokeColor, NSColor.whiteColor.CGColor) &&
+                              CGColorEqualToColor(blueBtn.rippleTroughLayers.firstObject.strokeColor, NSColor.blackColor.CGColor);
+            for (NSInteger li = 0; li < CPRippleLayerCount; li++) {
+                if (![blueBtn.rippleLayers[(NSUInteger)li].animationKeys
+                      containsObject:[NSString stringWithFormat:@"ripple%ld", (long)li]]) blueAnimOK = NO;
+            }
+
+            // 方向 A 选中态回归:背景完全透明、无描边(borderWidth=0)、无左侧指示条 view、
+            // 状态环实色(opacity≈1)且线宽 2;图标 ≤14pt。
+            CPAgentStatusButton *selBtn = [[CPAgentStatusButton alloc] initWithFrame:NSMakeRect(0, 0, 30, 30)];
+            selBtn.reduceMotion = YES;
+            [selBtn updateWithAgent:CPTestAgent(@"sel-test", @[]) displayStatus:CPDisplayStatusWorking selected:YES];
+            CGColorRef selBtnBg = selBtn.layer.backgroundColor;
+            BOOL selectionNoVeilOK = (!selBtnBg || CGColorGetAlpha(selBtnBg) == 0.0) &&
+                                     selBtn.layer.borderWidth == 0.0 &&
+                                     fabs(selBtn.ringLayer.opacity - 1.0) < 0.01 &&
+                                     fabs(selBtn.ringLayer.lineWidth - 2.0) < 0.01 &&
+                                     selBtn.iconView.frame.size.width <= 14.0;
+            CPAgentStatusButton *hovBtn = [[CPAgentStatusButton alloc] initWithFrame:NSMakeRect(0, 0, 30, 30)];
+            hovBtn.reduceMotion = YES;
+            [hovBtn updateWithAgent:CPTestAgent(@"hov-test", @[]) displayStatus:CPDisplayStatusWorking selected:NO];
+            NSEvent *noEvent = nil; // 仅触发 hover 状态翻转,事件本身不被使用
+            [hovBtn mouseEntered:noEvent];
+            CGColorRef hovBg = hovBtn.layer.backgroundColor;
+            // hover 未选中项:只把环透明度提到 ~0.55,背景蒙层 alpha 必须 ≤0.03,不起涟漪。
+            BOOL hoverSubtleOK = (!hovBg || CGColorGetAlpha(hovBg) <= 0.03) &&
+                                 fabs(hovBtn.ringLayer.opacity - 0.55) < 0.01 &&
+                                 hovBtn.rippleLayers.firstObject.animationKeys.count == 0;
+            [hovBtn mouseExited:noEvent];
+            hoverSubtleOK = hoverSubtleOK && fabs(hovBtn.ringLayer.opacity - 0.28) < 0.01;
 
             CPHUDWindowController *hud2 = CPHUDWindowController.new;
             hud2.reviewStore = uiStore;
@@ -3246,11 +3782,22 @@ int main(int argc, const char *argv[]) {
             CPAgent *agentBNew = CPTestAgent(@"agent-b", @[CPTestTask(@"b9", CPStatusWorking, 9)]);
             [hud2 updateWithAgents:@[agentANew, agentBNew] selectedAgent:agentB]; // stale pointer, same agentID
             BOOL hudSelectByID = hud2.selectedAgent == agentBNew;
+            // Agent 环颜色 = 其活动任务中最紧急状态(失败 > 等待处理 > 完成待查验 > 运行中 > 待机)。
+            CPAgent *urgent = CPTestAgent(@"urgent", @[CPTestTask(@"u1", CPStatusWorking, 1),
+                                                       CPTestTask(@"u2", CPStatusFailed, 2),
+                                                       CPTestTask(@"u3", CPStatusCompleted, 3)]);
+            CPAgent *calm = CPTestAgent(@"calm", @[CPTestTask(@"c1", CPStatusWorking, 1)]);
+            [hud2 updateWithAgents:@[urgent, calm] selectedAgent:calm];
+            CPAgentStatusButton *urgentBtn = (CPAgentStatusButton *)hud2.agentList.arrangedSubviews.firstObject;
+            BOOL agentUrgencyOK = [urgentBtn isKindOfClass:CPAgentStatusButton.class] &&
+                                  CGColorEqualToColor(urgentBtn.ringLayer.strokeColor, CPRed().CGColor) &&
+                                  fabs(CPRippleDurationForStatus(CPDisplayStatusForTasks(urgent.tasks, @"urgent", uiStore)) -
+                                       CPRippleDurationForStatus(CPDisplayStatusFailed)) < 0.01;
             [uiDefaults removePersistentDomainForName:uiSuite];
             [uiDefaults synchronize];
 
             BOOL m2ui = ringColorsOK && blueDoubleOK && reduceMotionOK && motionAnimOK && blueAnimOK &&
-                        hudAgentScope && hudSelectByID;
+                        selectionNoVeilOK && hoverSubtleOK && hudAgentScope && hudSelectByID && agentUrgencyOK;
 
             // M3: detail drawer + two-stage Esc + review only on real detail open
             NSString *m3Suite = [NSString stringWithFormat:@"com.codexpulse.drawertest.%d", NSProcessInfo.processInfo.processIdentifier];
@@ -3341,8 +3888,9 @@ int main(int argc, const char *argv[]) {
             for (NSInteger i = 0; i < 3; i++) {
                 [hBtn updateWithAgent:hAgent displayStatus:CPDisplayStatusWorking selected:YES];
             }
-            BOOL singleRippleKeys = [hBtn.rippleLayerA.animationKeys isEqualToArray:@[@"rippleA"]] &&
-                                    [hBtn.rippleLayerB.animationKeys isEqualToArray:@[@"rippleB"]] &&
+            BOOL singleRippleKeys = [hBtn.rippleLayers.firstObject.animationKeys isEqualToArray:@[@"ripple0"]] &&
+                                    [hBtn.rippleTroughLayers.firstObject.animationKeys isEqualToArray:@[@"trough0"]] &&
+                                    [hBtn.rippleLayers.lastObject.animationKeys isEqualToArray:@[@"ripple7"]] &&
                                     hBtn.ringLayer.animationKeys.count == 0 &&
                                     hBtn.innerRingLayer.animationKeys.count == 0;
 
@@ -3404,7 +3952,8 @@ int main(int argc, const char *argv[]) {
                                                          CPTestTask(@"m5", CPStatusWorking, 5)]);
             CPHUDWindowController *hud5 = CPHUDWindowController.new;
             [hud5 updateWithAgents:@[manyAgent] selectedAgent:manyAgent];
-            BOOL taskCapOK = hud5.taskList.arrangedSubviews.count == 3; // HUD 最多 2 张任务卡 + 摘要行
+            BOOL taskCapOK = hud5.taskList.arrangedSubviews.count == 2 && // HUD 最多 2 张任务卡
+                             [hud5.moreLabel.stringValue isEqualToString:@"另有 3 个活动"]; // 摘要进底行
             BOOL titleTruncates = cleanTruncates;
             if (taskCapOK) {
                 NSView *row = hud5.taskList.arrangedSubviews.firstObject;
@@ -3440,7 +3989,7 @@ int main(int argc, const char *argv[]) {
             BOOL m5ui = dynamicTokensOK && darkBaseOK && contrastAdjustOK && darkWindowsOK &&
                         titleTruncates && taskCapOK && emptyStateOK && workTitleTruncates;
 
-            // M7: 悬浮球安全边距窗口、双层涟漪、角标规则与计数 helper
+            // M7: 悬浮球安全边距窗口、8 层明暗成对涟漪、角标规则与计数 helper
             NSString *m7Suite = [NSString stringWithFormat:@"com.codexpulse.orbtest.%d", NSProcessInfo.processInfo.processIdentifier];
             NSUserDefaults *m7Defaults = [[NSUserDefaults alloc] initWithSuiteName:m7Suite];
             [m7Defaults removePersistentDomainForName:m7Suite];
@@ -3456,26 +4005,94 @@ int main(int argc, const char *argv[]) {
             BOOL orbCentered = fabs(NSMidX(orbFrame) - NSMidX(pillBounds)) <= 0.5 &&
                                fabs(NSMidY(orbFrame) - NSMidY(pillBounds)) <= 0.5;
             BOOL orbMarginOK = NSMinX(orbFrame) >= CPOrbMargin - 0.5 && NSMinY(orbFrame) >= CPOrbMargin - 0.5;
-            CGFloat scaledHalf = CPOrbSize * 1.18 / 2.0; // hover 放大 1.18 倍后的半径
-            BOOL hoverNotClipped = (NSMidX(orbFrame) - scaledHalf) >= -0.5 &&
-                                   (NSMidX(orbFrame) + scaledHalf) <= pillBounds.size.width + 0.5 &&
-                                   (NSMidY(orbFrame) - scaledHalf) >= -0.5 &&
-                                   (NSMidY(orbFrame) + scaledHalf) <= pillBounds.size.height + 0.5;
+            // 涟漪最大扩散(1.55 倍)必须完整落在窗口安全边距内,不被裁切。
+            CGFloat rippleHalf = dock7.orbRippleView.bounds.size.width / 2.0;
+            BOOL hoverNotClipped = (NSMidX(orbFrame) - rippleHalf) >= -0.5 &&
+                                   (NSMidX(orbFrame) + rippleHalf) <= pillBounds.size.width + 0.5 &&
+                                   (NSMidY(orbFrame) - rippleHalf) >= -0.5 &&
+                                   (NSMidY(orbFrame) + rippleHalf) <= pillBounds.size.height + 0.5;
+
+            // M1: 定稿涟漪参数表 — 状态差异只调周期,失败 8s 最快、待机 14s 最慢,严格单调递增。
+            BOOL m1ParamsOK = YES;
+            NSArray<NSNumber *> *m1Statuses = @[@(CPDisplayStatusFailed), @(CPDisplayStatusWaiting),
+                                                @(CPDisplayStatusCompletedPendingReview), @(CPDisplayStatusWorking),
+                                                @(CPDisplayStatusIdle)];
+            CGFloat prevDuration = 0.0;
+            for (NSNumber *st in m1Statuses) {
+                CPDisplayStatus s = (CPDisplayStatus)st.integerValue;
+                CGFloat d = CPRippleDurationForStatus(s);
+                if (d < 8.0 || d > 14.0 || d <= prevDuration) m1ParamsOK = NO;
+                prevDuration = d;
+            }
+            // 汇聚优先级:failed > waiting > pending-review > working > idle。
+            CPAgent *m1Idle = CPTestAgent(@"m1-idle", @[CPTestTask(@"i", CPStatusIdle, 1)]);
+            CPAgent *m1Work = CPTestAgent(@"m1-work", @[CPTestTask(@"w", CPStatusWorking, 1)]);
+            CPAgent *m1Fail = CPTestAgent(@"m1-fail", @[CPTestTask(@"f", CPStatusFailed, 1)]);
+            BOOL m1OverallOK = CPDisplayStatusForAgents(@[m1Idle], m7Store) == CPDisplayStatusIdle &&
+                               CPDisplayStatusForAgents(@[m1Idle, m1Work], m7Store) == CPDisplayStatusWorking &&
+                               CPDisplayStatusForAgents(@[m1Work, m1Fail], m7Store) == CPDisplayStatusFailed &&
+                               CPDisplayStatusForAgents(@[], m7Store) == CPDisplayStatusIdle;
 
             dock7.orbReduceMotion = NO;
             dock7.orbHovered = NO;
+            [dock7 renderWithAgents:@[m1Work] selectedAgent:m1Work]; // 运行中:绿色稳定中速
             [dock7 updateOrbRipples];
-            CAAnimation *orbA = [dock7.orbRippleA animationForKey:@"orbRippleA"];
-            CAAnimation *orbB = [dock7.orbRippleB animationForKey:@"orbRippleB"];
-            BOOL orbRippleOK = orbA != nil && orbB != nil &&
-                               orbA.timeOffset != orbB.timeOffset &&
-                               orbA.repeatCount > 1000.0f && orbB.repeatCount > 1000.0f;
-            // 涟漪 layer 几何:position 必须在球心、anchorPoint (0.5,0.5)、path 必须与 layer bounds 同心,
-            // 否则 transform.scale 不绕球心,弧线会漂移。
+            // 8 层明暗成对错拍:层间错峰 duration/8(12s 基准即 1.5s),周期取定稿时长表(运行中 = Working)。
+            BOOL orbRippleOK = dock7.orbRippleView.rippleLayers.count == CPRippleLayerCount &&
+                               dock7.orbRippleView.rippleTroughLayers.count == CPRippleLayerCount;
+            CGFloat orbDuration = CPRippleDurationForStatus(CPDisplayStatusWorking);
+            for (NSInteger li = 0; li < CPRippleLayerCount; li++) {
+                CAAnimation *crest = [dock7.orbRippleView.rippleLayers[(NSUInteger)li]
+                                      animationForKey:[NSString stringWithFormat:@"ripple%ld", (long)li]];
+                CAAnimation *trough = [dock7.orbRippleView.rippleTroughLayers[(NSUInteger)li]
+                                       animationForKey:[NSString stringWithFormat:@"trough%ld", (long)li]];
+                CGFloat expectOffset = orbDuration * (CGFloat)li / (CGFloat)CPRippleLayerCount;
+                if (!crest || !trough ||
+                    fabs(crest.timeOffset - expectOffset) > 0.01 ||
+                    fabs(crest.duration - orbDuration) > 0.01 ||
+                    crest.repeatCount <= 1000.0f || trough.repeatCount <= 1000.0f) orbRippleOK = NO;
+            }
+            // 波层 z 序在图标之下:涟漪组件先于球体加入 pill。
+            orbRippleOK = orbRippleOK &&
+                          [dock7.pill.subviews indexOfObject:dock7.orbRippleView] <
+                              [dock7.pill.subviews indexOfObject:dock7.floatingPill];
+            // 动画曲线与定稿规范一致:scale 1.0 → 1.55,透明度 0 → 峰值(悬浮球 ~0.28)→ 长尾巴 → 0,
+            // 缓入缓出控制点 (0.45,0.08,0.35,1)。
+            BOOL orbRippleCurveOK = NO;
+            CAAnimation *orbA = [dock7.orbRippleView.rippleLayers.firstObject animationForKey:@"ripple0"];
+            if ([orbA isKindOfClass:CAAnimationGroup.class]) {
+                CAAnimationGroup *g = (CAAnimationGroup *)orbA;
+                CABasicAnimation *scale = nil;
+                CAKeyframeAnimation *fade = nil;
+                for (CAAnimation *anim in g.animations) {
+                    CAPropertyAnimation *pa = (CAPropertyAnimation *)anim;
+                    if ([pa.keyPath isEqualToString:@"transform.scale"]) scale = (CABasicAnimation *)anim;
+                    if ([pa.keyPath isEqualToString:@"opacity"]) fade = (CAKeyframeAnimation *)anim;
+                }
+                float ocp1[2] = {0, 0}, ocp2[2] = {0, 0};
+                [g.timingFunction getControlPointAtIndex:1 values:ocp1];
+                [g.timingFunction getControlPointAtIndex:2 values:ocp2];
+                CGFloat orbPeak = fade.values.count > 1 ? [(NSNumber *)fade.values[1] doubleValue] : 0.0;
+                orbRippleCurveOK = scale && fade && fade.values.count == 6 &&
+                                   fabs([(NSNumber *)scale.fromValue doubleValue] - 1.0) < 0.01 &&
+                                   fabs([(NSNumber *)scale.toValue doubleValue] - CPRippleScaleTo) < 0.01 &&
+                                   orbPeak >= 0.20 && orbPeak <= 0.40 && // 悬浮球峰值略高(范围断言)
+                                   fabs([(NSNumber *)fade.values[0] doubleValue]) < 0.001 &&
+                                   fabs([(NSNumber *)fade.values[5] doubleValue]) < 0.001 &&
+                                   fabs(ocp1[0] - 0.45) < 0.01 && fabs(ocp1[1] - 0.08) < 0.01 &&
+                                   fabs(ocp2[0] - 0.35) < 0.01 && fabs(ocp2[1] - 1.0) < 0.01;
+            }
+            // 涟漪 layer 几何:组件居中于球心,layer position 必须在组件中心、anchorPoint (0.5,0.5)、
+            // path 与 layer bounds 同心,否则 transform.scale 不绕球心,弧线会漂移。
             CGPoint orbCenterPt = CGPointMake(NSMidX(orbFrame), NSMidY(orbFrame));
-            BOOL orbRippleGeo = YES;
-            for (CAShapeLayer *rl in @[dock7.orbRippleA, dock7.orbRippleB]) {
-                if (fabs(rl.position.x - orbCenterPt.x) > 0.5 || fabs(rl.position.y - orbCenterPt.y) > 0.5) orbRippleGeo = NO;
+            NSRect rvFrame = dock7.orbRippleView.frame;
+            BOOL orbRippleGeo = fabs(NSMidX(rvFrame) - orbCenterPt.x) <= 0.5 &&
+                                fabs(NSMidY(rvFrame) - orbCenterPt.y) <= 0.5;
+            CGPoint rvCenter = CGPointMake(NSMidX(dock7.orbRippleView.bounds), NSMidY(dock7.orbRippleView.bounds));
+            for (CAShapeLayer *rl in @[dock7.orbRippleView.rippleLayers.firstObject,
+                                       dock7.orbRippleView.rippleTroughLayers.firstObject,
+                                       dock7.orbRippleView.baseRingLayer]) {
+                if (fabs(rl.position.x - rvCenter.x) > 0.5 || fabs(rl.position.y - rvCenter.y) > 0.5) orbRippleGeo = NO;
                 if (fabs(rl.anchorPoint.x - 0.5) > 0.01 || fabs(rl.anchorPoint.y - 0.5) > 0.01) orbRippleGeo = NO;
                 if (!rl.path) { orbRippleGeo = NO; continue; }
                 CGRect pb = CGPathGetBoundingBox(rl.path);
@@ -3484,21 +4101,66 @@ int main(int argc, const char *argv[]) {
                     fabs(CGRectGetMidY(pb) - CGRectGetMidY(rl.bounds)) > 1.0) orbRippleGeo = NO;
                 if (pb.size.width > rl.bounds.size.width + 8.0 || pb.size.height > rl.bounds.size.height + 8.0) orbRippleGeo = NO;
             }
-            // 描边必须是清晰的蓝青 accent(蓝通道显著高于红通道),不能像灰色系统描边。
-            NSColor *rippleStroke = [[NSColor colorWithCGColor:dock7.orbRippleA.strokeColor]
-                                     colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
-            BOOL orbRippleColorOK = rippleStroke && rippleStroke.blueComponent > 0.7 &&
-                                    rippleStroke.blueComponent > rippleStroke.redComponent + 0.15;
+            // 明暗成对:白峰/黑谷描边;固定基础环为当前状态色(运行中为绿)低透明度。
+            BOOL orbRippleColorOK = CGColorEqualToColor(dock7.orbRippleView.rippleLayers.firstObject.strokeColor,
+                                                        NSColor.whiteColor.CGColor) &&
+                                    CGColorEqualToColor(dock7.orbRippleView.rippleTroughLayers.firstObject.strokeColor,
+                                                        NSColor.blackColor.CGColor) &&
+                                    !dock7.orbRippleView.baseRingLayer.hidden;
+            {
+                NSColor *baseStroke = [[NSColor colorWithCGColor:dock7.orbRippleView.baseRingLayer.strokeColor]
+                                       colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
+                NSColor *green = [CPGreen() colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
+                orbRippleColorOK = orbRippleColorOK && baseStroke && green &&
+                                   fabs(baseStroke.redComponent - green.redComponent) < 0.02 &&
+                                   fabs(baseStroke.greenComponent - green.greenComponent) < 0.02 &&
+                                   fabs(baseStroke.blueComponent - green.blueComponent) < 0.02;
+            }
+            // 各状态基础环颜色/时长可配置:失败红、等待橙、待查验蓝、运行绿、待机青。
+            BOOL m1StatusColorsOK = YES;
+            NSDictionary<NSNumber *, NSColor *> *expectColors = @{
+                @(CPDisplayStatusFailed): CPRed(),
+                @(CPDisplayStatusWaiting): CPOrange(),
+                @(CPDisplayStatusCompletedPendingReview): CPBlue(),
+                @(CPDisplayStatusIdle): CPDisplayStatusColor(CPDisplayStatusIdle),
+            };
+            for (NSNumber *st in m1Statuses) {
+                CPDisplayStatus s = (CPDisplayStatus)st.integerValue;
+                CPRippleView *rv = [[CPRippleView alloc] initWithRingDiameter:60 lineWidth:1.5];
+                rv.displayStatus = s;
+                [rv updateRipples];
+                NSColor *expect = [expectColors[st] ?: CPGreen() colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
+                NSColor *baseStroke = [[NSColor colorWithCGColor:rv.baseRingLayer.strokeColor]
+                                       colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
+                if (!baseStroke || !expect ||
+                    fabs(baseStroke.redComponent - expect.redComponent) > 0.02 ||
+                    fabs(baseStroke.greenComponent - expect.greenComponent) > 0.02 ||
+                    fabs(baseStroke.blueComponent - expect.blueComponent) > 0.02) m1StatusColorsOK = NO;
+                CAAnimation *anim = [rv.rippleLayers.firstObject animationForKey:@"ripple0"];
+                if (!anim || fabs(anim.duration - CPRippleDurationForStatus(s)) > 0.01) m1StatusColorsOK = NO;
+            }
             dock7.orbReduceMotion = YES;
             [dock7 updateOrbRipples];
-            BOOL orbReduceOK = dock7.orbRippleA.animationKeys.count == 0 &&
-                               dock7.orbRippleB.animationKeys.count == 0 &&
-                               !dock7.orbRippleA.hidden && dock7.orbRippleB.hidden; // 静态淡圈
+            // reduce motion:无任何 CAAnimation,8 对波层全隐藏,只留固定状态环(实色)。
+            BOOL orbReduceOK = dock7.orbRippleView.baseRingLayer.animationKeys.count == 0 &&
+                               !dock7.orbRippleView.baseRingLayer.hidden;
+            {
+                NSColor *baseStroke = [[NSColor colorWithCGColor:dock7.orbRippleView.baseRingLayer.strokeColor]
+                                       colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
+                orbReduceOK = orbReduceOK && baseStroke && baseStroke.alphaComponent > 0.95; // 实色固定环
+            }
+            for (NSInteger li = 0; li < CPRippleLayerCount; li++) {
+                if (!dock7.orbRippleView.rippleLayers[(NSUInteger)li].hidden ||
+                    dock7.orbRippleView.rippleLayers[(NSUInteger)li].animationKeys.count != 0 ||
+                    !dock7.orbRippleView.rippleTroughLayers[(NSUInteger)li].hidden ||
+                    dock7.orbRippleView.rippleTroughLayers[(NSUInteger)li].animationKeys.count != 0) orbReduceOK = NO;
+            }
             dock7.orbReduceMotion = NO;
-            dock7.orbHovered = YES; // hover/drag 时弱化涟漪
+            dock7.orbHovered = YES; // hover/drag 时隐藏动效
             [dock7 updateOrbRipples];
-            BOOL orbHoverWeakens = dock7.orbRippleA.animationKeys.count == 0 &&
-                                   dock7.orbRippleB.hidden && dock7.orbRippleA.hidden;
+            BOOL orbHoverWeakens = dock7.orbRippleView.rippleLayers.firstObject.animationKeys.count == 0 &&
+                                   dock7.orbRippleView.rippleLayers.firstObject.hidden &&
+                                   dock7.orbRippleView.rippleTroughLayers.firstObject.hidden;
             dock7.orbHovered = NO;
 
             CPAgent *idleAgent = CPTestAgent(@"m7-idle", @[CPTestTask(@"i1", CPStatusIdle, 1)]);
@@ -3541,6 +4203,7 @@ int main(int argc, const char *argv[]) {
             [m7Defaults synchronize];
 
             BOOL m7ui = orbWindowLarger && orbCentered && orbMarginOK && hoverNotClipped &&
+                        m1ParamsOK && m1OverallOK && m1StatusColorsOK && orbRippleCurveOK &&
                         orbRippleOK && orbRippleGeo && orbRippleColorOK && orbReduceOK && orbHoverWeakens &&
                         badgeZeroHidden && badgeCircle && badgeCentered && badgeInWindow &&
                         badgeCapsule && badgeOverflow && badgeHelperSemantics;
@@ -3549,7 +4212,7 @@ int main(int argc, const char *argv[]) {
             CPHUDWindowController *hud8 = CPHUDWindowController.new;
             hud8.reviewStore = [[CPReviewStore alloc] initWithDefaults:m7Defaults];
             BOOL hudSizeOK = CPHUDContentWidth >= 380.0 && CPHUDContentWidth <= 420.0 &&
-                             CPHUDContentHeight >= 200.0 && CPHUDContentHeight <= 240.0;
+                             CPHUDContentHeight >= 240.0 && CPHUDContentHeight <= 260.0;
             CGColorRef hudBg = hud8.visualView.layer.backgroundColor;
             BOOL hudOpaqueDark = hudBg && CGColorGetAlpha(hudBg) == 1.0 && hud8.visualView.layer.masksToBounds;
             {
@@ -3569,10 +4232,8 @@ int main(int argc, const char *argv[]) {
             CPAgent *hudAgentB = CPTestAgent(@"m8-b", @[CPTestTask(@"b-only", CPStatusFailed, 95)]);
             [hud8 updateWithAgents:@[hudAgentA, hudAgentB] selectedAgent:hudAgentA];
 
-            BOOL hudCapOK = hud8.taskList.arrangedSubviews.count == 3; // 2 张任务卡 + 1 行摘要
-            NSView *summaryV = hud8.taskList.arrangedSubviews.lastObject;
-            BOOL hudSummaryOK = [summaryV isKindOfClass:NSTextField.class] &&
-                                [((NSTextField *)summaryV).stringValue isEqualToString:@"另有 1 个活动"];
+            BOOL hudCapOK = hud8.taskList.arrangedSubviews.count == 2; // 最多 2 张任务卡,摘要在底行
+            BOOL hudSummaryOK = [hud8.moreLabel.stringValue isEqualToString:@"另有 1 个活动"];
             BOOL hudMinFontOK = YES;
             BOOL hudNoPathOK = YES;
             BOOL hudTitleTruncOK = NO;
@@ -3602,6 +4263,7 @@ int main(int argc, const char *argv[]) {
             BOOL hudRailOK = hud8.agentList.arrangedSubviews.count == 2;
             for (NSView *v in hud8.agentList.arrangedSubviews) {
                 if (![v isKindOfClass:CPAgentStatusButton.class]) hudRailOK = NO;
+                if ([v isKindOfClass:NSButton.class] && ((NSButton *)v).title.length != 0) hudRailOK = NO;
             }
             BOOL hudScopeOK = [hud8.agentNameLabel.stringValue isEqualToString:@"m8-a"];
             CPAgentStatusButton *btnB = (CPAgentStatusButton *)hud8.agentList.arrangedSubviews[1];
@@ -3620,7 +4282,13 @@ int main(int argc, const char *argv[]) {
             if (hud8.agentList.arrangedSubviews.count > 1) {
                 // render 后按钮为重建的新实例,重新取回检查选中态与 hit-test。
                 CPAgentStatusButton *newBtnB = (CPAgentStatusButton *)hud8.agentList.arrangedSubviews[1];
-                hudRailSelected = newBtnB.statusSelected;
+                // 方向 A 选中态:无蒙层(背景透明)、无描边、无指示条,状态环实色(opacity≈1)且线宽 2。
+                CGColorRef selBg = newBtnB.layer.backgroundColor;
+                hudRailSelected = newBtnB.statusSelected &&
+                                  (!selBg || CGColorGetAlpha(selBg) == 0.0) &&
+                                  newBtnB.layer.borderWidth == 0.0 &&
+                                  fabs(newBtnB.ringLayer.opacity - 1.0) < 0.01 &&
+                                  fabs(newBtnB.ringLayer.lineWidth - 2.0) < 0.01;
                 [hud8 expand]; // hit-test 需要卡片可见(hidden=NO)
                 [hud8.visualView layoutSubtreeIfNeeded];
                 NSPoint btnCenter = NSMakePoint(NSMidX(newBtnB.bounds), NSMidY(newBtnB.bounds));
@@ -3646,24 +4314,47 @@ int main(int argc, const char *argv[]) {
                             fabs(NSMaxY(hud8Expanded) - NSMaxY(testVisible)) <= 0.5 &&
                             hud8.trackingArea != nil;
 
-            // 状态点在按钮"视觉"右下角:圆心位于右半,且按 isFlipped 判定视觉下半
-            // (flipped 视图 y 向下增长,视觉底部是大 y;unflipped 则相反)。
-            CPAgentStatusButton *dotBtn = [[CPAgentStatusButton alloc] initWithFrame:NSMakeRect(0, 0, 38, 38)];
-            [dotBtn updateWithAgent:CPTestAgent(@"dot-test", @[]) displayStatus:CPDisplayStatusWorking selected:NO];
-            CGPoint dotC = CGPointMake(NSMidX(dotBtn.statusDot.frame), NSMidY(dotBtn.statusDot.frame));
-            BOOL dotInVisualBottom = dotBtn.isFlipped ? (dotC.y > dotBtn.bounds.size.height / 2.0)
-                                                      : (dotC.y < dotBtn.bounds.size.height / 2.0);
-            BOOL hudDotCornerOK = dotC.x > dotBtn.bounds.size.width / 2.0 && dotInVisualBottom;
+            // 展开后把手必须消失，避免右上角出现额外竖条“障碍物”。
+            BOOL hudHandleTabOK = hud8.handleView.hidden;
 
-            // 把手与卡片连续:展开时把手可见、贴卡片右缘顶部、同卡片色系
-            BOOL hudHandleTabOK = !hud8.handleView.hidden &&
-                                  fabs(NSMaxX(hud8.handleView.frame) - NSMaxX(hud8.visualView.frame)) <= 0.5 &&
-                                  fabs(NSMaxY(hud8.handleView.frame) - NSMaxY(hud8.visualView.frame)) <= 0.5 &&
-                                  hud8.handleView.layer.borderWidth > 0.0;
+            // 状态图例:底行右侧 14x14「?」小圆钮(无系统默认按钮样式、无「按钮」文字),
+            // hover/点击在其上方展开浮层:五行速查(7px 色点 + 状态名)+ 底部说明行,移走收回。
+            BOOL legendOK = hud8.legendButton != nil &&
+                            !hud8.legendButton.bordered &&
+                            [hud8.legendButton.title isEqualToString:@"?"] &&
+                            fabs(hud8.legendButton.bounds.size.width - 14.0) <= 0.5 &&
+                            fabs(hud8.legendButton.bounds.size.height - 14.0) <= 0.5 &&
+                            hud8.moreLabel.superview == hud8.bottomBar &&
+                            hud8.legendButton.superview == hud8.bottomBar &&
+                            (hud8.legendPanel == nil || !hud8.legendPanel.isVisible);
+            [hud8 legendClicked:nil]; // 键盘可达入口:切换展开
+            legendOK = legendOK && hud8.legendPanel != nil && hud8.legendPanel.isVisible;
+            {
+                NSMutableArray<NSString *> *legendTexts = NSMutableArray.array;
+                NSInteger dotCount = 0;
+                NSMutableArray<NSView *> *queue = [NSMutableArray arrayWithArray:hud8.legendPanel.contentView.subviews];
+                while (queue.count) {
+                    NSView *v = queue.firstObject;
+                    [queue removeObjectAtIndex:0];
+                    if ([v isKindOfClass:NSTextField.class]) [legendTexts addObject:((NSTextField *)v).stringValue];
+                    if ([v isKindOfClass:NSImageView.class]) dotCount++;
+                    [queue addObjectsFromArray:v.subviews];
+                }
+                legendOK = legendOK && dotCount == 5 &&
+                           [legendTexts containsObject:@"失败"] &&
+                           [legendTexts containsObject:@"等待处理"] &&
+                           [legendTexts containsObject:@"完成待查验"] &&
+                           [legendTexts containsObject:@"运行中"] &&
+                           [legendTexts containsObject:@"待机"] &&
+                           [legendTexts containsObject:@"Agent 环取任务中最紧急状态"] &&
+                           ![legendTexts containsObject:@"按钮"];
+            }
+            [hud8 hideLegend];
+            legendOK = legendOK && !hud8.legendPanel.isVisible;
 
             BOOL m8ui = hudSizeOK && hudOpaqueDark && hudCarrierNoClip && hudCapOK && hudSummaryOK && hudMinFontOK &&
                         hudNoPathOK && hudTitleTruncOK && hudRailOK && hudScopeOK && hudRailSelected &&
-                        hudRailHitOK && hudEmptyOK && hudGeoOK && hudDotCornerOK && hudHandleTabOK;
+                        hudRailHitOK && hudEmptyOK && hudGeoOK && hudHandleTabOK && legendOK;
 
             // M9: 工作台任务详情抽屉 — 全宽/两列 grid/截断/格式/Esc/刷新
             CPWorkbenchCardController *card9 = CPWorkbenchCardController.new;
@@ -3788,9 +4479,25 @@ int main(int argc, const char *argv[]) {
             [card9 showNearDockRect:NSMakeRect(0, 0, CPOrbWindowSize, CPOrbWindowSize) edge:NSRectEdgeMaxX];
             BOOL m9ShowMakesKey = card9.lastShowMadeKey;
 
+            // 详情打开时点击不得穿透到下层任务列表(命中被详情容器吞掉);关闭后下层恢复可点。
+            [card9 renderAgents:@[agent9]];
+            NSButton *row9c = NSButton.new;
+            row9c.tag = 0;
+            [card9 taskClicked:row9c];
+            [card9.card layoutSubtreeIfNeeded];
+            NSPoint midPt = NSMakePoint(NSMidX(card9.middleColumn.bounds), NSMidY(card9.middleColumn.bounds));
+            NSView *hitOpen = [card9.middleColumn hitTest:midPt];
+            BOOL m9BarrierOpen = [card9.rightColumn isKindOfClass:CPClickBarrierView.class] &&
+                                 hitOpen != nil && [hitOpen isDescendantOf:card9.rightColumn];
+            [card9 closeDetailDrawer];
+            NSView *hitClosed = [card9.middleColumn hitTest:midPt];
+            BOOL m9BarrierRestored = hitClosed != nil &&
+                                     ![hitClosed isDescendantOf:card9.rightColumn] &&
+                                     [hitClosed isDescendantOf:card9.taskScrollView];
+
             BOOL m9ui = m9FullWidth && m9GridOK && m9TitleTruncOK && m9ActivityTruncOK && m9TokensOK &&
                         m9DateOK && m9DashOK && m9CloseHitOK && m9CloseVisible && m9CloseTopRight && m9RefreshKeep && m9RefreshGone && m9Esc1 && m9Esc2 &&
-                        m9Keyable && m9ShowMakesKey;
+                        m9Keyable && m9ShowMakesKey && m9BarrierOpen && m9BarrierRestored;
 
             // M10: 工作台任务列表 NSScrollView 化
             CPWorkbenchCardController *card10 = CPWorkbenchCardController.new;
@@ -3822,18 +4529,54 @@ int main(int argc, const char *argv[]) {
             BOOL m10ui = m10ScrollStruct && m10HeaderFixed && m10Scrollable &&
                          m10FirstRowOK && m10LastRowOK && m10WidthOK;
 
+            // L2: hover 蒙层残留回归 — 正常进出清零;窗口移动(鼠标静止相对移出)、
+            // 隐藏、移出父视图等收不到 mouseExited 的场景必须强制复位。
+            NSWindow *hoverWin = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 120, 120)
+                                                             styleMask:NSWindowStyleMaskBorderless
+                                                               backing:NSBackingStoreBuffered
+                                                                 defer:NO];
+            CPHoverButton *hoverBtn = [CPHoverButton buttonWithTitle:@"" target:nil action:nil];
+            hoverBtn.frame = NSMakeRect(10, 10, 28, 28);
+            [hoverWin.contentView addSubview:hoverBtn];
+            [hoverWin orderFrontRegardless];
+            [hoverBtn cpSetHovered:YES];
+            CGColorRef hoverBg = hoverBtn.layer.backgroundColor;
+            BOOL hoverShown = hoverBg && CGColorGetAlpha(hoverBg) > 0.05;
+            [hoverBtn cpSetHovered:NO];
+            CGColorRef exitBg = hoverBtn.layer.backgroundColor;
+            BOOL hoverExitCleared = !exitBg || CGColorGetAlpha(exitBg) == 0.0;
+            // 窗口移动到远离真实鼠标的位置:tracking area 不会补发 exited,必须靠重校验清零。
+            [hoverBtn cpSetHovered:YES];
+            NSPoint realMouse = NSEvent.mouseLocation;
+            [hoverWin setFrameOrigin:NSMakePoint(realMouse.x + 800.0, realMouse.y + 800.0)];
+            CGColorRef moveBg = hoverBtn.layer.backgroundColor;
+            BOOL hoverMoveCleared = !moveBg || CGColorGetAlpha(moveBg) == 0.0;
+            [hoverBtn cpSetHovered:YES];
+            hoverBtn.hidden = YES; // 收不到 mouseExited:viewDidHide 兜底
+            CGColorRef hideBg = hoverBtn.layer.backgroundColor;
+            BOOL hoverHideCleared = !hideBg || CGColorGetAlpha(hideBg) == 0.0;
+            hoverBtn.hidden = NO;
+            [hoverBtn cpSetHovered:YES];
+            [hoverBtn removeFromSuperview]; // 刷新重建时旧按钮被移除
+            CGColorRef removedBg = hoverBtn.layer.backgroundColor;
+            BOOL hoverRemoveCleared = !removedBg || CGColorGetAlpha(removedBg) == 0.0;
+            [hoverWin orderOut:nil];
+            BOOL hoverResidualOK = hoverShown && hoverExitCleared && hoverMoveCleared &&
+                                   hoverHideCleared && hoverRemoveCleared;
+
             BOOL passed = centered && draggableHeader && labeledWorkbench && onlyRealAgents && labeledAgent && buttonReceivesClick &&
                           cardMasksToBounds && shadowCarrierNoMasks && cardIsChildOfShadowCarrier && windowHasWorkbenchInset &&
                           fixedCardSize && twoColumn && rightOverlayHidden &&
-                          hudCollapsed6x72 && hudCollapsedOnMainScreen && hudExpanded344x224 && hudExpandedOnMainScreen &&
+                          hudCollapsed6x72 && hudCollapsedOnMainScreen && hudExpandedSizeOK && hudExpandedOnMainScreen &&
                           shadowCarrierScales && handleAnchoredTopRight && contentNotSizable && hudClickViewIsBackgroundView &&
-                          hudVisualFrameExact && hudHandleTopRight && m2ui && m3ui && m3entries && m4ui && m5ui && m7ui && m8ui && m9ui && m10ui;
+                          hudVisualFrameExact && hudExpandedHandleHidden && m2ui && m3ui && m3entries && m4ui && m5ui && m7ui && m8ui && m9ui && m10ui &&
+                          hoverResidualOK;
             NSMutableString *result = [NSMutableString stringWithFormat:
                 @"Codex Pulse UI self-test: center=%@ drag=%@ workbench-label=%@ real-agents=%@ agent-label=%@ button-hit=%@ "
                 @"card-mask=%@ carrier-mask=%@ card-child=%@ win-inset=%@ card-520x360=%@ two-column=%@ right-overlay=%@ "
-                @"hud-6x72=%@ hud-collapsed-pos=%@ hud-344x224=%@ hud-expanded-pos=%@ "
+                @"hud-6x72=%@ hud-collapsed-pos=%@ hud-expanded-size=%@ hud-expanded-pos=%@ "
                 @"hud-carrier-scale=%@ hud-handle-tr=%@ hud-content-fixed=%@ hud-bg-click=%@ "
-                @"hud-visual-frame=%@ hud-handle-pos=%@\n",
+                @"hud-visual-frame=%@ hud-expanded-handle-hidden=%@\n",
                 centered ? @"OK" : @"FAIL",
                 draggableHeader ? @"OK" : @"FAIL",
                 labeledWorkbench ? @"OK" : @"FAIL",
@@ -3849,22 +4592,23 @@ int main(int argc, const char *argv[]) {
                 rightOverlayHidden ? @"OK" : @"FAIL",
                 hudCollapsed6x72 ? @"OK" : @"FAIL",
                 hudCollapsedOnMainScreen ? @"OK" : @"FAIL",
-                hudExpanded344x224 ? @"OK" : @"FAIL",
+                hudExpandedSizeOK ? @"OK" : @"FAIL",
                 hudExpandedOnMainScreen ? @"OK" : @"FAIL",
                 shadowCarrierScales ? @"OK" : @"FAIL",
                 handleAnchoredTopRight ? @"OK" : @"FAIL",
                 contentNotSizable ? @"OK" : @"FAIL",
                 hudClickViewIsBackgroundView ? @"OK" : @"FAIL",
                 hudVisualFrameExact ? @"OK" : @"FAIL",
-                hudHandleTopRight ? @"OK" : @"FAIL"];
-            [result appendFormat:@"M2 UI self-test: ring-colors=%@ blue-double=%@ reduce-motion=%@ ripple-anim=%@ ripple-blue=%@ hud-agent-scope=%@ hud-select-by-id=%@\n",
+                hudExpandedHandleHidden ? @"OK" : @"FAIL"];
+            [result appendFormat:@"M2 UI self-test: ring-colors=%@ blue-double=%@ reduce-motion=%@ ripple-anim=%@ ripple-blue=%@ hud-agent-scope=%@ hud-select-by-id=%@ agent-urgency=%@\n",
                 ringColorsOK ? @"OK" : @"FAIL",
                 blueDoubleOK ? @"OK" : @"FAIL",
                 reduceMotionOK ? @"OK" : @"FAIL",
                 motionAnimOK ? @"OK" : @"FAIL",
                 blueAnimOK ? @"OK" : @"FAIL",
                 hudAgentScope ? @"OK" : @"FAIL",
-                hudSelectByID ? @"OK" : @"FAIL"];
+                hudSelectByID ? @"OK" : @"FAIL",
+                agentUrgencyOK ? @"OK" : @"FAIL"];
             [result appendFormat:@"M3 UI self-test: drawer-init-hidden=%@ render-no-mark=%@ drawer-on-click=%@ review-on-open=%@ esc-drawer=%@ esc-workbench=%@\n",
                 drawerInitiallyHidden ? @"OK" : @"FAIL",
                 renderDoesNotMark ? @"OK" : @"FAIL",
@@ -3898,12 +4642,16 @@ int main(int argc, const char *argv[]) {
                 taskCapOK ? @"OK" : @"FAIL",
                 emptyStateOK ? @"OK" : @"FAIL",
                 workTitleTruncates ? @"OK" : @"FAIL"];
-            [result appendFormat:@"M7 UI self-test: orb-window=%@ orb-centered=%@ orb-margin=%@ hover-no-clip=%@ orb-ripple=%@ orb-ripple-geo=%@ orb-ripple-color=%@ orb-reduce=%@ orb-hover-weak=%@ badge-zero=%@ badge-circle=%@ badge-centered=%@ badge-in-window=%@ badge-capsule=%@ badge-overflow=%@ badge-helper=%@\n",
+            [result appendFormat:@"M7 UI self-test: orb-window=%@ orb-centered=%@ orb-margin=%@ hover-no-clip=%@ ripple-params=%@ ripple-overall=%@ ripple-status-colors=%@ orb-ripple=%@ orb-ripple-curve=%@ orb-ripple-geo=%@ orb-ripple-color=%@ orb-reduce=%@ orb-hover-weak=%@ badge-zero=%@ badge-circle=%@ badge-centered=%@ badge-in-window=%@ badge-capsule=%@ badge-overflow=%@ badge-helper=%@\n",
                 orbWindowLarger ? @"OK" : @"FAIL",
                 orbCentered ? @"OK" : @"FAIL",
                 orbMarginOK ? @"OK" : @"FAIL",
                 hoverNotClipped ? @"OK" : @"FAIL",
+                m1ParamsOK ? @"OK" : @"FAIL",
+                m1OverallOK ? @"OK" : @"FAIL",
+                m1StatusColorsOK ? @"OK" : @"FAIL",
                 orbRippleOK ? @"OK" : @"FAIL",
+                orbRippleCurveOK ? @"OK" : @"FAIL",
                 orbRippleGeo ? @"OK" : @"FAIL",
                 orbRippleColorOK ? @"OK" : @"FAIL",
                 orbReduceOK ? @"OK" : @"FAIL",
@@ -3915,7 +4663,7 @@ int main(int argc, const char *argv[]) {
                 badgeCapsule ? @"OK" : @"FAIL",
                 badgeOverflow ? @"OK" : @"FAIL",
                 badgeHelperSemantics ? @"OK" : @"FAIL"];
-            [result appendFormat:@"M8 UI self-test: hud-size=%@ hud-opaque-dark=%@ hud-carrier-noclip=%@ hud-cap2=%@ hud-summary=%@ hud-min-font=%@ hud-no-path=%@ hud-title-trunc=%@ hud-rail=%@ hud-scope=%@ hud-rail-selected=%@ hud-rail-hit=%@ hud-empty=%@ hud-geo=%@ hud-dot-corner=%@ hud-handle-tab=%@\n",
+            [result appendFormat:@"M8 UI self-test: hud-size=%@ hud-opaque-dark=%@ hud-carrier-noclip=%@ hud-cap2=%@ hud-summary=%@ hud-min-font=%@ hud-no-path=%@ hud-title-trunc=%@ hud-rail=%@ hud-scope=%@ hud-rail-selected=%@ hud-rail-hit=%@ hud-empty=%@ hud-geo=%@ hud-handle-tab=%@ legend=%@\n",
                 hudSizeOK ? @"OK" : @"FAIL",
                 hudOpaqueDark ? @"OK" : @"FAIL",
                 hudCarrierNoClip ? @"OK" : @"FAIL",
@@ -3930,9 +4678,11 @@ int main(int argc, const char *argv[]) {
                 hudRailHitOK ? @"OK" : @"FAIL",
                 hudEmptyOK ? @"OK" : @"FAIL",
                 hudGeoOK ? @"OK" : @"FAIL",
-                hudDotCornerOK ? @"OK" : @"FAIL",
-                hudHandleTabOK ? @"OK" : @"FAIL"];
-            [result appendFormat:@"M9 UI self-test: detail-fullwidth=%@ detail-grid=%@ detail-title-trunc=%@ detail-activity-trunc=%@ detail-tokens=%@ detail-date=%@ detail-dash=%@ detail-close-hit=%@ detail-close-visible=%@ detail-close-topright=%@ detail-refresh-keep=%@ detail-refresh-gone=%@ detail-esc1=%@ detail-esc2=%@ workbench-keyable=%@ show-makes-key=%@\n",
+                hudHandleTabOK ? @"OK" : @"FAIL",
+                legendOK ? @"OK" : @"FAIL"];
+            [result appendFormat:@"M5 UI self-test(动画生命周期): hud-rapid-toggle=%@\n",
+                hudRapidOK ? @"OK" : @"FAIL"];
+            [result appendFormat:@"M9 UI self-test: detail-fullwidth=%@ detail-grid=%@ detail-title-trunc=%@ detail-activity-trunc=%@ detail-tokens=%@ detail-date=%@ detail-dash=%@ detail-close-hit=%@ detail-close-visible=%@ detail-close-topright=%@ detail-refresh-keep=%@ detail-refresh-gone=%@ detail-esc1=%@ detail-esc2=%@ workbench-keyable=%@ show-makes-key=%@ detail-barrier=%@ detail-barrier-restore=%@\n",
                 m9FullWidth ? @"OK" : @"FAIL",
                 m9GridOK ? @"OK" : @"FAIL",
                 m9TitleTruncOK ? @"OK" : @"FAIL",
@@ -3948,7 +4698,9 @@ int main(int argc, const char *argv[]) {
                 m9Esc1 ? @"OK" : @"FAIL",
                 m9Esc2 ? @"OK" : @"FAIL",
                 m9Keyable ? @"OK" : @"FAIL",
-                m9ShowMakesKey ? @"OK" : @"FAIL"];
+                m9ShowMakesKey ? @"OK" : @"FAIL",
+                m9BarrierOpen ? @"OK" : @"FAIL",
+                m9BarrierRestored ? @"OK" : @"FAIL"];
             [result appendFormat:@"M10 UI self-test: task-scroll=%@ header-fixed=%@ scrollable=%@ first-row=%@ last-row-inset=%@ width-follow=%@\n",
                 m10ScrollStruct ? @"OK" : @"FAIL",
                 m10HeaderFixed ? @"OK" : @"FAIL",
@@ -3956,6 +4708,12 @@ int main(int argc, const char *argv[]) {
                 m10FirstRowOK ? @"OK" : @"FAIL",
                 m10LastRowOK ? @"OK" : @"FAIL",
                 m10WidthOK ? @"OK" : @"FAIL"];
+            [result appendFormat:@"L2 UI self-test(hover 残留): hover-shown=%@ exit-cleared=%@ window-move-cleared=%@ hide-cleared=%@ remove-cleared=%@\n",
+                hoverShown ? @"OK" : @"FAIL",
+                hoverExitCleared ? @"OK" : @"FAIL",
+                hoverMoveCleared ? @"OK" : @"FAIL",
+                hoverHideCleared ? @"OK" : @"FAIL",
+                hoverRemoveCleared ? @"OK" : @"FAIL"];
             if (!centered) {
                 [result appendFormat:@"  diagnostic: testVisible=%@ cardFrame=%@ hasScreen=%@\n",
                  NSStringFromRect(testVisible), NSStringFromRect(cardFrame), hasScreen ? @"YES" : @"NO"];

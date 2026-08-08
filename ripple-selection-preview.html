@@ -1,0 +1,571 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ripple 选中态 · 方向 A 预览</title>
+<style>
+:root {
+  --bg:           #313338;
+  --surface:      #2b2d31;
+  --surface-warm: #1e1f22;
+  --fg:   #dbdee1;
+  --fg-2: #f2f3f5;
+  --muted: #949ba4;
+  --meta:  #80848e;
+  --border:      rgba(255, 255, 255, 0.06);
+  --border-soft: #3f4147;
+  --accent:        #5865f2;
+  --accent-on:     #ffffff;
+  --accent-hover:  #4752c4;
+  --success: #23a55a;
+  --warn:    #f0b232;
+  --danger:  #f23f43;
+  --info:    #00a8fc;
+  --calm:    #3ba55d;
+  --font-body: "gg sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-mono: "gg mono", Consolas, "Andale Mono", "Courier New", Courier, monospace;
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 16px;
+  --focus-ring: 0 0 0 3px rgba(88, 101, 242, 0.3);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  font-family: var(--font-body);
+  background: var(--surface-warm);
+  color: var(--fg);
+  font-size: 16px;
+  line-height: 1.375;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 48px 24px 64px;
+  gap: 40px;
+}
+
+/* ---------- 顶部说明 ---------- */
+.intro { max-width: 720px; text-align: center; }
+.intro .eyebrow {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 12px;
+}
+.intro h1 {
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--fg-2);
+  letter-spacing: -0.01em;
+  margin-bottom: 10px;
+}
+.intro p { color: var(--muted); font-size: 15px; max-width: 560px; margin: 0 auto; }
+
+/* ---------- 演示舞台 ---------- */
+.stage {
+  display: flex;
+  gap: 48px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+/* ---------- HUD rail ---------- */
+.hud {
+  display: flex;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  box-shadow: rgba(0,0,0,0.4) 0 8px 24px;
+}
+.rail {
+  width: 64px;
+  background: var(--surface-warm);
+  padding: 14px 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  border-right: 1px solid var(--border);
+}
+
+/* Agent 按钮：30pt 容器，圆形 */
+.agent {
+  position: relative;
+  width: 40px;
+  height: 40px;
+  display: grid;
+  place-items: center;
+  background: none;
+  border: none;
+  cursor: pointer;
+  border-radius: 50%;
+  -webkit-tap-highlight-color: transparent;
+}
+.agent:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+/* 状态环（基础环，固定） */
+.agent .ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 1.5px solid var(--c, var(--meta));
+  opacity: 0.28;
+  transition: opacity 200ms ease, border-width 200ms ease;
+}
+
+/* 图标 */
+.agent .glyph {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: var(--surface);
+  color: var(--muted);
+  transition: color 200ms ease, background 200ms ease;
+}
+.agent .glyph svg { width: 14px; height: 14px; display: block; }
+
+/* 涟漪层（定稿·路线 1）：八层同心波从圆心往外层层荡开。
+   每圈波是"亮峰 + 暗谷"紧贴的一对（双层 box-shadow 模拟水面折射的明暗交界，
+   单色环 = 灯效，亮暗成对 = 水感）；波层沉在图标之下（z-index 0），
+   从图标边缘的水面露出来，不遮挡图标。
+   12s 周期、1.5s 错峰、缓入缓出（出发平缓、不急切）、衰减尾巴拉长——
+   场上同时存在四五层，层叠密度本身演出"慢"。 */
+.agent .wave {
+  position: absolute;
+  border-radius: 50%;
+  border: 1px solid transparent;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* —— 未选中：环淡、涟漪静止 —— */
+/* —— hover：环提亮一档，不起涟漪 —— */
+.agent:hover .ring { opacity: 0.55; }
+.agent:hover .glyph { color: var(--fg); }
+
+/* —— 选中（方向 A 核心）：实色环 + 环略粗 + 双层错峰涟漪常开 —— */
+.agent.selected .ring {
+  opacity: 1;
+  border-width: 2px;
+}
+.agent.selected .glyph {
+  color: var(--fg-2);
+  background: var(--bg);
+}
+.agent.selected .wave {
+  animation: agent-ripple var(--dur, 12s) cubic-bezier(0.45, 0.08, 0.35, 1) infinite;
+  will-change: inset, opacity;
+}
+.agent.selected .wave:nth-child(2) { animation-delay: calc(var(--dur, 12s) / -8); }
+.agent.selected .wave:nth-child(3) { animation-delay: calc(var(--dur, 12s) / -8 * 2); }
+.agent.selected .wave:nth-child(4) { animation-delay: calc(var(--dur, 12s) / -8 * 3); }
+.agent.selected .wave:nth-child(5) { animation-delay: calc(var(--dur, 12s) / -8 * 4); }
+.agent.selected .wave:nth-child(6) { animation-delay: calc(var(--dur, 12s) / -8 * 5); }
+.agent.selected .wave:nth-child(7) { animation-delay: calc(var(--dur, 12s) / -8 * 6); }
+.agent.selected .wave:nth-child(8) { animation-delay: calc(var(--dur, 12s) / -8 * 7); }
+
+/* 波扫过时图标与环的轻微晃动（水面折射感，幅度 < 1px） */
+.agent.selected .glyph, .agent.selected .ring { animation: bob var(--dur, 12s) ease-in-out infinite; }
+
+/* 水波关键帧（40px 容器）：
+   0%   —— inset 19px ≈ 半径 1px，波从真正的圆心出发，不弹亮
+   26%  —— 缓慢显现到峰值 0.85（推迟到峰，中心不急切）
+   50–90% —— 长尾巴衰减，每层"活"得久，场上同时叠着四五层
+   100% —— 荡到容器外缘，明暗双影同时淡没，融入水面 */
+@keyframes agent-ripple {
+  0%   { inset: 19px; opacity: 0;
+         box-shadow: 0 0 0 1.5px rgba(255,255,255,0.5), 0 0 0 3px rgba(0,0,0,0.4); }
+  26%  { opacity: 0.85; }
+  50%  { opacity: 0.55; }
+  72%  { opacity: 0.28; }
+  90%  { opacity: 0.10; }
+  100% { inset: -2px; opacity: 0;
+         box-shadow: 0 0 0 0.5px rgba(255,255,255,0.14), 0 0 0 1.5px rgba(0,0,0,0.12); }
+}
+
+@keyframes bob {
+  0%, 100% { transform: translate(0, 0); }
+  18% { transform: translate(0.6px, -0.8px); }
+  42% { transform: translate(-0.5px, 0.6px); }
+  68% { transform: translate(0, 0); }
+}
+
+/* 状态颜色与速度：失败最快，待机最慢（周期差异，层数与曲线统一） */
+.agent[data-status="error"]   { --c: var(--danger);  --dur: 8s; }
+.agent[data-status="waiting"] { --c: var(--warn);    --dur: 9.6s; }
+.agent[data-status="review"]  { --c: var(--info);    --dur: 10.8s; }
+.agent[data-status="running"] { --c: var(--success); --dur: 12s; }
+.agent[data-status="idle"]    { --c: #4fd1c5;        --dur: 14s; }
+
+/* ---------- 右侧内容面板（示意） ---------- */
+.panel {
+  width: 320px;
+  padding: 20px 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 300px;
+}
+.panel-head { display: flex; flex-direction: column; gap: 6px; }
+.panel-name {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--fg-2);
+}
+.panel-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+}
+.status-tag {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 9999px;
+  color: var(--c, var(--muted));
+  background: color-mix(in oklab, var(--c, var(--muted)) 14%, transparent);
+  white-space: nowrap;
+}
+.panel-time { color: var(--muted); font-family: var(--font-mono); font-size: 11px; }
+
+.task {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.task-title { font-size: 14px; font-weight: 500; color: var(--fg); display: flex; align-items: center; gap: 7px; }
+/* 颜色永远表示状态：每张任务卡带自己的状态点，Agent 环取任务中最紧急的那个 */
+.task-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--c, var(--muted));
+  flex-shrink: 0;
+}
+.task-act { font-size: 12px; color: var(--muted); }
+.panel-foot {
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* 状态图例：收成右下角一个小圆钮，hover/聚焦时向上展开，平时不拉长面板 */
+.legend-wrap { position: relative; flex-shrink: 0; }
+.legend-toggle {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1px solid var(--border-soft);
+  background: transparent;
+  color: var(--meta);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: help;
+  padding: 0;
+  transition: color var(--motion-base) var(--ease-standard), border-color var(--motion-base) var(--ease-standard);
+}
+.legend-toggle:hover, .legend-toggle:focus-visible { color: var(--muted); border-color: var(--meta); }
+.legend {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-family: var(--font-mono);
+  background: var(--surface-warm);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  padding: 8px 10px;
+  box-shadow: var(--elev-raised);
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(3px);
+  transition: opacity var(--motion-base) var(--ease-standard), transform var(--motion-base) var(--ease-standard), visibility var(--motion-base);
+  z-index: 10;
+}
+.legend-wrap:hover .legend,
+.legend-wrap:focus-within .legend {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
+}
+.legend {
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--meta);
+  text-align: left;
+  flex-shrink: 0;
+}
+.legend span { display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+.legend .legend-note {
+  color: var(--meta);
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  white-space: normal;
+  line-height: 1.5;
+}
+.legend i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--c);
+  flex-shrink: 0;
+}
+
+/* ---------- 悬浮球对照 ---------- */
+.orb-wrap { display: flex; flex-direction: column; align-items: center; gap: 16px; }
+.orb-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+.orb {
+  position: relative;
+  width: 84px;
+  height: 84px;
+  display: grid;
+  place-items: center;
+}
+.orb .core {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: var(--surface);
+  border: 1px solid var(--border-soft);
+  display: grid;
+  place-items: center;
+  color: var(--fg-2);
+  position: relative;
+  z-index: 1;
+}
+.orb .core svg { width: 22px; height: 22px; }
+.orb .ring-base {
+  position: absolute;
+  inset: 14px;
+  border-radius: 50%;
+  border: 1.5px solid var(--success);
+  opacity: 0.5;
+}
+.orb .wave {
+  position: absolute;
+  border-radius: 50%;
+  border: 1px solid transparent;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 0;
+  animation: orb-ripple 12s cubic-bezier(0.45, 0.08, 0.35, 1) infinite;
+  will-change: inset, opacity;
+}
+.orb .wave:nth-child(2) { animation-delay: -1.5s; }
+.orb .wave:nth-child(3) { animation-delay: -3s; }
+.orb .wave:nth-child(4) { animation-delay: -4.5s; }
+.orb .wave:nth-child(5) { animation-delay: -6s; }
+.orb .wave:nth-child(6) { animation-delay: -7.5s; }
+.orb .wave:nth-child(7) { animation-delay: -9s; }
+.orb .wave:nth-child(8) { animation-delay: -10.5s; }
+.orb .core, .orb .ring-base { animation: bob 12s ease-in-out infinite; }
+
+/* 悬浮球（84px 容器）：同一套水波语言，从圆心荡到外缘 */
+@keyframes orb-ripple {
+  0%   { inset: 41px; opacity: 0;
+         box-shadow: 0 0 0 1.5px rgba(255,255,255,0.5), 0 0 0 3px rgba(0,0,0,0.4); }
+  26%  { opacity: 0.85; }
+  50%  { opacity: 0.55; }
+  72%  { opacity: 0.28; }
+  90%  { opacity: 0.10; }
+  100% { inset: -2px; opacity: 0;
+         box-shadow: 0 0 0 0.5px rgba(255,255,255,0.14), 0 0 0 1.5px rgba(0,0,0,0.12); }
+}
+
+/* ---------- 控制条 ---------- */
+.controls {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+.controls .hint { font-size: 13px; color: var(--muted); }
+.toggle-motion {
+  font: inherit;
+  font-size: 13px;
+  color: var(--fg);
+  background: var(--surface);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  padding: 8px 16px;
+  cursor: pointer;
+  transition: background 200ms ease;
+}
+.toggle-motion:hover { background: var(--bg); }
+.toggle-motion:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+/* reduce motion：全部静止，只留环 */
+body.reduce-motion .wave,
+body.reduce-motion .agent.selected .wave,
+body.reduce-motion .orb .wave { animation: none; opacity: 0; }
+body.reduce-motion .agent.selected .glyph, body.reduce-motion .agent.selected .ring,
+body.reduce-motion .orb .core, body.reduce-motion .orb .ring-base { animation: none; }
+body.reduce-motion .agent.selected .ring { opacity: 1; border-width: 2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .wave, .agent.selected .wave, .orb .wave { animation: none !important; opacity: 0 !important; }
+  .agent.selected .glyph, .agent.selected .ring, .orb .core, .orb .ring-base { animation: none !important; }
+}
+</style>
+</head>
+<body>
+
+<div class="intro" data-od-id="intro">
+  <div class="eyebrow">Ripple · 方向 A 预览</div>
+  <h1>定稿涟漪：八层同心波，从圆心层层荡开</h1>
+  <p>水感的来源：每圈波是"亮峰 + 暗谷"紧贴的一对（模拟水面折射的明暗交界，单色环只会像灯）；波层沉在图标之下，从圆心出发、穿过水面荡到外缘消散。12s 周期、1.5s 错峰、缓入缓出、衰减尾巴拉长——场上同时叠着四五层，层叠的密度把"慢"演出来。点击左侧 rail 中的图标切换选中；右下角是状态色速查。</p>
+</div>
+
+<div class="stage" data-od-id="stage">
+
+  <!-- HUD 示意 -->
+  <div class="hud" data-od-id="hud">
+    <div class="rail" data-od-id="agent-rail" role="tablist" aria-label="Agent 列表">
+
+      <button class="agent" data-status="error" data-name="Codex" data-tag="失败" data-time="14:02" role="tab" aria-selected="false" data-od-id="agent-codex">
+        <span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span>
+        <span class="ring"></span>
+        <span class="glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M8 9l-4 3 4 3M16 9l4 3-4 3M13 5l-2 14"/></svg></span>
+      </button>
+
+      <button class="agent" data-status="waiting" data-name="Claude" data-tag="等待处理" data-time="13:47" role="tab" aria-selected="false" data-od-id="agent-claude">
+        <span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span>
+        <span class="ring"></span>
+        <span class="glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg></span>
+      </button>
+
+      <button class="agent selected" data-status="running" data-name="Kimi" data-tag="运行中" data-time="刚刚" role="tab" aria-selected="true" data-od-id="agent-kimi">
+        <span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span>
+        <span class="ring"></span>
+        <span class="glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L4.5 13.5H11L10 22l8.5-11.5H12L13 2z"/></svg></span>
+      </button>
+
+      <button class="agent" data-status="review" data-name="Gemini" data-tag="完成待查验" data-time="12:30" role="tab" aria-selected="false" data-od-id="agent-gemini">
+        <span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span>
+        <span class="ring"></span>
+        <span class="glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l2.4 7.6L22 12l-7.6 2.4L12 22l-2.4-7.6L2 12l7.6-2.4L12 2z"/></svg></span>
+      </button>
+
+      <button class="agent" data-status="idle" data-name="Cursor" data-tag="待机" data-time="11:58" role="tab" aria-selected="false" data-od-id="agent-cursor">
+        <span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span>
+        <span class="ring"></span>
+        <span class="glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3l14 9-6 1-4 6-4-16z"/></svg></span>
+      </button>
+
+    </div>
+
+    <div class="panel" data-od-id="hud-panel">
+      <div class="panel-head">
+        <div class="panel-name" id="panelName">Kimi</div>
+        <div class="panel-meta">
+          <span class="status-tag" id="panelTag" style="--c: var(--success)">运行中</span>
+          <span class="panel-time" id="panelTime">更新于 刚刚</span>
+        </div>
+      </div>
+      <div class="task" data-od-id="task-1">
+        <div class="task-title"><i class="task-dot" style="--c: var(--success)"></i>重构 HUD 选中态为 Ripple 语言</div>
+        <div class="task-act">正在生成预览原型…</div>
+      </div>
+      <div class="task" data-od-id="task-2">
+        <div class="task-title"><i class="task-dot" style="--c: var(--warn)"></i>修复工作台详情层点击穿透</div>
+        <div class="task-act">等待依赖：构建通过</div>
+      </div>
+      <div class="panel-foot">
+        <span>另有 3 个活动</span>
+        <div class="legend-wrap" data-od-id="status-legend">
+          <button class="legend-toggle" type="button" aria-label="状态颜色说明">?</button>
+          <div class="legend">
+            <span><i style="--c: var(--danger)"></i>失败</span>
+            <span><i style="--c: var(--warn)"></i>等待处理</span>
+            <span><i style="--c: var(--info)"></i>完成待查验</span>
+            <span><i style="--c: var(--success)"></i>运行中</span>
+            <span><i style="--c: #4fd1c5"></i>待机</span>
+            <span class="legend-note">Agent 环取任务中最紧急状态</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 悬浮球对照 -->
+  <div class="orb-wrap" data-od-id="orb-wrap">
+    <div class="orb-label">悬浮球 · 常开涟漪</div>
+    <div class="orb" data-od-id="orb">
+      <span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span>
+      <span class="ring-base"></span>
+      <span class="core"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M12 5a7 7 0 0 1 7 7M12 1a11 11 0 0 1 11 11"/></svg></span>
+    </div>
+    <div class="orb-label" style="text-transform:none; letter-spacing:0">悬浮球始终"发声"，<br>rail 里只有选中的跟随发声</div>
+  </div>
+
+</div>
+
+<div class="controls" data-od-id="controls">
+  <span class="hint">速度差异：失败 8s → 待机 14s，层数与曲线统一，选谁听谁。</span>
+  <button class="toggle-motion" id="motionBtn" data-od-id="toggle-motion">模拟「减少动态效果」</button>
+</div>
+
+<script>
+const agents = document.querySelectorAll('.agent');
+const nameEl = document.getElementById('panelName');
+const tagEl  = document.getElementById('panelTag');
+const timeEl = document.getElementById('panelTime');
+const colorMap = {
+  error: 'var(--danger)', waiting: 'var(--warn)', review: 'var(--info)',
+  running: 'var(--success)', idle: '#4fd1c5'
+};
+
+agents.forEach(btn => {
+  btn.addEventListener('click', () => {
+    agents.forEach(b => { b.classList.remove('selected'); b.setAttribute('aria-selected', 'false'); });
+    btn.classList.add('selected');
+    btn.setAttribute('aria-selected', 'true');
+    nameEl.textContent = btn.dataset.name;
+    tagEl.textContent = btn.dataset.tag;
+    tagEl.style.setProperty('--c', colorMap[btn.dataset.status]);
+    timeEl.textContent = '更新于 ' + btn.dataset.time;
+  });
+});
+
+const motionBtn = document.getElementById('motionBtn');
+motionBtn.addEventListener('click', () => {
+  const on = document.body.classList.toggle('reduce-motion');
+  motionBtn.textContent = on ? '恢复动态效果' : '模拟「减少动态效果」';
+});
+</script>
+</body>
+</html>

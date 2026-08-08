@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ripple 风格实验室 — 三条路线对比</title>
+<style>
+:root {
+  --bg:           #313338;
+  --surface:      #2b2d31;
+  --surface-warm: #1e1f22;
+  --fg:   #dbdee1;
+  --fg-2: #f2f3f5;
+  --muted: #949ba4;
+  --meta:  #80848e;
+  --border:      rgba(255, 255, 255, 0.06);
+  --border-soft: #3f4147;
+  --accent:        #5865f2;
+  --accent-on:     #ffffff;
+  --accent-hover:  #4752c4;
+  --success: #23a55a;
+  --warn:    #f0b232;
+  --danger:  #f23f43;
+  --font-display: "gg sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-body:    "gg sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-mono:    "gg mono", Consolas, "Andale Mono", "Courier New", Courier, monospace;
+  --text-xs: 12px; --text-sm: 14px; --text-base: 16px;
+  --text-lg: 18px; --text-xl: 20px; --text-2xl: 24px;
+  --leading-body: 1.375;
+  --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px;
+  --space-5: 20px; --space-6: 24px; --space-8: 32px; --space-12: 40px;
+  --radius-sm: 4px; --radius-md: 8px; --radius-lg: 16px; --radius-pill: 9999px;
+  --focus-ring: 0 0 0 3px rgba(88, 101, 242, 0.3);
+  --motion-fast: 80ms; --motion-base: 200ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  background: var(--bg); color: var(--fg);
+  font-family: var(--font-body); font-size: var(--text-base); line-height: var(--leading-body);
+  padding: var(--space-8);
+}
+.page-head { max-width: 1180px; margin: 0 auto var(--space-8); }
+.page-head h1 { font-size: var(--text-2xl); font-weight: 700; color: var(--fg-2); letter-spacing: -0.01em; }
+.page-head p { margin-top: var(--space-2); color: var(--muted); font-size: var(--text-sm); max-width: 720px; }
+
+.lab { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-5); max-width: 1180px; margin: 0 auto; }
+@media (max-width: 980px) { .lab { grid-template-columns: 1fr; } }
+
+.cell {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-md); padding: var(--space-6);
+  display: flex; flex-direction: column; gap: var(--space-4);
+}
+.cell-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-3); }
+.cell-head h2 { font-size: var(--text-lg); font-weight: 700; color: var(--fg-2); }
+.cell-tag { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.08em; color: var(--meta); text-transform: uppercase; }
+.cell-desc { font-size: var(--text-sm); color: var(--muted); min-height: 3.6em; }
+
+.stage {
+  position: relative; height: 240px;
+  background: var(--surface-warm); border: 1px solid var(--border); border-radius: var(--radius-md);
+  display: flex; align-items: center; justify-content: center;
+  overflow: hidden;
+}
+/* 水面底：极轻微的径向明暗纹，路线 1/2 用来给波提供"介质" */
+.stage.water::before {
+  content: ""; position: absolute; inset: 0;
+  background:
+    radial-gradient(circle at 50% 50%, rgba(255,255,255,0.025) 0 18%, transparent 19%),
+    radial-gradient(circle at 50% 50%, transparent 30%, rgba(255,255,255,0.018) 31% 34%, transparent 35%),
+    radial-gradient(circle at 50% 50%, transparent 46%, rgba(0,0,0,0.10) 47% 50%, transparent 51%);
+}
+
+.orb { position: relative; width: 120px; height: 120px; display: grid; place-items: center; }
+.core {
+  width: 52px; height: 52px; border-radius: 50%;
+  background: var(--surface); border: 1px solid var(--border-soft);
+  display: grid; place-items: center; position: relative; z-index: 2;
+  font-size: 20px; color: var(--fg-2);
+}
+.base-ring {
+  position: absolute; width: 64px; height: 64px; border-radius: 50%;
+  border: 2px solid var(--rc, var(--success)); z-index: 1;
+}
+
+/* ── 路线 1：折射型 ── 波沉在图标之下的水面层，从圆心往外层层荡开 */
+.refract-ripple { position: absolute; inset: 0; z-index: 0; pointer-events: none; }
+.refract-ripple .wave {
+  position: absolute; border-radius: 50%;
+  /* 亮峰 + 暗谷紧贴成对：用双层 box-shadow 模拟折射的明暗交界 */
+  border: 1px solid transparent;
+  /* 八层同心波，12s 周期；波层沉在图标之下，不遮挡图标、不造成视觉障碍，
+     从图标边缘的水面露出来一层层荡向外缘 */
+  animation: refract 12s cubic-bezier(0.45, 0.08, 0.35, 1) infinite;
+  will-change: inset, opacity;
+}
+/* 八层同心波，按 1.5s 错峰；每层衰减尾巴拉长，场上同时存在四五层 */
+.refract-ripple .wave:nth-child(2) { animation-delay: -1.5s; }
+.refract-ripple .wave:nth-child(3) { animation-delay: -3s; }
+.refract-ripple .wave:nth-child(4) { animation-delay: -4.5s; }
+.refract-ripple .wave:nth-child(5) { animation-delay: -6s; }
+.refract-ripple .wave:nth-child(6) { animation-delay: -7.5s; }
+.refract-ripple .wave:nth-child(7) { animation-delay: -9s; }
+.refract-ripple .wave:nth-child(8) { animation-delay: -10.5s; }
+@keyframes refract {
+  /* inset 59px ≈ 半径 1px：波真的从圆心出发 */
+  0%   { inset: 59px; opacity: 0;
+         box-shadow: 0 0 0 1.5px rgba(255,255,255,0.5), 0 0 0 3px rgba(0,0,0,0.4); }
+  26%  { opacity: 0.85; }
+  50%  { opacity: 0.55; }
+  72%  { opacity: 0.28; }
+  90%  { opacity: 0.10; }
+  100% { inset: -2px; opacity: 0;
+         box-shadow: 0 0 0 0.5px rgba(255,255,255,0.14), 0 0 0 1.5px rgba(0,0,0,0.12); }
+}
+/* 介质扰动：波经过处水面明暗缓慢呼吸起伏（非常轻），同样盖过图标 */
+.refract-swell {
+  position: absolute; width: 96px; height: 96px; border-radius: 50%; z-index: 0;
+  background: radial-gradient(circle, rgba(255,255,255,0.05), rgba(0,0,0,0.10) 70%, transparent 72%);
+  animation: swell 12s cubic-bezier(0.45, 0.08, 0.35, 1) infinite;
+}
+.refract-swell.s2 { animation-delay: -1.5s; }
+.refract-swell.s3 { animation-delay: -3s; }
+.refract-swell.s4 { animation-delay: -4.5s; }
+.refract-swell.s5 { animation-delay: -6s; }
+.refract-swell.s6 { animation-delay: -7.5s; }
+.refract-swell.s7 { animation-delay: -9s; }
+.refract-swell.s8 { animation-delay: -10.5s; }
+@keyframes swell {
+  0%   { transform: scale(0.05); opacity: 0; }
+  14%  { opacity: 0.7; }
+  100% { transform: scale(1.18); opacity: 0; }
+}
+/* 图标被波扫过时的轻微晃动 */
+.stage.route1 .core, .stage.route1 .base-ring { animation: bob 12s ease-in-out infinite; }
+@keyframes bob {
+  0%, 100% { transform: translate(0, 0); }
+  18% { transform: translate(0.6px, -0.8px); }
+  42% { transform: translate(-0.5px, 0.6px); }
+  68% { transform: translate(0, 0); }
+}
+
+/* ── 路线 2：明暗双环 ── 亮峰暗谷成对的描边环，纯 CSS 边界动画 */
+.pair-ripple { position: absolute; inset: 0; z-index: 1; pointer-events: none; }
+.pair-ripple .wave {
+  position: absolute; border-radius: 50%;
+  border: 1.5px solid rgba(255,255,255,0.55);
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.40);
+  animation: pair 2.4s cubic-bezier(0.12, 0.72, 0.24, 1) infinite;
+  will-change: inset, opacity, border-width;
+}
+.pair-ripple .wave:nth-child(2) { animation-delay: -1.2s; }
+@keyframes pair {
+  0%   { inset: 30px; opacity: 0; border-width: 2px; }
+  6%   { opacity: 1; }
+  50%  { opacity: 0.35; border-width: 1px; }
+  100% { inset: -2px; opacity: 0; border-width: 0.5px; box-shadow: 0 0 0 0.5px rgba(0,0,0,0.15); }
+}
+/* 状态色只染一点点：环带 8% 状态色，避免变回彩灯 */
+.pair-ripple .wave { border-color: color-mix(in oklab, rgba(255,255,255,0.55), var(--rc, #23a55a) 18%); }
+
+/* ── 路线 3：极简单环 ── 一圈、更慢、更淡、更短 */
+.min-ripple { position: absolute; inset: 0; z-index: 1; pointer-events: none; }
+.min-ripple .wave {
+  position: absolute; border-radius: 50%;
+  border: 1px solid var(--rc, var(--success));
+  animation: minimal 3.2s cubic-bezier(0.25, 0.6, 0.35, 1) infinite;
+  will-change: inset, opacity;
+}
+@keyframes minimal {
+  0%   { inset: 32px; opacity: 0; }
+  12%  { opacity: 0.20; }
+  100% { inset: 14px; opacity: 0; }
+}
+
+.verdict { font-size: var(--text-xs); color: var(--meta); border-top: 1px solid var(--border); padding-top: var(--space-3); }
+.verdict b { color: var(--muted); font-weight: 600; }
+
+/* 状态切换 */
+.controls { max-width: 1180px; margin: var(--space-8) auto 0; display: flex; flex-wrap: wrap; gap: var(--space-3); align-items: center; }
+.controls .lbl { font-family: var(--font-mono); font-size: var(--text-xs); color: var(--meta); letter-spacing: 0.06em; }
+.chip {
+  appearance: none; border: 1px solid var(--border-soft); background: var(--surface);
+  color: var(--fg); font: 600 var(--text-sm)/1 var(--font-body);
+  padding: 8px 14px; border-radius: var(--radius-pill); cursor: pointer; min-height: 36px;
+  display: inline-flex; align-items: center; gap: var(--space-2);
+  transition: background var(--motion-fast) var(--ease-standard), border-color var(--motion-fast) var(--ease-standard);
+}
+.chip:hover { background: rgba(78, 80, 88, 0.3); }
+.chip:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.chip[aria-pressed="true"] { border-color: var(--accent); background: rgba(88, 101, 242, 0.12); }
+.chip .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--c); }
+</style>
+</head>
+<body>
+
+<header class="page-head" data-od-id="lab-head">
+  <h1>Ripple 风格实验室</h1>
+  <p>三条路线，同一个图标、同一个状态色。注意区别不在环的参数，而在「波经过的地方，水面本身有没有动」。</p>
+</header>
+
+<div class="lab" data-od-id="lab-grid">
+
+  <section class="cell" data-od-id="route-1">
+    <div class="cell-head"><h2>路线 1 · 折射</h2><span class="cell-tag">feDisplacement / CoreImage</span></div>
+    <p class="cell-desc">波沉在图标之下的水面层，从中心荡向边缘、一层一层慢速推开。八层同心波按 1s 错峰、8s 长周期，每层衰减尾巴拉长——场上同时保持四五层波在缓慢推开，层叠的密度本身就是"慢"的表达。折射明暗 + 介质起伏 + 图标轻晃，需要滤镜（原生端用 CoreImage，无第三方依赖）。</p>
+    <div class="stage water route1">
+      <div class="orb" data-od-id="orb-route-1">
+        <span class="refract-swell"></span>
+        <span class="refract-swell s2"></span>
+        <span class="refract-swell s3"></span>
+        <span class="refract-swell s4"></span>
+        <span class="refract-swell s5"></span>
+        <span class="refract-swell s6"></span>
+        <span class="refract-swell s7"></span>
+        <span class="refract-swell s8"></span>
+        <div class="refract-ripple"><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span><span class="wave"></span></div>
+        <span class="base-ring"></span>
+        <span class="core">◍</span>
+      </div>
+    </div>
+    <p class="verdict"><b>判断点：</b>盯着图标看——波扫过时它有没有「在水下」晃一下的感觉。有，这条路就成立。</p>
+  </section>
+
+  <section class="cell" data-od-id="route-2">
+    <div class="cell-head"><h2>路线 2 · 明暗双环</h2><span class="cell-tag">纯描边动画</span></div>
+    <p class="cell-desc">结构和现在一样，但每圈波是「亮边 + 暗边」成对的环——单色环是发光，亮暗成对才是水面的高光与阴影。改动最小，效果从「灯」跨到「有点像水」。</p>
+    <div class="stage water route2">
+      <div class="orb" data-od-id="orb-route-2">
+        <div class="pair-ripple"><span class="wave"></span><span class="wave"></span></div>
+        <span class="base-ring"></span>
+        <span class="core">◍</span>
+      </div>
+    </div>
+    <p class="verdict"><b>判断点：</b>对比路线 3——成对的暗边是不是让它不像呼吸灯了。原生端就是两层描边 CALayer，落地成本最低。</p>
+  </section>
+
+  <section class="cell" data-od-id="route-3">
+    <div class="cell-head"><h2>路线 3 · 极简单环</h2><span class="cell-tag">放弃像水</span></div>
+    <p class="cell-desc">承认 30~56pt 塞不下水面：一圈、更慢（3.2s）、更淡（峰值 0.2）、更短（只扩 18px）。不假装是水，只做节奏提示，状态表达交还给颜色和图例。</p>
+    <div class="stage route3">
+      <div class="orb" data-od-id="orb-route-3">
+        <div class="min-ripple"><span class="wave"></span></div>
+        <span class="base-ring"></span>
+        <span class="core">◍</span>
+      </div>
+    </div>
+    <p class="verdict"><b>判断点：</b>它不再「像灯」的代价是也不「像水」——如果你觉得小尺寸本就该克制，这是最稳的解。</p>
+  </section>
+
+</div>
+
+<div class="controls" data-od-id="status-controls">
+  <span class="lbl">状态色</span>
+  <button class="chip" data-color="#f23f43" aria-pressed="false"><span class="dot" style="--c:#f23f43"></span>失败</button>
+  <button class="chip" data-color="#f0b232" aria-pressed="false"><span class="dot" style="--c:#f0b232"></span>等待处理</button>
+  <button class="chip" data-color="#5865f2" aria-pressed="false"><span class="dot" style="--c:#5865f2"></span>完成待查验</button>
+  <button class="chip" data-color="#23a55a" aria-pressed="true"><span class="dot" style="--c:#23a55a"></span>运行中</button>
+  <button class="chip" data-color="#4fd1c5" aria-pressed="false"><span class="dot" style="--c:#4fd1c5"></span>待机</button>
+</div>
+
+<script>
+(function () {
+  var chips = document.querySelectorAll('.chip');
+  var orbs = document.querySelectorAll('.orb');
+  chips.forEach(function (chip) {
+    chip.addEventListener('click', function () {
+      chips.forEach(function (c) { c.setAttribute('aria-pressed', 'false'); });
+      chip.setAttribute('aria-pressed', 'true');
+      orbs.forEach(function (o) { o.style.setProperty('--rc', chip.dataset.color); });
+    });
+  });
+  orbs.forEach(function (o) { o.style.setProperty('--rc', '#23a55a'); });
+})();
+</script>
+</body>
+</html>
