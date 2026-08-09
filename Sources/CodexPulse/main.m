@@ -1,6 +1,7 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
 #import <sqlite3.h>
+#import <string.h>
 
 #pragma mark - Constants
 
@@ -92,7 +93,37 @@ static NSImage *CPDotImage(CGFloat size, NSColor *color) {
 static NSImage *CPStatusDot(CGFloat size, CPStatus status) { return CPDotImage(size, CPStatusColor(status)); }
 
 static NSDate *CPDateFromMillis(sqlite3_int64 v) { return v <= 0 ? NSDate.date : [NSDate dateWithTimeIntervalSince1970:v / 1000.0]; }
-static NSDate *CPDateFromSeconds(sqlite3_int64 v) { return v <= 0 ? nil : [NSDate dateWithTimeIntervalSince1970:(NSTimeInterval)v]; }
+static NSDate *CPDateFromSeconds(NSTimeInterval v) { return v <= 0 ? nil : [NSDate dateWithTimeIntervalSince1970:v]; }
+
+// 状态按“最后一个事件”判断：用户处理完需关注事项后，只要出现更新的工作日志，立刻恢复工作中。
+static CPStatus CPInferTaskStatus(NSDate *lastLog, NSDate *lastComplete, NSDate *lastAttention,
+                                  NSDate *lastError, NSDate *updatedAt, NSDate *now) {
+    NSTimeInterval errorAge = lastError ? [now timeIntervalSinceDate:lastError] : DBL_MAX;
+    NSTimeInterval attentionAge = lastAttention ? [now timeIntervalSinceDate:lastAttention] : DBL_MAX;
+    NSTimeInterval logAge = lastLog ? [now timeIntervalSinceDate:lastLog] : DBL_MAX;
+    NSTimeInterval completeAge = lastComplete ? [now timeIntervalSinceDate:lastComplete] : DBL_MAX;
+    BOOL attentionIsLatest = lastAttention &&
+        (!lastLog || [lastAttention compare:lastLog] != NSOrderedAscending) &&
+        (!lastComplete || [lastAttention compare:lastComplete] == NSOrderedDescending);
+
+    if (errorAge < 180 && (!lastComplete || [lastError compare:lastComplete] == NSOrderedDescending)) return CPStatusFailed;
+    if (attentionAge < 900 && attentionIsLatest) return CPStatusAttention;
+    if (logAge < 12) return CPStatusWorking;
+    if (completeAge < 180) return CPStatusCompleted;
+    if (updatedAt && [now timeIntervalSinceDate:updatedAt] < 1800) return CPStatusWaiting;
+    return CPStatusIdle;
+}
+
+static NSInteger CPStatusTiePriority(CPStatus status) {
+    switch (status) {
+        case CPStatusFailed: return 5;
+        case CPStatusAttention: return 4;
+        case CPStatusWaiting: return 3;
+        case CPStatusCompleted: return 2;
+        case CPStatusWorking: return 1;
+        case CPStatusIdle: return 0;
+    }
+}
 
 static NSString *CPCleanTitle(const unsigned char *text) {
     if (!text) return @"未命名任务";
@@ -227,26 +258,33 @@ typedef NS_ENUM(NSInteger, CPDisplayStatus) {
 
 @end
 
-// Strict priority: failed > attention/waiting > completed-unreviewed > working > idle.
+static CPDisplayStatus CPDisplayStatusForTask(CPTask *task, NSString *agentID, CPReviewStore *reviewStore) {
+    switch (task.status) {
+        case CPStatusFailed: return CPDisplayStatusFailed;
+        case CPStatusAttention:
+        case CPStatusWaiting: return CPDisplayStatusWaiting;
+        case CPStatusCompleted:
+            return [reviewStore isTaskReviewed:task agentID:agentID]
+                ? CPDisplayStatusIdle : CPDisplayStatusCompletedPendingReview;
+        case CPStatusWorking: return CPDisplayStatusWorking;
+        case CPStatusIdle: return CPDisplayStatusIdle;
+    }
+}
+
+// Agent 灯代表最近更新的任务；仅在更新时间完全相同时才用严重度打破平局。
+// 这样历史等待项不会长期压住一个已经重新运行的任务，也能真实呈现五种灯色。
 static CPDisplayStatus CPDisplayStatusForTasks(NSArray<CPTask *> *tasks, NSString *agentID, CPReviewStore *reviewStore) {
-    BOOL anyFailed = NO, anyWaiting = NO, anyPendingReview = NO, anyWorking = NO;
+    CPTask *latestTask = nil;
+    CPDisplayStatus latestStatus = CPDisplayStatusIdle;
     for (CPTask *t in tasks) {
-        switch (t.status) {
-            case CPStatusFailed: anyFailed = YES; break;
-            case CPStatusAttention:
-            case CPStatusWaiting: anyWaiting = YES; break;
-            case CPStatusCompleted:
-                if (![reviewStore isTaskReviewed:t agentID:agentID]) anyPendingReview = YES;
-                break;
-            case CPStatusWorking: anyWorking = YES; break;
-            case CPStatusIdle: break;
+        CPDisplayStatus status = CPDisplayStatusForTask(t, agentID, reviewStore);
+        NSComparisonResult order = latestTask ? [t.updatedAt compare:latestTask.updatedAt] : NSOrderedDescending;
+        if (!latestTask || order == NSOrderedDescending || (order == NSOrderedSame && status > latestStatus)) {
+            latestTask = t;
+            latestStatus = status;
         }
     }
-    if (anyFailed) return CPDisplayStatusFailed;
-    if (anyWaiting) return CPDisplayStatusWaiting;
-    if (anyPendingReview) return CPDisplayStatusCompletedPendingReview;
-    if (anyWorking) return CPDisplayStatusWorking;
-    return CPDisplayStatusIdle;
+    return latestStatus;
 }
 
 #pragma mark - Unified Ripple Component (CPRippleView)
@@ -913,6 +951,13 @@ static NSInteger CPBadgeCountForAgents(NSArray<CPAgent *> *agents, CPReviewStore
 
 #pragma mark - State Reader
 
+static const char *CPCodexVisibleThreadsSQL =
+    "SELECT id, COALESCE(NULLIF(name,''), NULLIF(title,''), NULLIF(preview,''), '未命名任务'), "
+    "cwd, created_at_ms, updated_at_ms, tokens_used FROM threads "
+    "WHERE archived=0 AND preview<>'' "
+    "AND COALESCE(thread_source,'') <> 'subagent' AND COALESCE(source,'') NOT LIKE '%\"subagent\"%' "
+    "ORDER BY recency_at_ms DESC, updated_at_ms DESC LIMIT 10";
+
 @interface CPStateReader : NSObject
 - (NSArray<CPAgent *> *)readAgents;
 @end
@@ -952,12 +997,8 @@ static NSInteger CPBadgeCountForAgents(NSArray<CPAgent *> *agents, CPReviewStore
         sqlite3_busy_timeout(logsDB, 150);
     }
 
-    const char *sql =
-        "SELECT id, COALESCE(NULLIF(name,''), NULLIF(title,''), NULLIF(preview,''), '未命名任务'), "
-        "cwd, created_at_ms, updated_at_ms, tokens_used FROM threads "
-        "WHERE archived=0 AND preview<>'' ORDER BY recency_at_ms DESC, updated_at_ms DESC LIMIT 10";
     sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(stateDB, sql, -1, &stmt, NULL) == SQLITE_OK) {
+    if (sqlite3_prepare_v2(stateDB, CPCodexVisibleThreadsSQL, -1, &stmt, NULL) == SQLITE_OK) {
         while (sqlite3_step(stmt) == SQLITE_ROW) {
             CPTask *task = CPTask.new;
             task.taskID = [NSString stringWithUTF8String:(const char *)sqlite3_column_text(stmt, 0)] ?: @"";
@@ -1017,34 +1058,24 @@ static NSInteger CPBadgeCountForAgents(NSArray<CPAgent *> *agents, CPReviewStore
         return;
     }
     const char *sql =
-        "SELECT MAX(ts), "
-        "MAX(CASE WHEN feedback_log_body LIKE '%turn/completed%' OR feedback_log_body LIKE '%turn_completed%' THEN ts ELSE 0 END), "
-        "MAX(CASE WHEN feedback_log_body LIKE '%approval%' OR feedback_log_body LIKE '%request_user_input%' THEN ts ELSE 0 END), "
-        "MAX(CASE WHEN level='ERROR' THEN ts ELSE 0 END) FROM logs WHERE thread_id=?";
+        "SELECT MAX(ts + ts_nanos / 1000000000.0), "
+        "MAX(CASE WHEN feedback_log_body LIKE '%turn/completed%' OR feedback_log_body LIKE '%turn_completed%' THEN ts + ts_nanos / 1000000000.0 ELSE 0 END), "
+        "MAX(CASE WHEN feedback_log_body LIKE '%approval%' OR feedback_log_body LIKE '%request_user_input%' THEN ts + ts_nanos / 1000000000.0 ELSE 0 END), "
+        "MAX(CASE WHEN level='ERROR' THEN ts + ts_nanos / 1000000000.0 ELSE 0 END) FROM logs WHERE thread_id=?";
     sqlite3_stmt *stmt = NULL;
     NSDate *lastLog = nil, *lastComplete = nil, *lastAttention = nil, *lastError = nil;
     if (sqlite3_prepare_v2(logsDB, sql, -1, &stmt, NULL) == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, task.taskID.UTF8String, -1, SQLITE_TRANSIENT);
         if (sqlite3_step(stmt) == SQLITE_ROW) {
-            lastLog = CPDateFromSeconds(sqlite3_column_int64(stmt, 0));
-            lastComplete = CPDateFromSeconds(sqlite3_column_int64(stmt, 1));
-            lastAttention = CPDateFromSeconds(sqlite3_column_int64(stmt, 2));
-            lastError = CPDateFromSeconds(sqlite3_column_int64(stmt, 3));
+            lastLog = CPDateFromSeconds(sqlite3_column_double(stmt, 0));
+            lastComplete = CPDateFromSeconds(sqlite3_column_double(stmt, 1));
+            lastAttention = CPDateFromSeconds(sqlite3_column_double(stmt, 2));
+            lastError = CPDateFromSeconds(sqlite3_column_double(stmt, 3));
         }
     }
     if (stmt) sqlite3_finalize(stmt);
 
-    NSTimeInterval errorAge = lastError ? -lastError.timeIntervalSinceNow : DBL_MAX;
-    NSTimeInterval attentionAge = lastAttention ? -lastAttention.timeIntervalSinceNow : DBL_MAX;
-    NSTimeInterval logAge = lastLog ? -lastLog.timeIntervalSinceNow : DBL_MAX;
-    NSTimeInterval completeAge = lastComplete ? -lastComplete.timeIntervalSinceNow : DBL_MAX;
-
-    if (errorAge < 180 && (!lastComplete || [lastError compare:lastComplete] == NSOrderedDescending)) task.status = CPStatusFailed;
-    else if (attentionAge < 900 && (!lastComplete || [lastAttention compare:lastComplete] == NSOrderedDescending)) task.status = CPStatusAttention;
-    else if (logAge < 12) task.status = CPStatusWorking;
-    else if (completeAge < 180) task.status = CPStatusCompleted;
-    else if (-task.updatedAt.timeIntervalSinceNow < 1800) task.status = CPStatusWaiting;
-    else task.status = CPStatusIdle;
+    task.status = CPInferTaskStatus(lastLog, lastComplete, lastAttention, lastError, task.updatedAt, NSDate.date);
 
     task.activity = [self activityForTask:task logsDB:logsDB];
 }
@@ -1069,10 +1100,13 @@ static NSInteger CPBadgeCountForAgents(NSArray<CPAgent *> *agents, CPReviewStore
 }
 
 - (CPStatus)overallStatusForTasks:(NSArray<CPTask *> *)tasks {
-    for (CPTask *t in tasks) if (t.status == CPStatusFailed) return CPStatusFailed;
-    for (CPTask *t in tasks) if (t.status == CPStatusAttention) return CPStatusAttention;
-    for (CPTask *t in tasks) if (t.status == CPStatusWorking) return CPStatusWorking;
-    return tasks.count ? CPStatusWaiting : CPStatusIdle;
+    CPTask *latest = nil;
+    for (CPTask *t in tasks) {
+        NSComparisonResult order = latest ? [t.updatedAt compare:latest.updatedAt] : NSOrderedDescending;
+        if (!latest || order == NSOrderedDescending ||
+            (order == NSOrderedSame && CPStatusTiePriority(t.status) > CPStatusTiePriority(latest.status))) latest = t;
+    }
+    return latest ? latest.status : CPStatusIdle;
 }
 
 @end
@@ -1149,7 +1183,8 @@ static NSInteger CPBadgeCountForAgents(NSArray<CPAgent *> *agents, CPReviewStore
 @property NSTextField *cardMetaLabel;
 @property NSTextField *centerTitle;
 @property NSTextField *centerMeta;
-@property NSButton *detailCloseButton;
+@property NSButton *detailBackButton;
+@property NSButton *detailOpenAgentButton;
 @property NSArray<CPAgent *> *agents;
 @property CPAgent *selectedAgent;
 @property CPTask *selectedTask;
@@ -1495,27 +1530,23 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     [head.heightAnchor constraintEqualToConstant:28].active = YES;
     NSTextField *title = CPLabel(@"任务详情", 11, NSFontWeightSemibold, CPMuted());
     title.translatesAutoresizingMaskIntoConstraints = NO;
-    NSButton *closeButton = CPIconButton(@"xmark", self, @selector(closeDetailDrawer), @"关闭详情");
-    // 清晰可辨认的关闭按钮:常驻淡底色 + 1px 描边,深底高对比符号。
-    closeButton.contentTintColor = CPFg();
-    ((CPHoverButton *)closeButton).cpBaseBackground = [CPMuted() colorWithAlphaComponent:0.14];
-    ((CPHoverButton *)closeButton).cpAlwaysBorder = YES;
-    // CPIconButton 不关闭 autoresizing 转换,这里必须显式关掉,否则 trailing 约束失效、
-    // 按钮按 frame 原点落在左侧并压住标题(实机截图 bug)。
-    closeButton.translatesAutoresizingMaskIntoConstraints = NO;
-    self.detailCloseButton = closeButton;
+    NSButton *backButton = CPIconButton(@"chevron.left", self, @selector(closeDetailDrawer), @"返回任务列表");
+    backButton.accessibilityLabel = @"返回任务列表";
+    backButton.contentTintColor = CPFg();
+    ((CPHoverButton *)backButton).cpBaseBackground = [CPMuted() colorWithAlphaComponent:0.14];
+    ((CPHoverButton *)backButton).cpAlwaysBorder = YES;
+    backButton.translatesAutoresizingMaskIntoConstraints = NO;
+    self.detailBackButton = backButton;
     [head addSubview:title];
-    [head addSubview:closeButton];
+    [head addSubview:backButton];
     [NSLayoutConstraint activateConstraints:@[
-        [title.leadingAnchor constraintEqualToAnchor:head.leadingAnchor],
+        [backButton.leadingAnchor constraintEqualToAnchor:head.leadingAnchor],
+        [backButton.centerYAnchor constraintEqualToAnchor:head.centerYAnchor],
+        [backButton.widthAnchor constraintEqualToConstant:28],
+        [backButton.heightAnchor constraintEqualToConstant:28],
+        [title.leadingAnchor constraintEqualToAnchor:backButton.trailingAnchor constant:6],
         [title.centerYAnchor constraintEqualToAnchor:head.centerYAnchor],
-        // 标题永远给关闭按钮让出右侧空间
-        [title.trailingAnchor constraintLessThanOrEqualToAnchor:closeButton.leadingAnchor constant:-8],
-        // 关闭按钮固定视觉右上 28x28(head 宽 = rightColumn 内容宽 - 24,距右边 12pt)
-        [closeButton.trailingAnchor constraintEqualToAnchor:head.trailingAnchor],
-        [closeButton.centerYAnchor constraintEqualToAnchor:head.centerYAnchor],
-        [closeButton.widthAnchor constraintEqualToConstant:28],
-        [closeButton.heightAnchor constraintEqualToConstant:28]
+        [title.trailingAnchor constraintLessThanOrEqualToAnchor:head.trailingAnchor]
     ]];
     [stack addArrangedSubview:head];
     // header 横向填满,不按 intrinsic 收缩
@@ -1561,7 +1592,8 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
 
     NSTextField *name = CPLabel(agent.name, 12, NSFontWeightMedium, CPFg());
     name.lineBreakMode = NSLineBreakByTruncatingTail;
-    NSTextField *status = CPLabel(CPStatusTitle(agent.status), 10, NSFontWeightRegular, CPMuted());
+    CPDisplayStatus displayStatus = CPDisplayStatusForTasks(agent.tasks, agent.agentID, self.reviewStore);
+    NSTextField *status = CPLabel(CPDisplayStatusTitle(displayStatus), 10, NSFontWeightRegular, CPMuted());
 
     NSStackView *text = [NSStackView stackViewWithViews:@[name, status]];
     text.orientation = NSUserInterfaceLayoutOrientationVertical;
@@ -1572,7 +1604,7 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     [text.widthAnchor constraintEqualToConstant:44].active = YES;
 
     NSImageView *dot = [[NSImageView alloc] initWithFrame:NSMakeRect(0, 0, 6, 6)];
-    dot.image = CPStatusDot(6, agent.status);
+    dot.image = CPDotImage(6, CPDisplayStatusColor(displayStatus));
     dot.translatesAutoresizingMaskIntoConstraints = NO;
     [dot.widthAnchor constraintEqualToConstant:6].active = YES;
     [dot.heightAnchor constraintEqualToConstant:6].active = YES;
@@ -1601,8 +1633,8 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     row.layer.borderWidth = 0.0;
     ((CPHoverButton *)row).cpBaseBackground = NSColor.clearColor;
     row.tag = index;
-    row.toolTip = [NSString stringWithFormat:@"在 %@ 中打开：%@", self.selectedAgent.name, task.title];
-    row.accessibilityLabel = [NSString stringWithFormat:@"%@，在 %@ 中打开", task.title, self.selectedAgent.name];
+    row.toolTip = [NSString stringWithFormat:@"查看任务详情：%@", task.title];
+    row.accessibilityLabel = [NSString stringWithFormat:@"%@，查看任务详情", task.title];
     row.translatesAutoresizingMaskIntoConstraints = NO;
     [row.heightAnchor constraintEqualToConstant:56].active = YES;
 
@@ -1747,6 +1779,7 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
 }
 
 - (void)renderDetail {
+    self.detailOpenAgentButton = nil;
     while (self.detailStack.arrangedSubviews.count > 1) {
         NSView *v = self.detailStack.arrangedSubviews.lastObject;
         [self.detailStack removeArrangedSubview:v];
@@ -1833,6 +1866,29 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
         [activityBody.bottomAnchor constraintEqualToAnchor:activityCard.bottomAnchor constant:-8]
     ]];
     [self addDetailView:activityCard];
+
+    // 一级点击只进入详情；从详情页明确执行第二次点击才跳转到对应 Agent 的任务。
+    CPHoverButton *openButton = (CPHoverButton *)[CPHoverButton buttonWithTitle:[NSString stringWithFormat:@"在 %@ 中打开", agent.name]
+                                                                        target:self
+                                                                        action:@selector(openSelectedTaskInAgent:)];
+    openButton.bordered = NO;
+    openButton.font = [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold];
+    openButton.contentTintColor = CPFg();
+    openButton.image = CPSymbol(@"arrow.up.right.square", 12, CPFg());
+    openButton.imagePosition = NSImageLeading;
+    openButton.cpBaseBackground = [CPAccent() colorWithAlphaComponent:0.24];
+    openButton.cpAlwaysBorder = YES;
+    openButton.toolTip = [NSString stringWithFormat:@"直达 %@ 中的这个任务", agent.name];
+    openButton.accessibilityLabel = openButton.toolTip;
+    [openButton.heightAnchor constraintEqualToConstant:34].active = YES;
+    self.detailOpenAgentButton = openButton;
+    [self addDetailView:openButton];
+}
+
+- (void)openSelectedTaskInAgent:(id)sender {
+    (void)sender;
+    if (!self.selectedAgent || !self.selectedTask || CPRunningSelfTests) return;
+    CPOpenAgentTask(self.selectedAgent, self.selectedTask);
 }
 
 - (void)updateMeta {
@@ -1869,9 +1925,9 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
             self.selectedTask.status == CPStatusWaiting) {
             [self.reviewStore markTaskReviewed:self.selectedTask agentID:self.selectedAgent.agentID];
             [[NSNotificationCenter defaultCenter] postNotificationName:@"CPTaskReviewed" object:nil];
+            // 立即刷新工作台 Agent 灯；任务对象按 taskID 保留，详情抽屉不会关闭。
+            [self renderAgents:self.agents];
         }
-        // 工作台任务点击后直接跳到所属 Agent；详情仍保留在工作台，返回时可以继续查看。
-        if (!CPRunningSelfTests) CPOpenAgentTask(self.selectedAgent, self.selectedTask);
     }
 }
 
@@ -3200,7 +3256,7 @@ static const CGFloat CPHUDAgentRail = 64.0;
     sep.layer.backgroundColor = CPBorder().CGColor;
     [card addSubview:sep];
 
-    NSTextField *footer = CPLabel(@"Agent 环取任务中最紧急状态", 10, NSFontWeightRegular, CPMuted());
+    NSTextField *footer = CPLabel(@"Agent 环跟随最近更新的任务", 10, NSFontWeightRegular, CPMuted());
     footer.maximumNumberOfLines = 1;
     footer.frame = NSMakeRect(padX, 8.0, width - padX * 2, 14.0);
     [card addSubview:footer];
@@ -3904,7 +3960,7 @@ int main(int argc, const char *argv[]) {
             CPAgent *agentBNew = CPTestAgent(@"agent-b", @[CPTestTask(@"b9", CPStatusWorking, 9)]);
             [hud2 updateWithAgents:@[agentANew, agentBNew] selectedAgent:agentB]; // stale pointer, same agentID
             BOOL hudSelectByID = hud2.selectedAgent == agentBNew;
-            // Agent 环颜色 = 其活动任务中最紧急状态(失败 > 等待处理 > 完成待查验 > 运行中 > 待机)。
+            // Agent 环颜色跟随最近更新的任务；较旧失败项不会压住较新的完成状态。
             CPAgent *urgent = CPTestAgent(@"urgent", @[CPTestTask(@"u1", CPStatusWorking, 1),
                                                        CPTestTask(@"u2", CPStatusFailed, 2),
                                                        CPTestTask(@"u3", CPStatusCompleted, 3)]);
@@ -3912,9 +3968,9 @@ int main(int argc, const char *argv[]) {
             [hud2 updateWithAgents:@[urgent, calm] selectedAgent:calm];
             CPAgentStatusButton *urgentBtn = (CPAgentStatusButton *)hud2.agentList.arrangedSubviews.firstObject;
             BOOL agentUrgencyOK = [urgentBtn isKindOfClass:CPAgentStatusButton.class] &&
-                                  CGColorEqualToColor(urgentBtn.ringLayer.strokeColor, CPRed().CGColor) &&
+                                  CGColorEqualToColor(urgentBtn.ringLayer.strokeColor, CPBlue().CGColor) &&
                                   fabs(CPRippleDurationForStatus(CPDisplayStatusForTasks(urgent.tasks, @"urgent", uiStore)) -
-                                       CPRippleDurationForStatus(CPDisplayStatusFailed)) < 0.01;
+                                       CPRippleDurationForStatus(CPDisplayStatusCompletedPendingReview)) < 0.01;
             [uiDefaults removePersistentDomainForName:uiSuite];
             [uiDefaults synchronize];
 
@@ -4468,7 +4524,7 @@ int main(int argc, const char *argv[]) {
                            [legendTexts containsObject:@"完成待查验"] &&
                            [legendTexts containsObject:@"运行中"] &&
                            [legendTexts containsObject:@"待机"] &&
-                           [legendTexts containsObject:@"Agent 环取任务中最紧急状态"] &&
+                           [legendTexts containsObject:@"Agent 环跟随最近更新的任务"] &&
                            ![legendTexts containsObject:@"按钮"];
             }
             [hud8 hideLegend];
@@ -4546,35 +4602,45 @@ int main(int argc, const char *argv[]) {
                 m9DashOK = dashCount >= 2; // 项目 + 活动
             }
 
-            // 关闭按钮 hit-test 不被遮挡
+            // 左上返回按钮 hit-test 不被遮挡；详情底部提供第二次点击的 Agent 直达按钮。
             [card9.rightColumn layoutSubtreeIfNeeded];
-            NSPoint closeC = NSMakePoint(NSMidX(card9.detailCloseButton.bounds), NSMidY(card9.detailCloseButton.bounds));
-            NSPoint closeInCol = [card9.detailCloseButton convertPoint:closeC toView:card9.rightColumn];
-            BOOL m9CloseHitOK = [card9.rightColumn hitTest:closeInCol] == card9.detailCloseButton;
-            // 关闭按钮可辨认:≥24x24、在 rightColumn 可见边界内、常驻底色+描边、xmark 图像存在
-            NSRect closeF = [card9.detailCloseButton convertRect:card9.detailCloseButton.bounds toView:card9.rightColumn];
-            CGColorRef closeBg = card9.detailCloseButton.layer.backgroundColor;
-            BOOL m9CloseVisible = !card9.detailCloseButton.isHidden && card9.detailCloseButton.alphaValue == 1.0 &&
-                                  closeF.size.width >= 24.0 && closeF.size.height >= 24.0 &&
-                                  NSContainsRect(card9.rightColumn.bounds, closeF) &&
-                                  closeBg && CGColorGetAlpha(closeBg) > 0.0 &&
-                                  card9.detailCloseButton.layer.borderWidth > 0.0 &&
-                                  card9.detailCloseButton.image != nil;
-            // 关闭按钮必须在视觉右上且不与标题重叠(修复 translates 缺失导致按钮落在左侧压住标题的假阳性)
+            NSPoint backC = NSMakePoint(NSMidX(card9.detailBackButton.bounds), NSMidY(card9.detailBackButton.bounds));
+            NSPoint backInCol = [card9.detailBackButton convertPoint:backC toView:card9.rightColumn];
+            BOOL m9BackHitOK = [card9.rightColumn hitTest:backInCol] == card9.detailBackButton;
+            NSRect backF = [card9.detailBackButton convertRect:card9.detailBackButton.bounds toView:card9.rightColumn];
+            CGColorRef backBg = card9.detailBackButton.layer.backgroundColor;
+            BOOL m9BackVisible = !card9.detailBackButton.isHidden && card9.detailBackButton.alphaValue == 1.0 &&
+                                 backF.size.width >= 24.0 && backF.size.height >= 24.0 &&
+                                 NSContainsRect(card9.rightColumn.bounds, backF) &&
+                                 backBg && CGColorGetAlpha(backBg) > 0.0 &&
+                                 card9.detailBackButton.layer.borderWidth > 0.0 &&
+                                 card9.detailBackButton.image != nil;
             NSView *head9 = card9.detailStack.arrangedSubviews.firstObject;
             NSTextField *titleLbl = nil;
             for (NSView *v in head9.subviews) {
                 if ([v isKindOfClass:NSTextField.class]) { titleLbl = (NSTextField *)v; break; }
             }
             NSRect titleF = titleLbl ? [titleLbl convertRect:titleLbl.bounds toView:card9.rightColumn] : NSZeroRect;
-            CGFloat colW = card9.rightColumn.bounds.size.width;
-            NSSize closeLocalSize = card9.detailCloseButton.bounds.size;
-            BOOL m9CloseTopRight = titleLbl != nil &&
-                                   NSMaxX(closeF) >= colW - 14.0 && NSMaxX(closeF) <= colW - 10.0 + 0.5 &&
-                                   !NSIntersectsRect(closeF, titleF) &&
-                                   fabs(titleF.origin.x - 12.0) <= 2.0 &&
-                                   closeLocalSize.width >= 24.0 && closeLocalSize.width <= 32.5 &&
-                                   closeLocalSize.height >= 24.0 && closeLocalSize.height <= 32.5;
+            NSSize backLocalSize = card9.detailBackButton.bounds.size;
+            BOOL m9BackTopLeft = titleLbl != nil &&
+                                 fabs(backF.origin.x - 12.0) <= 2.0 &&
+                                 !NSIntersectsRect(backF, titleF) &&
+                                 titleF.origin.x >= NSMaxX(backF) + 4.0 &&
+                                 backLocalSize.width >= 24.0 && backLocalSize.width <= 36.0 &&
+                                 backLocalSize.height >= 24.0 && backLocalSize.height <= 36.0;
+            BOOL m9DirectOpen = card9.detailOpenAgentButton != nil &&
+                                [card9.detailOpenAgentButton.title isEqualToString:@"在 m9-agent 中打开"] &&
+                                card9.detailOpenAgentButton.action == @selector(openSelectedTaskInAgent:) &&
+                                !card9.rightColumn.hidden;
+            if (m9DirectOpen) {
+                NSRect openF = [card9.detailOpenAgentButton convertRect:card9.detailOpenAgentButton.bounds
+                                                                 toView:card9.rightColumn];
+                NSPoint openCenter = NSMakePoint(NSMidX(card9.detailOpenAgentButton.bounds),
+                                                 NSMidY(card9.detailOpenAgentButton.bounds));
+                NSPoint openInCol = [card9.detailOpenAgentButton convertPoint:openCenter toView:card9.rightColumn];
+                m9DirectOpen = NSContainsRect(card9.rightColumn.bounds, openF) &&
+                               [card9.rightColumn hitTest:openInCol] == card9.detailOpenAgentButton;
+            }
 
             // 刷新保持/消失
             BOOL m9RefreshKeep = !card9.rightColumn.hidden && card9.selectedTask == emptyFields;
@@ -4618,7 +4684,8 @@ int main(int argc, const char *argv[]) {
                                      [hitClosed isDescendantOf:card9.taskScrollView];
 
             BOOL m9ui = m9FullWidth && m9GridOK && m9TitleTruncOK && m9ActivityTruncOK && m9TokensOK &&
-                        m9DateOK && m9DashOK && m9CloseHitOK && m9CloseVisible && m9CloseTopRight && m9RefreshKeep && m9RefreshGone && m9Esc1 && m9Esc2 &&
+                        m9DateOK && m9DashOK && m9BackHitOK && m9BackVisible && m9BackTopLeft && m9DirectOpen &&
+                        m9RefreshKeep && m9RefreshGone && m9Esc1 && m9Esc2 &&
                         m9Keyable && m9ShowMakesKey && m9BarrierOpen && m9BarrierRestored;
 
             // M10: 工作台任务列表 NSScrollView 化
@@ -4723,7 +4790,7 @@ int main(int argc, const char *argv[]) {
                 hudClickViewIsBackgroundView ? @"OK" : @"FAIL",
                 hudVisualFrameExact ? @"OK" : @"FAIL",
                 hudExpandedHandleHidden ? @"OK" : @"FAIL"];
-            [result appendFormat:@"M2 UI self-test: ring-colors=%@ blue-double=%@ reduce-motion=%@ ripple-anim=%@ ripple-blue=%@ hud-agent-scope=%@ hud-select-by-id=%@ agent-urgency=%@\n",
+            [result appendFormat:@"M2 UI self-test: ring-colors=%@ blue-double=%@ reduce-motion=%@ ripple-anim=%@ ripple-blue=%@ hud-agent-scope=%@ hud-select-by-id=%@ agent-latest-task=%@\n",
                 ringColorsOK ? @"OK" : @"FAIL",
                 blueDoubleOK ? @"OK" : @"FAIL",
                 reduceMotionOK ? @"OK" : @"FAIL",
@@ -4808,7 +4875,7 @@ int main(int argc, const char *argv[]) {
                 legendOK ? @"OK" : @"FAIL"];
             [result appendFormat:@"M5 UI self-test(动画生命周期): hud-rapid-toggle=%@\n",
                 hudRapidOK ? @"OK" : @"FAIL"];
-            [result appendFormat:@"M9 UI self-test: detail-fullwidth=%@ detail-grid=%@ detail-title-trunc=%@ detail-activity-trunc=%@ detail-tokens=%@ detail-date=%@ detail-dash=%@ detail-close-hit=%@ detail-close-visible=%@ detail-close-topright=%@ detail-refresh-keep=%@ detail-refresh-gone=%@ detail-esc1=%@ detail-esc2=%@ workbench-keyable=%@ show-makes-key=%@ detail-barrier=%@ detail-barrier-restore=%@\n",
+            [result appendFormat:@"M9 UI self-test: detail-fullwidth=%@ detail-grid=%@ detail-title-trunc=%@ detail-activity-trunc=%@ detail-tokens=%@ detail-date=%@ detail-dash=%@ detail-back-hit=%@ detail-back-visible=%@ detail-back-topleft=%@ detail-direct-open=%@ detail-refresh-keep=%@ detail-refresh-gone=%@ detail-esc1=%@ detail-esc2=%@ workbench-keyable=%@ show-makes-key=%@ detail-barrier=%@ detail-barrier-restore=%@\n",
                 m9FullWidth ? @"OK" : @"FAIL",
                 m9GridOK ? @"OK" : @"FAIL",
                 m9TitleTruncOK ? @"OK" : @"FAIL",
@@ -4816,9 +4883,10 @@ int main(int argc, const char *argv[]) {
                 m9TokensOK ? @"OK" : @"FAIL",
                 m9DateOK ? @"OK" : @"FAIL",
                 m9DashOK ? @"OK" : @"FAIL",
-                m9CloseHitOK ? @"OK" : @"FAIL",
-                m9CloseVisible ? @"OK" : @"FAIL",
-                m9CloseTopRight ? @"OK" : @"FAIL",
+                m9BackHitOK ? @"OK" : @"FAIL",
+                m9BackVisible ? @"OK" : @"FAIL",
+                m9BackTopLeft ? @"OK" : @"FAIL",
+                m9DirectOpen ? @"OK" : @"FAIL",
                 m9RefreshKeep ? @"OK" : @"FAIL",
                 m9RefreshGone ? @"OK" : @"FAIL",
                 m9Esc1 ? @"OK" : @"FAIL",
@@ -4857,6 +4925,9 @@ int main(int argc, const char *argv[]) {
             NSInteger taskCount = 0;
             for (CPAgent *a in agents) taskCount += a.tasks.count;
             printf("Codex Pulse self-test: %lu agents, %ld tasks, local read OK\n", (unsigned long)agents.count, (long)taskCount);
+            BOOL internalThreadsFiltered = strstr(CPCodexVisibleThreadsSQL, "thread_source,'') <> 'subagent'") != NULL &&
+                                           strstr(CPCodexVisibleThreadsSQL, "COALESCE(source,'') NOT LIKE") != NULL;
+            printf("Task visibility self-test: internal-subagents=%s\n", internalThreadsFiltered ? "FILTERED" : "FAIL");
 
             // M2: CPReviewStore + CPDisplayStatus priority, isolated NSUserDefaults suite.
             NSString *suite = [NSString stringWithFormat:@"com.codexpulse.selftest.%d", NSProcessInfo.processInfo.processIdentifier];
@@ -4894,22 +4965,34 @@ int main(int argc, const char *argv[]) {
                                                        CPTestTask(@"e", CPStatusIdle, 1)], @"x", store) == CPDisplayStatusWorking;
             BOOL prIdle = CPDisplayStatusForTasks(@[CPTestTask(@"e", CPStatusIdle, 1)], @"x", store) == CPDisplayStatusIdle &&
                           CPDisplayStatusForTasks(@[], @"x", store) == CPDisplayStatusIdle;
+            BOOL latestWorking = CPDisplayStatusForTasks(@[CPTestTask(@"old-wait", CPStatusWaiting, 1),
+                                                            CPTestTask(@"new-work", CPStatusWorking, 2)], @"x", store) == CPDisplayStatusWorking;
+
+            NSDate *now = [NSDate dateWithTimeIntervalSince1970:1000.0];
+            NSDate *attentionFirst = [NSDate dateWithTimeIntervalSince1970:998.0];
+            NSDate *newerLog = [NSDate dateWithTimeIntervalSince1970:999.5];
+            BOOL resumedBecomesWorking = CPInferTaskStatus(newerLog, nil, attentionFirst, nil, nil, now) == CPStatusWorking;
+            NSDate *latestAttention = [NSDate dateWithTimeIntervalSince1970:999.75];
+            BOOL latestAttentionStays = CPInferTaskStatus(newerLog, nil, latestAttention, nil, nil, now) == CPStatusAttention;
 
             [testDefaults removePersistentDomainForName:suite];
             [testDefaults synchronize];
 
             BOOL m2 = reviewUnseenFirst && reviewMarked && reviewResetOnNewSignature && reviewAgentIsolated &&
                       attentionBadgeUnseen && attentionBadgeReviewed &&
-                      prFailed && prWaiting && prAttention && prBlue && prWorking && prIdle;
+                      prFailed && prWaiting && prAttention && prBlue && prWorking && prIdle &&
+                      latestWorking && resumedBecomesWorking && latestAttentionStays;
             NSString *m2line = [NSString stringWithFormat:
                 @"M2 self-test: review-unseen=%@ review-marked=%@ review-resign=%@ review-agent-isolated=%@ "
                 @"badge-attention-unseen=%@ badge-attention-reviewed=%@ prio-failed=%@ prio-waiting=%@ "
-                @"prio-attention=%@ prio-blue=%@ prio-working=%@ prio-idle=%@\n",
+                @"prio-attention=%@ prio-blue=%@ prio-working=%@ prio-idle=%@ latest-working=%@ resumed-working=%@ latest-attention=%@\n",
                 reviewUnseenFirst ? @"OK" : @"FAIL", reviewMarked ? @"OK" : @"FAIL",
                 reviewResetOnNewSignature ? @"OK" : @"FAIL", reviewAgentIsolated ? @"OK" : @"FAIL",
                 attentionBadgeUnseen ? @"OK" : @"FAIL", attentionBadgeReviewed ? @"OK" : @"FAIL",
                 prFailed ? @"OK" : @"FAIL", prWaiting ? @"OK" : @"FAIL", prAttention ? @"OK" : @"FAIL",
-                prBlue ? @"OK" : @"FAIL", prWorking ? @"OK" : @"FAIL", prIdle ? @"OK" : @"FAIL"];
+                prBlue ? @"OK" : @"FAIL", prWorking ? @"OK" : @"FAIL", prIdle ? @"OK" : @"FAIL",
+                latestWorking ? @"OK" : @"FAIL", resumedBecomesWorking ? @"OK" : @"FAIL",
+                latestAttentionStays ? @"OK" : @"FAIL"];
             fputs(m2line.UTF8String, stdout);
 
             // 任务路由：Codex/Kimi 使用已验证的本机 URL scheme；未知 Agent 降级为应用唤起。
@@ -4961,7 +5044,7 @@ int main(int argc, const char *argv[]) {
                 ctMdLink ? @"OK" : @"FAIL", ctMdMulti ? @"OK" : @"FAIL",
                 ctBareURI ? @"OK" : @"FAIL", ctMdTrunc ? @"OK" : @"FAIL"];
             fputs(m6line.UTF8String, stdout);
-            return (taskCount > 0 && m2 && taskRoutingOK && m6) ? 0 : 2;
+            return (taskCount > 0 && internalThreadsFiltered && m2 && taskRoutingOK && m6) ? 0 : 2;
         }
         if (CPAnotherInstanceIsRunning()) return 0;
         NSApplication *app = NSApplication.sharedApplication;
