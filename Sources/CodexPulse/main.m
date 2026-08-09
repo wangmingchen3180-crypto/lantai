@@ -95,22 +95,20 @@ static NSImage *CPStatusDot(CGFloat size, CPStatus status) { return CPDotImage(s
 static NSDate *CPDateFromMillis(sqlite3_int64 v) { return v <= 0 ? NSDate.date : [NSDate dateWithTimeIntervalSince1970:v / 1000.0]; }
 static NSDate *CPDateFromSeconds(NSTimeInterval v) { return v <= 0 ? nil : [NSDate dateWithTimeIntervalSince1970:v]; }
 
-// 状态按“最后一个事件”判断：用户处理完需关注事项后，只要出现更新的工作日志，立刻恢复工作中。
-static CPStatus CPInferTaskStatus(NSDate *lastLog, NSDate *lastComplete, NSDate *lastAttention,
-                                  NSDate *lastError, NSDate *updatedAt, NSDate *now) {
-    NSTimeInterval errorAge = lastError ? [now timeIntervalSinceDate:lastError] : DBL_MAX;
-    NSTimeInterval attentionAge = lastAttention ? [now timeIntervalSinceDate:lastAttention] : DBL_MAX;
-    NSTimeInterval logAge = lastLog ? [now timeIntervalSinceDate:lastLog] : DBL_MAX;
-    NSTimeInterval completeAge = lastComplete ? [now timeIntervalSinceDate:lastComplete] : DBL_MAX;
-    BOOL attentionIsLatest = lastAttention &&
-        (!lastLog || [lastAttention compare:lastLog] != NSOrderedAscending) &&
-        (!lastComplete || [lastAttention compare:lastComplete] == NSOrderedDescending);
-
-    if (errorAge < 180 && (!lastComplete || [lastError compare:lastComplete] == NSOrderedDescending)) return CPStatusFailed;
-    if (attentionAge < 900 && attentionIsLatest) return CPStatusAttention;
-    if (logAge < 12) return CPStatusWorking;
-    if (completeAge < 180) return CPStatusCompleted;
-    if (updatedAt && [now timeIntervalSinceDate:updatedAt] < 1800) return CPStatusWaiting;
+// 用 Codex rollout 的真实生命周期判断，而不是在调试日志正文里做关键词搜索。
+// task_complete 持续为已完成，直到下一次 task_started；黄色只来自尚未返回的审批/输入调用。
+static CPStatus CPInferTaskStatus(NSDate *lastLog, NSDate *lastStarted, NSDate *lastComplete,
+                                  BOOL attentionPending, NSDate *lastError, NSDate *now) {
+    if (attentionPending) return CPStatusAttention;
+    BOOL activeTurn = lastStarted && (!lastComplete || [lastStarted compare:lastComplete] == NSOrderedDescending);
+    if (activeTurn) {
+        BOOL unresolvedError = lastError && [lastError compare:lastStarted] != NSOrderedAscending &&
+                               (!lastLog || [lastError compare:lastLog] != NSOrderedAscending);
+        if (unresolvedError) return CPStatusFailed;
+        return CPStatusWorking;
+    }
+    if (lastComplete && (!lastStarted || [lastComplete compare:lastStarted] != NSOrderedAscending)) return CPStatusCompleted;
+    if (lastLog && [now timeIntervalSinceDate:lastLog] < 12) return CPStatusWorking;
     return CPStatusIdle;
 }
 
@@ -193,6 +191,7 @@ static NSString *CPFormatDateCN(NSDate *date) {
 @property NSString *title;
 @property NSString *projectPath;
 @property NSString *projectName;
+@property NSString *rolloutPath;
 @property NSString *activity;
 @property NSDate *createdAt;
 @property NSDate *updatedAt;
@@ -259,13 +258,13 @@ typedef NS_ENUM(NSInteger, CPDisplayStatus) {
 @end
 
 static CPDisplayStatus CPDisplayStatusForTask(CPTask *task, NSString *agentID, CPReviewStore *reviewStore) {
+    (void)agentID;
+    (void)reviewStore;
     switch (task.status) {
         case CPStatusFailed: return CPDisplayStatusFailed;
         case CPStatusAttention:
         case CPStatusWaiting: return CPDisplayStatusWaiting;
-        case CPStatusCompleted:
-            return [reviewStore isTaskReviewed:task agentID:agentID]
-                ? CPDisplayStatusIdle : CPDisplayStatusCompletedPendingReview;
+        case CPStatusCompleted: return CPDisplayStatusCompletedPendingReview;
         case CPStatusWorking: return CPDisplayStatusWorking;
         case CPStatusIdle: return CPDisplayStatusIdle;
     }
@@ -693,7 +692,7 @@ static NSString *CPDisplayStatusTitle(CPDisplayStatus s) {
     switch (s) {
         case CPDisplayStatusFailed: return @"失败";
         case CPDisplayStatusWaiting: return @"需关注";
-        case CPDisplayStatusCompletedPendingReview: return @"待查验";
+        case CPDisplayStatusCompletedPendingReview: return @"已完成";
         case CPDisplayStatusWorking: return @"工作中";
         case CPDisplayStatusIdle: return @"空闲";
     }
@@ -953,10 +952,100 @@ static NSInteger CPBadgeCountForAgents(NSArray<CPAgent *> *agents, CPReviewStore
 
 static const char *CPCodexVisibleThreadsSQL =
     "SELECT id, COALESCE(NULLIF(name,''), NULLIF(title,''), NULLIF(preview,''), '未命名任务'), "
-    "cwd, created_at_ms, updated_at_ms, tokens_used FROM threads "
+    "cwd, created_at_ms, updated_at_ms, tokens_used, rollout_path FROM threads "
     "WHERE archived=0 AND preview<>'' "
     "AND COALESCE(thread_source,'') <> 'subagent' AND COALESCE(source,'') NOT LIKE '%\"subagent\"%' "
     "ORDER BY recency_at_ms DESC, updated_at_ms DESC LIMIT 10";
+
+@interface CPRolloutState : NSObject
+@property NSDate *lastStarted;
+@property NSDate *lastComplete;
+@property BOOL attentionPending;
+@end
+@implementation CPRolloutState @end
+
+static NSDate *CPDateFromISO8601(NSString *value) {
+    if (!value.length) return nil;
+    static NSISO8601DateFormatter *formatter = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        formatter = NSISO8601DateFormatter.new;
+        formatter.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
+    });
+    return [formatter dateFromString:value];
+}
+
+// 只读 rollout 尾部，避免加载整段长会话；完成/启动事件都位于每轮末端。
+static CPRolloutState *CPReadRolloutState(NSString *path) {
+    CPRolloutState *state = CPRolloutState.new;
+    if (!path.length) return state;
+    NSFileHandle *handle = [NSFileHandle fileHandleForReadingAtPath:path];
+    if (!handle) return state;
+
+    NSData *tail = nil;
+    @try {
+        unsigned long long length = [handle seekToEndOfFile];
+        unsigned long long start = length > 262144 ? length - 262144 : 0;
+        [handle seekToFileOffset:start];
+        tail = [handle readDataToEndOfFile];
+        [handle closeFile];
+        if (start > 0 && tail.length) {
+            const uint8_t *bytes = tail.bytes;
+            NSUInteger firstNewline = NSNotFound;
+            for (NSUInteger i = 0; i < tail.length; i++) {
+                if (bytes[i] == '\n') { firstNewline = i; break; }
+            }
+            if (firstNewline == NSNotFound || firstNewline + 1 >= tail.length) return state;
+            tail = [tail subdataWithRange:NSMakeRange(firstNewline + 1, tail.length - firstNewline - 1)];
+        }
+    } @catch (__unused NSException *exception) {
+        return state;
+    }
+
+    NSString *text = [[NSString alloc] initWithData:tail encoding:NSUTF8StringEncoding];
+    if (!text.length) return state;
+    NSMutableDictionary<NSString *, NSDate *> *pendingAttention = NSMutableDictionary.dictionary;
+    for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+        if (!line.length) continue;
+        NSData *lineData = [line dataUsingEncoding:NSUTF8StringEncoding];
+        NSDictionary *entry = [NSJSONSerialization JSONObjectWithData:lineData options:0 error:nil];
+        if (![entry isKindOfClass:NSDictionary.class]) continue;
+        NSDictionary *payload = entry[@"payload"];
+        if (![payload isKindOfClass:NSDictionary.class]) continue;
+        NSString *entryType = entry[@"type"];
+        NSString *payloadType = payload[@"type"];
+        NSDate *timestamp = CPDateFromISO8601(entry[@"timestamp"]);
+
+        if ([entryType isEqualToString:@"event_msg"] && [payloadType isEqualToString:@"task_started"]) {
+            state.lastStarted = timestamp;
+            [pendingAttention removeAllObjects];
+            continue;
+        }
+        if ([entryType isEqualToString:@"event_msg"] && [payloadType isEqualToString:@"task_complete"]) {
+            state.lastComplete = timestamp;
+            [pendingAttention removeAllObjects];
+            continue;
+        }
+        if (![entryType isEqualToString:@"response_item"]) continue;
+        if ([payloadType isEqualToString:@"custom_tool_call"] || [payloadType isEqualToString:@"function_call"]) {
+            NSString *name = [payload[@"name"] description].lowercaseString;
+            NSString *input = [payload[@"input"] description];
+            BOOL asksForInput = [name containsString:@"request_user_input"];
+            BOOL asksForApproval = [input containsString:@"sandbox_permissions"] && [input containsString:@"require_escalated"];
+            if (asksForInput || asksForApproval) {
+                NSString *callID = [payload[@"call_id"] description];
+                if (!callID.length) callID = [payload[@"id"] description];
+                if (callID.length) pendingAttention[callID] = timestamp ?: NSDate.distantPast;
+            }
+        } else if ([payloadType isEqualToString:@"custom_tool_call_output"] || [payloadType isEqualToString:@"function_call_output"]) {
+            NSString *callID = [payload[@"call_id"] description];
+            if (!callID.length) callID = [payload[@"id"] description];
+            if (callID.length) [pendingAttention removeObjectForKey:callID];
+        }
+    }
+    state.attentionPending = pendingAttention.count > 0;
+    return state;
+}
 
 @interface CPStateReader : NSObject
 - (NSArray<CPAgent *> *)readAgents;
@@ -1008,6 +1097,8 @@ static const char *CPCodexVisibleThreadsSQL =
             task.createdAt = CPDateFromMillis(sqlite3_column_int64(stmt, 3));
             task.updatedAt = CPDateFromMillis(sqlite3_column_int64(stmt, 4));
             task.tokensUsed = (NSInteger)sqlite3_column_int64(stmt, 5);
+            task.rolloutPath = sqlite3_column_text(stmt, 6)
+                ? [NSString stringWithUTF8String:(const char *)sqlite3_column_text(stmt, 6)] : @"";
             [self enrichTask:task logsDB:logsDB];
             [agent.tasks addObject:task];
         }
@@ -1052,30 +1143,29 @@ static const char *CPCodexVisibleThreadsSQL =
 }
 
 - (void)enrichTask:(CPTask *)task logsDB:(sqlite3 *)logsDB {
+    CPRolloutState *rollout = CPReadRolloutState(task.rolloutPath);
     if (!logsDB) {
-        task.status = -task.updatedAt.timeIntervalSinceNow < 1800 ? CPStatusWaiting : CPStatusIdle;
-        task.activity = @"正在整理任务状态";
+        task.status = CPInferTaskStatus(nil, rollout.lastStarted, rollout.lastComplete,
+                                        rollout.attentionPending, nil, NSDate.date);
+        task.activity = task.status == CPStatusCompleted ? @"任务已完成" : @"正在整理任务状态";
         return;
     }
     const char *sql =
         "SELECT MAX(ts + ts_nanos / 1000000000.0), "
-        "MAX(CASE WHEN feedback_log_body LIKE '%turn/completed%' OR feedback_log_body LIKE '%turn_completed%' THEN ts + ts_nanos / 1000000000.0 ELSE 0 END), "
-        "MAX(CASE WHEN feedback_log_body LIKE '%approval%' OR feedback_log_body LIKE '%request_user_input%' THEN ts + ts_nanos / 1000000000.0 ELSE 0 END), "
         "MAX(CASE WHEN level='ERROR' THEN ts + ts_nanos / 1000000000.0 ELSE 0 END) FROM logs WHERE thread_id=?";
     sqlite3_stmt *stmt = NULL;
-    NSDate *lastLog = nil, *lastComplete = nil, *lastAttention = nil, *lastError = nil;
+    NSDate *lastLog = nil, *lastError = nil;
     if (sqlite3_prepare_v2(logsDB, sql, -1, &stmt, NULL) == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, task.taskID.UTF8String, -1, SQLITE_TRANSIENT);
         if (sqlite3_step(stmt) == SQLITE_ROW) {
             lastLog = CPDateFromSeconds(sqlite3_column_double(stmt, 0));
-            lastComplete = CPDateFromSeconds(sqlite3_column_double(stmt, 1));
-            lastAttention = CPDateFromSeconds(sqlite3_column_double(stmt, 2));
-            lastError = CPDateFromSeconds(sqlite3_column_double(stmt, 3));
+            lastError = CPDateFromSeconds(sqlite3_column_double(stmt, 1));
         }
     }
     if (stmt) sqlite3_finalize(stmt);
 
-    task.status = CPInferTaskStatus(lastLog, lastComplete, lastAttention, lastError, task.updatedAt, NSDate.date);
+    task.status = CPInferTaskStatus(lastLog, rollout.lastStarted, rollout.lastComplete,
+                                    rollout.attentionPending, lastError, NSDate.date);
 
     task.activity = [self activityForTask:task logsDB:logsDB];
 }
@@ -3236,7 +3326,7 @@ static const CGFloat CPHUDAgentRail = 64.0;
     NSArray<NSArray *> *rows = @[
         @[@"失败", CPRed()],
         @[@"等待处理", CPOrange()],
-        @[@"完成待查验", CPBlue()],
+        @[@"已完成", CPBlue()],
         @[@"运行中", CPGreen()],
         @[@"待机", CPDisplayStatusColor(CPDisplayStatusIdle)],
     ];
@@ -4521,7 +4611,7 @@ int main(int argc, const char *argv[]) {
                 legendOK = legendOK && dotCount == 5 &&
                            [legendTexts containsObject:@"失败"] &&
                            [legendTexts containsObject:@"等待处理"] &&
-                           [legendTexts containsObject:@"完成待查验"] &&
+                           [legendTexts containsObject:@"已完成"] &&
                            [legendTexts containsObject:@"运行中"] &&
                            [legendTexts containsObject:@"待机"] &&
                            [legendTexts containsObject:@"Agent 环跟随最近更新的任务"] &&
@@ -4923,8 +5013,21 @@ int main(int argc, const char *argv[]) {
         if (argc > 1 && strcmp(argv[1], "--self-test") == 0) {
             NSArray<CPAgent *> *agents = [CPStateReader.new readAgents];
             NSInteger taskCount = 0;
-            for (CPAgent *a in agents) taskCount += a.tasks.count;
+            NSInteger workingCount = 0, attentionCount = 0, completedCount = 0, failedCount = 0, idleCount = 0;
+            for (CPAgent *a in agents) {
+                taskCount += a.tasks.count;
+                if (a.placeholder) continue;
+                for (CPTask *task in a.tasks) {
+                    if (task.status == CPStatusWorking) workingCount++;
+                    else if (task.status == CPStatusAttention || task.status == CPStatusWaiting) attentionCount++;
+                    else if (task.status == CPStatusCompleted) completedCount++;
+                    else if (task.status == CPStatusFailed) failedCount++;
+                    else idleCount++;
+                }
+            }
             printf("Codex Pulse self-test: %lu agents, %ld tasks, local read OK\n", (unsigned long)agents.count, (long)taskCount);
+            printf("Real task states: working=%ld attention=%ld completed=%ld failed=%ld idle=%ld\n",
+                   (long)workingCount, (long)attentionCount, (long)completedCount, (long)failedCount, (long)idleCount);
             BOOL internalThreadsFiltered = strstr(CPCodexVisibleThreadsSQL, "thread_source,'') <> 'subagent'") != NULL &&
                                            strstr(CPCodexVisibleThreadsSQL, "COALESCE(source,'') NOT LIKE") != NULL;
             printf("Task visibility self-test: internal-subagents=%s\n", internalThreadsFiltered ? "FILTERED" : "FAIL");
@@ -4967,13 +5070,21 @@ int main(int argc, const char *argv[]) {
                           CPDisplayStatusForTasks(@[], @"x", store) == CPDisplayStatusIdle;
             BOOL latestWorking = CPDisplayStatusForTasks(@[CPTestTask(@"old-wait", CPStatusWaiting, 1),
                                                             CPTestTask(@"new-work", CPStatusWorking, 2)], @"x", store) == CPDisplayStatusWorking;
+            CPTask *reviewedComplete = CPTestTask(@"reviewed-complete", CPStatusCompleted, 4);
+            [store markTaskReviewed:reviewedComplete agentID:@"x"];
+            BOOL completedStaysVisible = CPDisplayStatusForTasks(@[reviewedComplete], @"x", store) == CPDisplayStatusCompletedPendingReview;
 
             NSDate *now = [NSDate dateWithTimeIntervalSince1970:1000.0];
-            NSDate *attentionFirst = [NSDate dateWithTimeIntervalSince1970:998.0];
+            NSDate *oldStart = [NSDate dateWithTimeIntervalSince1970:900.0];
+            NSDate *completedAt = [NSDate dateWithTimeIntervalSince1970:950.0];
             NSDate *newerLog = [NSDate dateWithTimeIntervalSince1970:999.5];
-            BOOL resumedBecomesWorking = CPInferTaskStatus(newerLog, nil, attentionFirst, nil, nil, now) == CPStatusWorking;
-            NSDate *latestAttention = [NSDate dateWithTimeIntervalSince1970:999.75];
-            BOOL latestAttentionStays = CPInferTaskStatus(newerLog, nil, latestAttention, nil, nil, now) == CPStatusAttention;
+            BOOL completedPersists = CPInferTaskStatus(newerLog, oldStart, completedAt, NO, nil, now) == CPStatusCompleted;
+            NSDate *resumedAt = [NSDate dateWithTimeIntervalSince1970:990.0];
+            BOOL resumedBecomesWorking = CPInferTaskStatus(newerLog, resumedAt, completedAt, NO, nil, now) == CPStatusWorking;
+            BOOL pendingAttentionStays = CPInferTaskStatus(newerLog, resumedAt, completedAt, YES, nil, now) == CPStatusAttention;
+            NSDate *failedAt = [NSDate dateWithTimeIntervalSince1970:995.0];
+            BOOL failurePersists = CPInferTaskStatus(failedAt, resumedAt, completedAt, NO, failedAt, now) == CPStatusFailed;
+            BOOL noEventIsIdle = CPInferTaskStatus(nil, nil, nil, NO, nil, now) == CPStatusIdle;
 
             [testDefaults removePersistentDomainForName:suite];
             [testDefaults synchronize];
@@ -4981,18 +5092,21 @@ int main(int argc, const char *argv[]) {
             BOOL m2 = reviewUnseenFirst && reviewMarked && reviewResetOnNewSignature && reviewAgentIsolated &&
                       attentionBadgeUnseen && attentionBadgeReviewed &&
                       prFailed && prWaiting && prAttention && prBlue && prWorking && prIdle &&
-                      latestWorking && resumedBecomesWorking && latestAttentionStays;
+                      latestWorking && completedStaysVisible && completedPersists && resumedBecomesWorking &&
+                      pendingAttentionStays && failurePersists && noEventIsIdle;
             NSString *m2line = [NSString stringWithFormat:
                 @"M2 self-test: review-unseen=%@ review-marked=%@ review-resign=%@ review-agent-isolated=%@ "
                 @"badge-attention-unseen=%@ badge-attention-reviewed=%@ prio-failed=%@ prio-waiting=%@ "
-                @"prio-attention=%@ prio-blue=%@ prio-working=%@ prio-idle=%@ latest-working=%@ resumed-working=%@ latest-attention=%@\n",
+                @"prio-attention=%@ prio-blue=%@ prio-working=%@ prio-idle=%@ latest-working=%@ completed-visible=%@ completed-persists=%@ resumed-working=%@ pending-attention=%@ failure-persists=%@ no-event-idle=%@\n",
                 reviewUnseenFirst ? @"OK" : @"FAIL", reviewMarked ? @"OK" : @"FAIL",
                 reviewResetOnNewSignature ? @"OK" : @"FAIL", reviewAgentIsolated ? @"OK" : @"FAIL",
                 attentionBadgeUnseen ? @"OK" : @"FAIL", attentionBadgeReviewed ? @"OK" : @"FAIL",
                 prFailed ? @"OK" : @"FAIL", prWaiting ? @"OK" : @"FAIL", prAttention ? @"OK" : @"FAIL",
                 prBlue ? @"OK" : @"FAIL", prWorking ? @"OK" : @"FAIL", prIdle ? @"OK" : @"FAIL",
-                latestWorking ? @"OK" : @"FAIL", resumedBecomesWorking ? @"OK" : @"FAIL",
-                latestAttentionStays ? @"OK" : @"FAIL"];
+                latestWorking ? @"OK" : @"FAIL", completedStaysVisible ? @"OK" : @"FAIL",
+                completedPersists ? @"OK" : @"FAIL", resumedBecomesWorking ? @"OK" : @"FAIL",
+                pendingAttentionStays ? @"OK" : @"FAIL", failurePersists ? @"OK" : @"FAIL",
+                noEventIsIdle ? @"OK" : @"FAIL"];
             fputs(m2line.UTF8String, stdout);
 
             // 任务路由：Codex/Kimi 使用已验证的本机 URL scheme；未知 Agent 降级为应用唤起。
