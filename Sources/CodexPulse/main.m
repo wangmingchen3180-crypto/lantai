@@ -4,6 +4,8 @@
 
 #pragma mark - Constants
 
+static BOOL CPRunningSelfTests = NO;
+
 // 高对比通道调整：亮通道更亮、暗通道更暗，提高对比度。
 static CGFloat CPContrastAdjustChannel(CGFloat v) {
     return v >= 0.5 ? MIN(1.0, v + 0.12) : MAX(0.0, v * 0.72);
@@ -582,9 +584,7 @@ static NSImage *CPCircularIcon(NSImage *source, CGFloat side) {
     return result;
 }
 
-// 官方图标回退:系统里装了对应 app(如 Codex / Claude / Terminal / VS Code)就用 NSWorkspace
-// 官方图标(圆形裁切);取不到返回 nil,调用方回退到现有 SF Symbol 自绘方案。
-static NSImage *CPAppIconForAgent(NSString *agentID, CGFloat side) {
+static NSArray<NSString *> *CPBundleIDsForAgent(NSString *agentID) {
     static NSDictionary<NSString *, NSArray<NSString *> *> *bundleMap = nil;
     if (!bundleMap) {
         bundleMap = @{
@@ -593,15 +593,60 @@ static NSImage *CPAppIconForAgent(NSString *agentID, CGFloat side) {
             @"claude": @[@"com.anthropic.claudefordesktop", @"com.anthropic.claude"],
             @"terminal": @[@"com.apple.Terminal"],
             @"vscode": @[@"com.microsoft.VSCode"],
+            @"cursor": @[@"com.todesktop.230313mzl4w4u92"],
         };
     }
-    for (NSString *bundleID in bundleMap[agentID.lowercaseString] ?: @[]) {
+    return bundleMap[agentID.lowercaseString] ?: @[];
+}
+
+// 官方图标回退:系统里装了对应 app(如 Codex / Claude / Terminal / VS Code)就用 NSWorkspace
+// 官方图标(圆形裁切);取不到返回 nil,调用方回退到现有 SF Symbol 自绘方案。
+static NSImage *CPAppIconForAgent(NSString *agentID, CGFloat side) {
+    for (NSString *bundleID in CPBundleIDsForAgent(agentID)) {
         NSURL *appURL = [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:bundleID];
         if (!appURL) continue;
         NSImage *icon = [NSWorkspace.sharedWorkspace iconForFile:appURL.path];
         if (icon) return CPCircularIcon(icon, side);
     }
     return nil;
+}
+
+// 返回可精确定位任务的 Agent 深链。未知/占位 Agent 返回 nil，由调用方降级为仅唤起应用。
+static NSURL *CPDeepLinkForAgentTask(CPAgent *agent, CPTask *task) {
+    if (!agent || !task || !task.taskID.length || agent.placeholder) return nil;
+    NSString *escapedID = [task.taskID stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLPathAllowedCharacterSet];
+    if (!escapedID.length) return nil;
+    NSString *agentID = agent.agentID.lowercaseString;
+    if ([agentID isEqualToString:@"codex"]) {
+        return [NSURL URLWithString:[NSString stringWithFormat:@"codex://threads/%@", escapedID]];
+    }
+    if ([agentID isEqualToString:@"kimi"]) {
+        return [NSURL URLWithString:[NSString stringWithFormat:@"kimi-work://chat/%@", escapedID]];
+    }
+    return nil;
+}
+
+// 优先用任务深链精确跳转；不支持深链时至少唤起任务所属 Agent 应用。
+static BOOL CPOpenAgentTask(CPAgent *agent, CPTask *task) {
+    NSURL *deepLink = CPDeepLinkForAgentTask(agent, task);
+    if (deepLink && [NSWorkspace.sharedWorkspace openURL:deepLink]) return YES;
+
+    for (NSString *bundleID in CPBundleIDsForAgent(agent.agentID)) {
+        NSArray<NSRunningApplication *> *running = [NSRunningApplication runningApplicationsWithBundleIdentifier:bundleID];
+        if (running.count) {
+            [running.firstObject activateWithOptions:NSApplicationActivateAllWindows];
+            return YES;
+        }
+        NSURL *appURL = [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:bundleID];
+        if (!appURL) continue;
+        NSWorkspaceOpenConfiguration *configuration = NSWorkspaceOpenConfiguration.configuration;
+        configuration.activates = YES;
+        [NSWorkspace.sharedWorkspace openApplicationAtURL:appURL
+                                            configuration:configuration
+                                        completionHandler:nil];
+        return YES;
+    }
+    return NO;
 }
 
 #pragma mark - Agent Status Button
@@ -1556,6 +1601,8 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     row.layer.borderWidth = 0.0;
     ((CPHoverButton *)row).cpBaseBackground = NSColor.clearColor;
     row.tag = index;
+    row.toolTip = [NSString stringWithFormat:@"在 %@ 中打开：%@", self.selectedAgent.name, task.title];
+    row.accessibilityLabel = [NSString stringWithFormat:@"%@，在 %@ 中打开", task.title, self.selectedAgent.name];
     row.translatesAutoresizingMaskIntoConstraints = NO;
     [row.heightAnchor constraintEqualToConstant:56].active = YES;
 
@@ -1823,6 +1870,8 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
             [self.reviewStore markTaskReviewed:self.selectedTask agentID:self.selectedAgent.agentID];
             [[NSNotificationCenter defaultCenter] postNotificationName:@"CPTaskReviewed" object:nil];
         }
+        // 工作台任务点击后直接跳到所属 Agent；详情仍保留在工作台，返回时可以继续查看。
+        if (!CPRunningSelfTests) CPOpenAgentTask(self.selectedAgent, self.selectedTask);
     }
 }
 
@@ -3560,6 +3609,7 @@ static BOOL CPAnotherInstanceIsRunning(void) {
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         if (argc > 1 && strcmp(argv[1], "--ui-self-test") == 0) {
+            CPRunningSelfTests = YES;
             [NSApplication sharedApplication];
 
             CPWorkbenchCardController *card = CPWorkbenchCardController.new;
@@ -4862,6 +4912,25 @@ int main(int argc, const char *argv[]) {
                 prBlue ? @"OK" : @"FAIL", prWorking ? @"OK" : @"FAIL", prIdle ? @"OK" : @"FAIL"];
             fputs(m2line.UTF8String, stdout);
 
+            // 任务路由：Codex/Kimi 使用已验证的本机 URL scheme；未知 Agent 降级为应用唤起。
+            CPTask *routeTask = CPTestTask(@"thread-123", CPStatusWorking, 1);
+            CPAgent *routeCodex = CPTestAgent(@"codex", @[routeTask]);
+            CPAgent *routeKimi = CPTestAgent(@"kimi", @[routeTask]);
+            CPAgent *routeUnknown = CPTestAgent(@"unknown", @[routeTask]);
+            BOOL codexRouteOK = [CPDeepLinkForAgentTask(routeCodex, routeTask).absoluteString
+                                 isEqualToString:@"codex://threads/thread-123"];
+            BOOL kimiRouteOK = [CPDeepLinkForAgentTask(routeKimi, routeTask).absoluteString
+                                isEqualToString:@"kimi-work://chat/thread-123"];
+            BOOL unknownRouteOK = CPDeepLinkForAgentTask(routeUnknown, routeTask) == nil;
+            routeKimi.placeholder = YES;
+            BOOL placeholderRouteOK = CPDeepLinkForAgentTask(routeKimi, routeTask) == nil;
+            BOOL taskRoutingOK = codexRouteOK && kimiRouteOK && unknownRouteOK && placeholderRouteOK;
+            NSString *routingLine = [NSString stringWithFormat:
+                @"Task routing self-test: codex-thread=%@ kimi-chat=%@ unknown-fallback=%@ placeholder-fallback=%@\n",
+                codexRouteOK ? @"OK" : @"FAIL", kimiRouteOK ? @"OK" : @"FAIL",
+                unknownRouteOK ? @"OK" : @"FAIL", placeholderRouteOK ? @"OK" : @"FAIL"];
+            fputs(routingLine.UTF8String, stdout);
+
             // M6: CPCleanTitle 脏文本清洗
             BOOL ctDirty = [CPCleanTitle((const unsigned char *)"想让你设计一个loop [11] user: <in-app-browser-context>秘密上下文</in-app-browser-context>")
                             isEqualToString:@"想让你设计一个loop"];
@@ -4892,13 +4961,14 @@ int main(int argc, const char *argv[]) {
                 ctMdLink ? @"OK" : @"FAIL", ctMdMulti ? @"OK" : @"FAIL",
                 ctBareURI ? @"OK" : @"FAIL", ctMdTrunc ? @"OK" : @"FAIL"];
             fputs(m6line.UTF8String, stdout);
-            return (taskCount > 0 && m2 && m6) ? 0 : 2;
+            return (taskCount > 0 && m2 && taskRoutingOK && m6) ? 0 : 2;
         }
         if (CPAnotherInstanceIsRunning()) return 0;
         NSApplication *app = NSApplication.sharedApplication;
         AppDelegate *delegate = AppDelegate.new;
         delegate.hudVisualTest = argc > 1 && strcmp(argv[1], "--visual-test-hud") == 0;
         delegate.detailVisualTest = argc > 1 && strcmp(argv[1], "--visual-test-detail") == 0;
+        CPRunningSelfTests = delegate.detailVisualTest;
         app.delegate = delegate;
         [app run];
     }
