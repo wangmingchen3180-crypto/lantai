@@ -494,6 +494,9 @@ static NSTextField *CPLabel(NSString *text, CGFloat size, NSFontWeight weight, N
 @interface CPHoverButton : NSButton
 @property (nonatomic, strong) NSColor *cpBaseBackground;
 @property (nonatomic) BOOL cpAlwaysBorder; // 常驻 1px 描边(如详情关闭按钮)
+// 可选的视觉层:设置后 hover/按压的底色与描边画在这层上,按钮自身 layer 保持透明。
+// 用于"点击热区 > 可见图形"的场景(如详情返回钮:24pt 热区 + 与标题行高等大的小圆)。
+@property (nonatomic, strong) CALayer *cpVisualLayer;
 @end
 
 @implementation CPHoverButton {
@@ -525,13 +528,23 @@ static NSTextField *CPLabel(NSString *text, CGFloat size, NSFontWeight weight, N
 
 - (void)cpApplyBackground {
     if (self.isHighlighted) {
-        self.layer.borderWidth = 1.0;
-        self.layer.backgroundColor = [CPMuted() colorWithAlphaComponent:0.30].CGColor;
+        self.cpVisualTarget.borderWidth = 1.0;
+        self.cpVisualTarget.backgroundColor = [CPMuted() colorWithAlphaComponent:0.30].CGColor;
     } else {
         BOOL hovered = _cpHovered && self.window && !self.isHiddenOrHasHiddenAncestor;
-        self.layer.borderWidth = (hovered || self.cpAlwaysBorder) ? 1.0 : 0.0;
-        self.layer.backgroundColor = (hovered ? [CPMuted() colorWithAlphaComponent:0.16] : (self.cpBaseBackground ?: NSColor.clearColor)).CGColor;
+        self.cpVisualTarget.borderWidth = (hovered || self.cpAlwaysBorder) ? 1.0 : 0.0;
+        self.cpVisualTarget.backgroundColor = (hovered ? [CPMuted() colorWithAlphaComponent:0.16] : (self.cpBaseBackground ?: NSColor.clearColor)).CGColor;
     }
+}
+
+- (CALayer *)cpVisualTarget {
+    // 有视觉层时按钮自身 layer 不承载任何可见绘制,热区之外完全透明。
+    if (self.cpVisualLayer) {
+        self.layer.borderWidth = 0.0;
+        self.layer.backgroundColor = NSColor.clearColor.CGColor;
+        return self.cpVisualLayer;
+    }
+    return self.layer;
 }
 
 // hover 残留修复:视图被隐藏/移出窗口/换窗口时收不到 mouseExited,蒙层会停留;
@@ -587,6 +600,7 @@ static NSTextField *CPLabel(NSString *text, CGFloat size, NSFontWeight weight, N
 - (void)setHighlighted:(BOOL)highlighted { [super setHighlighted:highlighted]; [self cpApplyBackground]; }
 - (void)setCpBaseBackground:(NSColor *)color { _cpBaseBackground = color; [self cpApplyBackground]; }
 - (void)setCpAlwaysBorder:(BOOL)flag { _cpAlwaysBorder = flag; [self cpApplyBackground]; }
+- (void)setCpVisualLayer:(CALayer *)layer { _cpVisualLayer = layer; [self cpApplyBackground]; }
 
 @end
 
@@ -606,6 +620,25 @@ static NSImage *CPSymbol(NSString *name, CGFloat pointSize, NSColor *color) {
     img = [img imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:pointSize weight:NSFontWeightMedium]];
     if (color) img = [img imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithHierarchicalColor:color]];
     return img;
+}
+
+// 把符号渲染成 side x side(pt)的位图,供 CALayer.contents 使用。
+// 按钮内部私有布局约束会撑坏热区几何(曾把 24x24 热区撑成 24x29 椭圆),
+// 因此 chevron 不走 NSButton.image,而作为圆的 layer 内容绘制,几何完全可控。
+static CGImageRef CPSymbolCGImage(NSString *name, CGFloat pointSize, NSColor *color, CGFloat side) {
+    CGFloat scale = 2.0;
+    NSSize px = NSMakeSize(side * scale, side * scale);
+    NSImage *symbol = CPSymbol(name, pointSize, color);
+    NSImage *rendered = [[NSImage alloc] initWithSize:px];
+    [rendered lockFocus];
+    [[NSGraphicsContext currentContext] setImageInterpolation:NSImageInterpolationHigh];
+    NSSize s = symbol.size;
+    NSRect dst = NSMakeRect((px.width - s.width) / 2.0, (px.height - s.height) / 2.0, s.width, s.height);
+    [symbol drawInRect:dst fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1.0];
+    [rendered unlockFocus];
+    NSRect proposed = NSMakeRect(0, 0, px.width, px.height);
+    CGImageRef cg = [rendered CGImageForProposedRect:&proposed context:nil hints:nil];
+    return (CGImageRef)CFRetain(cg);
 }
 
 // 把官方 app 图标裁成 side x side 的圆形,放进状态环内。
@@ -1617,13 +1650,35 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
 
     NSView *head = [[NSView alloc] initWithFrame:NSZeroRect];
     head.translatesAutoresizingMaskIntoConstraints = NO;
-    [head.heightAnchor constraintEqualToConstant:28].active = YES;
-    NSTextField *title = CPLabel(@"任务详情", 11, NSFontWeightSemibold, CPMuted());
+    [head.heightAnchor constraintEqualToConstant:30].active = YES;
+    NSTextField *title = CPLabel(@"任务详情", 13, NSFontWeightSemibold, CPFg());
     title.translatesAutoresizingMaskIntoConstraints = NO;
+    // 返回入口:24pt 透明热区 + 与「任务详情」13pt 标题行高等大的 18pt 正圆。
+    // 可见圆和文字上端齐平、共中线,不再是一个明显大于文字的圆饼;hover/按压
+    // 反馈经 cpVisualLayer 画在小圆上,热区之外完全透明。
+    // 返回入口:24pt 透明热区 + 与「任务详情」13pt 标题行高等大的 18pt 正圆。
+    // chevron 不作为 NSButton.image 设置——按钮的私有内部约束曾把 24x24 热区
+    // 撑成 24x29,圆角层被拉伸成椭圆;改为圆的 CALayer.contents 绘制,几何完全自控。
     NSButton *backButton = CPIconButton(@"chevron.left", self, @selector(closeDetailDrawer), @"返回任务列表");
     backButton.accessibilityLabel = @"返回任务列表";
-    backButton.contentTintColor = CPFg();
-    ((CPHoverButton *)backButton).cpBaseBackground = [CPMuted() colorWithAlphaComponent:0.14];
+    backButton.image = nil; // 杜绝 NSButton 私有布局约束
+    backButton.layer.cornerRadius = 0.0;
+    // CPIconButton 自带的 28×28 约束必须先关掉,否则与下方 24×24 冲突。
+    for (NSLayoutConstraint *c in [NSArray arrayWithArray:backButton.constraints]) {
+        if (c.firstAttribute == NSLayoutAttributeWidth || c.firstAttribute == NSLayoutAttributeHeight) c.active = NO;
+    }
+    CALayer *backCircle = [CALayer layer];
+    backCircle.name = @"detailBackCircle";
+    backCircle.frame = NSMakeRect(3.0, 3.0, 18.0, 18.0); // 24pt 热区内居中
+    backCircle.cornerRadius = 9.0; // 半径恒为宽度一半,正圆
+    backCircle.borderColor = CPBorder().CGColor;
+    backCircle.masksToBounds = YES;
+    backCircle.contents = (__bridge id)CPSymbolCGImage(@"chevron.left", 9, CPFg(), 18.0);
+    backCircle.contentsGravity = kCAGravityCenter;
+    backCircle.contentsScale = 2.0;
+    [backButton.layer addSublayer:backCircle];
+    ((CPHoverButton *)backButton).cpVisualLayer = backCircle;
+    ((CPHoverButton *)backButton).cpBaseBackground = CPBg();
     ((CPHoverButton *)backButton).cpAlwaysBorder = YES;
     backButton.translatesAutoresizingMaskIntoConstraints = NO;
     self.detailBackButton = backButton;
@@ -1632,9 +1687,9 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     [NSLayoutConstraint activateConstraints:@[
         [backButton.leadingAnchor constraintEqualToAnchor:head.leadingAnchor],
         [backButton.centerYAnchor constraintEqualToAnchor:head.centerYAnchor],
-        [backButton.widthAnchor constraintEqualToConstant:28],
-        [backButton.heightAnchor constraintEqualToConstant:28],
-        [title.leadingAnchor constraintEqualToAnchor:backButton.trailingAnchor constant:6],
+        [backButton.widthAnchor constraintEqualToConstant:24],
+        [backButton.heightAnchor constraintEqualToConstant:24],
+        [title.leadingAnchor constraintEqualToAnchor:backButton.trailingAnchor constant:8],
         [title.centerYAnchor constraintEqualToAnchor:head.centerYAnchor],
         [title.trailingAnchor constraintLessThanOrEqualToAnchor:head.trailingAnchor]
     ]];
@@ -1958,21 +2013,77 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     [self addDetailView:activityCard];
 
     // 一级点击只进入详情；从详情页明确执行第二次点击才跳转到对应 Agent 的任务。
-    CPHoverButton *openButton = (CPHoverButton *)[CPHoverButton buttonWithTitle:[NSString stringWithFormat:@"在 %@ 中打开", agent.name]
+    // 直达入口做成 macOS 设置式"跳转行":与最近活动卡片同底色/同描边/同 10px
+    // 圆角,左图标 + 左对齐文案 + 尾部 disclosure chevron。按钮本身是全行透明
+    // 覆盖层,承接点击/hover/按压;视觉由行内子视图排版,不是网页 CTA。
+    NSView *actionRow = [[NSView alloc] initWithFrame:NSZeroRect];
+    actionRow.wantsLayer = YES;
+    actionRow.layer.backgroundColor = CPBg().CGColor;
+    actionRow.layer.cornerRadius = 10.0;
+    actionRow.layer.borderWidth = 1.0;
+    actionRow.layer.borderColor = CPBorder().CGColor;
+    actionRow.translatesAutoresizingMaskIntoConstraints = NO;
+    [actionRow.heightAnchor constraintEqualToConstant:36].active = YES;
+
+    NSImageView *openIcon = [[NSImageView alloc] initWithFrame:NSZeroRect];
+    // 图标语言对齐:优先用 Agent 官方 app 图标的圆形裁切(与状态环/HUD 同源),
+    // 语义本身就是"在 <Agent> 中打开";取不到时回退为无方框的 arrow.up.right,
+    // 方框符号(arrow.up.right.square)与全产品的圆形语言冲突,不再使用。
+    NSImage *agentIcon = CPAppIconForAgent(agent.agentID, 15.0);
+    if (agentIcon) {
+        openIcon.image = agentIcon;
+        openIcon.contentTintColor = nil; // 官方彩色图标不做单色 tint
+    } else {
+        openIcon.image = CPSymbol(@"arrow.up.right", 11, CPAccent());
+        openIcon.contentTintColor = CPAccent();
+    }
+    openIcon.translatesAutoresizingMaskIntoConstraints = NO;
+    [openIcon.widthAnchor constraintEqualToConstant:16].active = YES;
+    [openIcon.heightAnchor constraintEqualToConstant:16].active = YES;
+
+    NSString *openTitle = [NSString stringWithFormat:@"在 %@ 中打开", agent.name];
+    NSTextField *openLabel = CPLabel(openTitle, 12, NSFontWeightMedium, CPFg());
+    openLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    openLabel.translatesAutoresizingMaskIntoConstraints = NO;
+
+    NSImageView *openChevron = [[NSImageView alloc] initWithFrame:NSZeroRect];
+    openChevron.image = CPSymbol(@"chevron.right", 10, CPMuted());
+    openChevron.contentTintColor = CPMuted();
+    openChevron.translatesAutoresizingMaskIntoConstraints = NO;
+
+    CPHoverButton *openButton = (CPHoverButton *)[CPHoverButton buttonWithTitle:openTitle
                                                                         target:self
                                                                         action:@selector(openSelectedTaskInAgent:)];
     openButton.bordered = NO;
-    openButton.font = [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold];
-    openButton.contentTintColor = CPFg();
-    openButton.image = CPSymbol(@"arrow.up.right.square", 12, CPFg());
-    openButton.imagePosition = NSImageLeading;
-    openButton.cpBaseBackground = [CPAccent() colorWithAlphaComponent:0.24];
-    openButton.cpAlwaysBorder = YES;
+    // 标题只作语义/自测载体,不重复绘制 —— 行内文字由 openLabel 排版。
+    openButton.attributedTitle = [[NSAttributedString alloc]
+        initWithString:openTitle
+            attributes:@{NSFontAttributeName: [NSFont systemFontOfSize:12 weight:NSFontWeightMedium],
+                         NSForegroundColorAttributeName: NSColor.clearColor}];
+    openButton.layer.cornerRadius = 10.0; // hover/按压 wash 按卡片圆角裁切
     openButton.toolTip = [NSString stringWithFormat:@"直达 %@ 中的这个任务", agent.name];
     openButton.accessibilityLabel = openButton.toolTip;
-    [openButton.heightAnchor constraintEqualToConstant:34].active = YES;
+    openButton.translatesAutoresizingMaskIntoConstraints = NO;
     self.detailOpenAgentButton = openButton;
-    [self addDetailView:openButton];
+
+    [actionRow addSubview:openIcon];
+    [actionRow addSubview:openLabel];
+    [actionRow addSubview:openChevron];
+    [actionRow addSubview:openButton]; // 覆盖层置顶,整行可点
+    [NSLayoutConstraint activateConstraints:@[
+        [openIcon.leadingAnchor constraintEqualToAnchor:actionRow.leadingAnchor constant:12],
+        [openIcon.centerYAnchor constraintEqualToAnchor:actionRow.centerYAnchor],
+        [openLabel.leadingAnchor constraintEqualToAnchor:openIcon.trailingAnchor constant:8],
+        [openLabel.centerYAnchor constraintEqualToAnchor:actionRow.centerYAnchor],
+        [openChevron.trailingAnchor constraintEqualToAnchor:actionRow.trailingAnchor constant:-12],
+        [openChevron.centerYAnchor constraintEqualToAnchor:actionRow.centerYAnchor],
+        [openLabel.trailingAnchor constraintLessThanOrEqualToAnchor:openChevron.leadingAnchor constant:-8],
+        [openButton.leadingAnchor constraintEqualToAnchor:actionRow.leadingAnchor],
+        [openButton.trailingAnchor constraintEqualToAnchor:actionRow.trailingAnchor],
+        [openButton.topAnchor constraintEqualToAnchor:actionRow.topAnchor],
+        [openButton.bottomAnchor constraintEqualToAnchor:actionRow.bottomAnchor]
+    ]];
+    [self addDetailView:actionRow];
 }
 
 - (void)openSelectedTaskInAgent:(id)sender {
@@ -4698,13 +4809,19 @@ int main(int argc, const char *argv[]) {
             NSPoint backInCol = [card9.detailBackButton convertPoint:backC toView:card9.rightColumn];
             BOOL m9BackHitOK = [card9.rightColumn hitTest:backInCol] == card9.detailBackButton;
             NSRect backF = [card9.detailBackButton convertRect:card9.detailBackButton.bounds toView:card9.rightColumn];
-            CGColorRef backBg = card9.detailBackButton.layer.backgroundColor;
+            // 可见圆是 detailBackCircle 视觉子层(24pt 透明热区内 18pt 正圆),背景/描边检查以它为准。
+            CALayer *backCircle = nil;
+            for (CALayer *l in card9.detailBackButton.layer.sublayers) {
+                if ([l.name isEqualToString:@"detailBackCircle"]) { backCircle = l; break; }
+            }
+            CGColorRef backBg = backCircle.backgroundColor;
             BOOL m9BackVisible = !card9.detailBackButton.isHidden && card9.detailBackButton.alphaValue == 1.0 &&
-                                 backF.size.width >= 24.0 && backF.size.height >= 24.0 &&
+                                 backF.size.width == 24.0 && backF.size.height == 24.0 && // 热区必须严格方正,否则圆角层被拉成椭圆
                                  NSContainsRect(card9.rightColumn.bounds, backF) &&
-                                 backBg && CGColorGetAlpha(backBg) > 0.0 &&
-                                 card9.detailBackButton.layer.borderWidth > 0.0 &&
-                                 card9.detailBackButton.image != nil;
+                                 backCircle && backBg && CGColorGetAlpha(backBg) > 0.0 &&
+                                 backCircle.borderWidth > 0.0 &&
+                                 backCircle.frame.size.width == backCircle.frame.size.height && // 正圆
+                                 backCircle.contents != nil; // chevron 画在圆层 contents 上
             NSView *head9 = card9.detailStack.arrangedSubviews.firstObject;
             NSTextField *titleLbl = nil;
             for (NSView *v in head9.subviews) {
