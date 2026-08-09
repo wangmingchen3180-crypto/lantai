@@ -626,7 +626,8 @@ static NSColor *CPDisplayStatusColor(CPDisplayStatus s) {
     }
 }
 
-// 角标计数:需要用户处理的条目 = 失败 + 需关注 + 等待处理 + 完成但未经查验(按 review 签名逐任务判断)。
+// 角标计数:需要用户处理且尚未查看的条目。
+// 打开详情会记录当前 updatedAt 签名；任务再次更新后会自动重新出现。
 static NSInteger CPBadgeCountForAgents(NSArray<CPAgent *> *agents, CPReviewStore *reviewStore) {
     NSInteger count = 0;
     for (CPAgent *a in agents) {
@@ -636,7 +637,7 @@ static NSInteger CPBadgeCountForAgents(NSArray<CPAgent *> *agents, CPReviewStore
                 case CPStatusFailed:
                 case CPStatusAttention:
                 case CPStatusWaiting:
-                    count++;
+                    if (![reviewStore isTaskReviewed:t agentID:a.agentID]) count++;
                     break;
                 case CPStatusCompleted:
                     if (![reviewStore isTaskReviewed:t agentID:a.agentID]) count++;
@@ -1521,6 +1522,9 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     text.orientation = NSUserInterfaceLayoutOrientationVertical;
     text.alignment = NSLayoutAttributeLeading;
     text.spacing = 0;
+    text.translatesAutoresizingMaskIntoConstraints = NO;
+    // 固定文字列宽度，状态灯不再随 Agent 名称长度横向漂移。
+    [text.widthAnchor constraintEqualToConstant:44].active = YES;
 
     NSImageView *dot = [[NSImageView alloc] initWithFrame:NSMakeRect(0, 0, 6, 6)];
     dot.image = CPStatusDot(6, agent.status);
@@ -1811,8 +1815,11 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
         self.selectedTask = self.selectedAgent.tasks[(NSUInteger)idx];
         [self renderDetail];
         [self showDetailDrawer];
-        // 只有真正打开任务详情才写入查验；render/选择Agent/刷新均不写defaults。
-        if (self.selectedTask.status == CPStatusCompleted) {
+        // 只有真正打开任务详情才记录已查看；render/选择 Agent/刷新均不写 defaults。
+        if (self.selectedTask.status == CPStatusCompleted ||
+            self.selectedTask.status == CPStatusAttention ||
+            self.selectedTask.status == CPStatusFailed ||
+            self.selectedTask.status == CPStatusWaiting) {
             [self.reviewStore markTaskReviewed:self.selectedTask agentID:self.selectedAgent.agentID];
             [[NSNotificationCenter defaultCenter] postNotificationName:@"CPTaskReviewed" object:nil];
         }
@@ -3412,6 +3419,10 @@ static const CGFloat CPHUDAgentRail = 64.0;
                                            selector:@selector(dockModeChanged:)
                                                name:@"CPDockModeChanged"
                                              object:nil];
+    [NSNotificationCenter.defaultCenter addObserver:self
+                                           selector:@selector(taskReviewed:)
+                                               name:@"CPTaskReviewed"
+                                             object:nil];
 
     [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent *(NSEvent *event) {
         if (event.keyCode == 53 && weakSelf.card.isVisible) {
@@ -3472,6 +3483,13 @@ static const CGFloat CPHUDAgentRail = 64.0;
         [self.card renderAgents:self.agents];
         [self.hud updateWithAgents:self.agents selectedAgent:agent];
     }
+}
+
+- (void)taskReviewed:(NSNotification *)note {
+    (void)note;
+    // HUD 自身已监听此通知；这里只同步悬浮球角标和菜单栏提示。
+    [self.dock renderWithAgents:self.agents selectedAgent:self.card.selectedAgent];
+    [self updateStatusBar];
 }
 
 - (void)dockModeChanged:(NSNotification *)note {
@@ -3568,6 +3586,60 @@ int main(int argc, const char *argv[]) {
                              card.middleColumn.superview == columnsStack;
             BOOL rightOverlayHidden = card.rightColumn.hidden &&
                                       card.rightColumn.superview == card.middleColumn;
+
+            // Bugfix 回归：不同长度 Agent 名称的状态灯必须落在同一固定列。
+            CPAgent *shortNameAgent = CPTestAgent(@"short-name", @[CPTestTask(@"short-task", CPStatusWorking, 1)]);
+            shortNameAgent.name = @"A";
+            CPAgent *longNameAgent = CPTestAgent(@"long-name", @[CPTestTask(@"long-task", CPStatusWaiting, 2)]);
+            longNameAgent.name = @"VeryLongAgentName";
+            [card renderAgents:@[shortNameAgent, longNameAgent]];
+            [card.leftColumn layoutSubtreeIfNeeded];
+            BOOL agentStatusDotsAligned = NO;
+            if (card.agentStack.arrangedSubviews.count >= 3) {
+                NSButton *shortRow = (NSButton *)card.agentStack.arrangedSubviews[1];
+                NSButton *longRow = (NSButton *)card.agentStack.arrangedSubviews[2];
+                NSStackView *shortContent = (NSStackView *)shortRow.subviews.firstObject;
+                NSStackView *longContent = (NSStackView *)longRow.subviews.firstObject;
+                if ([shortContent isKindOfClass:NSStackView.class] && [longContent isKindOfClass:NSStackView.class] &&
+                    shortContent.arrangedSubviews.count == 3 && longContent.arrangedSubviews.count == 3) {
+                    NSView *shortDot = shortContent.arrangedSubviews.lastObject;
+                    NSView *longDot = longContent.arrangedSubviews.lastObject;
+                    NSRect shortDotFrame = [shortDot convertRect:shortDot.bounds toView:card.agentStack];
+                    NSRect longDotFrame = [longDot convertRect:longDot.bounds toView:card.agentStack];
+                    agentStatusDotsAligned = fabs(NSMidX(shortDotFrame) - NSMidX(longDotFrame)) <= 0.5;
+                }
+            }
+
+            // Bugfix 回归：打开“需关注”详情后，悬浮球角标应通过通知立即清除。
+            NSString *bugSuite = [NSString stringWithFormat:@"com.codexpulse.bugfix-ui.%d", NSProcessInfo.processInfo.processIdentifier];
+            NSUserDefaults *bugDefaults = [[NSUserDefaults alloc] initWithSuiteName:bugSuite];
+            [bugDefaults removePersistentDomainForName:bugSuite];
+            CPReviewStore *bugStore = [[CPReviewStore alloc] initWithDefaults:bugDefaults];
+            CPTask *attentionTaskUI = CPTestTask(@"attention-ui", CPStatusAttention, 3000);
+            CPAgent *attentionAgentUI = CPTestAgent(@"attention-agent-ui", @[attentionTaskUI]);
+            CPWorkbenchCardController *bugCard = CPWorkbenchCardController.new;
+            bugCard.reviewStore = bugStore;
+            [bugCard renderAgents:@[attentionAgentUI]];
+            CPDockWindowController *bugDock = CPDockWindowController.new;
+            bugDock.reviewStore = bugStore;
+            [bugDock setMode:0];
+            [bugDock renderWithAgents:@[attentionAgentUI] selectedAgent:attentionAgentUI];
+            BOOL attentionBadgeInitiallyVisible = !bugDock.badgeView.hidden;
+            id bugToken = [NSNotificationCenter.defaultCenter addObserverForName:@"CPTaskReviewed"
+                                                                          object:nil
+                                                                           queue:nil
+                                                                      usingBlock:^(NSNotification *note) {
+                (void)note;
+                [bugDock renderWithAgents:@[attentionAgentUI] selectedAgent:attentionAgentUI];
+            }];
+            NSButton *attentionRow = NSButton.new;
+            attentionRow.tag = 0;
+            [bugCard taskClicked:attentionRow];
+            BOOL attentionBadgeClearsOnOpen = attentionBadgeInitiallyVisible && bugDock.badgeView.hidden &&
+                                              [bugStore isTaskReviewed:attentionTaskUI agentID:attentionAgentUI.agentID];
+            [NSNotificationCenter.defaultCenter removeObserver:bugToken];
+            [bugDefaults removePersistentDomainForName:bugSuite];
+            [bugDefaults synchronize];
 
             NSArray<CPAgent *> *agents = [CPStateReader.new readAgents];
             CPDockWindowController *dock = CPDockWindowController.new;
@@ -4565,6 +4637,7 @@ int main(int argc, const char *argv[]) {
                                    hoverHideCleared && hoverRemoveCleared;
 
             BOOL passed = centered && draggableHeader && labeledWorkbench && onlyRealAgents && labeledAgent && buttonReceivesClick &&
+                          agentStatusDotsAligned && attentionBadgeClearsOnOpen &&
                           cardMasksToBounds && shadowCarrierNoMasks && cardIsChildOfShadowCarrier && windowHasWorkbenchInset &&
                           fixedCardSize && twoColumn && rightOverlayHidden &&
                           hudCollapsed6x72 && hudCollapsedOnMainScreen && hudExpandedSizeOK && hudExpandedOnMainScreen &&
@@ -4609,6 +4682,9 @@ int main(int argc, const char *argv[]) {
                 hudAgentScope ? @"OK" : @"FAIL",
                 hudSelectByID ? @"OK" : @"FAIL",
                 agentUrgencyOK ? @"OK" : @"FAIL"];
+            [result appendFormat:@"Bugfix UI self-test: agent-dot-column=%@ attention-badge-clears=%@\n",
+                agentStatusDotsAligned ? @"OK" : @"FAIL",
+                attentionBadgeClearsOnOpen ? @"OK" : @"FAIL"];
             [result appendFormat:@"M3 UI self-test: drawer-init-hidden=%@ render-no-mark=%@ drawer-on-click=%@ review-on-open=%@ esc-drawer=%@ esc-workbench=%@\n",
                 drawerInitiallyHidden ? @"OK" : @"FAIL",
                 renderDoesNotMark ? @"OK" : @"FAIL",
@@ -4747,6 +4823,11 @@ int main(int argc, const char *argv[]) {
             CPTask *sameIDDifferentAgent = CPTestTask(@"t1", CPStatusCompleted, 1000);
             BOOL reviewAgentIsolated = [store isTaskReviewed:sameIDDifferentAgent agentID:@"codex"] &&
                                        ![store isTaskReviewed:sameIDDifferentAgent agentID:@"kimi"];
+            CPTask *attentionTask = CPTestTask(@"attention", CPStatusAttention, 3000);
+            CPAgent *attentionAgent = CPTestAgent(@"attention-agent", @[attentionTask]);
+            BOOL attentionBadgeUnseen = CPBadgeCountForAgents(@[attentionAgent], store) == 1;
+            [store markTaskReviewed:attentionTask agentID:attentionAgent.agentID];
+            BOOL attentionBadgeReviewed = CPBadgeCountForAgents(@[attentionAgent], store) == 0;
 
             BOOL prFailed = CPDisplayStatusForTasks(@[CPTestTask(@"a", CPStatusWorking, 1),
                                                       CPTestTask(@"b", CPStatusCompleted, 1),
@@ -4768,12 +4849,15 @@ int main(int argc, const char *argv[]) {
             [testDefaults synchronize];
 
             BOOL m2 = reviewUnseenFirst && reviewMarked && reviewResetOnNewSignature && reviewAgentIsolated &&
+                      attentionBadgeUnseen && attentionBadgeReviewed &&
                       prFailed && prWaiting && prAttention && prBlue && prWorking && prIdle;
             NSString *m2line = [NSString stringWithFormat:
                 @"M2 self-test: review-unseen=%@ review-marked=%@ review-resign=%@ review-agent-isolated=%@ "
-                @"prio-failed=%@ prio-waiting=%@ prio-attention=%@ prio-blue=%@ prio-working=%@ prio-idle=%@\n",
+                @"badge-attention-unseen=%@ badge-attention-reviewed=%@ prio-failed=%@ prio-waiting=%@ "
+                @"prio-attention=%@ prio-blue=%@ prio-working=%@ prio-idle=%@\n",
                 reviewUnseenFirst ? @"OK" : @"FAIL", reviewMarked ? @"OK" : @"FAIL",
                 reviewResetOnNewSignature ? @"OK" : @"FAIL", reviewAgentIsolated ? @"OK" : @"FAIL",
+                attentionBadgeUnseen ? @"OK" : @"FAIL", attentionBadgeReviewed ? @"OK" : @"FAIL",
                 prFailed ? @"OK" : @"FAIL", prWaiting ? @"OK" : @"FAIL", prAttention ? @"OK" : @"FAIL",
                 prBlue ? @"OK" : @"FAIL", prWorking ? @"OK" : @"FAIL", prIdle ? @"OK" : @"FAIL"];
             fputs(m2line.UTF8String, stdout);
