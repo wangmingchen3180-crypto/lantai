@@ -42,6 +42,15 @@ static NSColor *CPBlue(void) { return CPDyn(0.420, 0.590, 1.000, 0.480, 0.640, 1
 static NSColor *CPOrange(void) { return CPDyn(1.000, 0.620, 0.240, 1.000, 0.660, 0.300); }
 static NSColor *CPRed(void) { return CPDyn(1.000, 0.420, 0.430, 1.000, 0.470, 0.480); }
 static NSColor *CPGreen(void) { return CPDyn(0.330, 0.860, 0.450, 0.380, 0.890, 0.500); }
+// 8% 白色 hairline(对齐原型 --hairline: rgba(255,255,255,.08)):B 版待办卡片、输入框等
+// 嵌入式描边专用,比 CPBorder 柔和一档。不改全局 CPBorder,控件描边语义保持不变。
+static NSColor *CPHairline(void) {
+    return [NSColor colorWithName:nil dynamicProvider:^NSColor *(NSAppearance *appearance) {
+        NSString *match = [appearance bestMatchFromAppearancesWithNames:@[NSAppearanceNameAqua, NSAppearanceNameDarkAqua]];
+        BOOL dark = [match isEqualToString:NSAppearanceNameDarkAqua];
+        return [NSColor colorWithSRGBRed:1.0 green:1.0 blue:1.0 alpha:dark ? 0.08 : 0.10];
+    }];
+}
 
 #pragma mark - Status
 
@@ -394,10 +403,12 @@ static CPDisplayStatus CPDisplayStatusForAgents(NSArray<CPAgent *> *agents, CPRe
 @property (nonatomic, readonly) NSArray<CAShapeLayer *> *rippleTroughLayers; // 8 层黑谷
 - (instancetype)initWithRingDiameter:(CGFloat)diameter lineWidth:(CGFloat)lineWidth;
 - (void)updateRipples;
+- (void)invalidateRippleCache; // 宿主绕过 updateRipples 直接改层(如隐藏时移除动画)后,强制下次全量重应用
 @end
 
 @implementation CPRippleView {
     CGFloat _ringLineWidth; // 基础环静态线宽
+    NSString *_appliedKey;  // 上次实际应用的参数签名:未变化时不再 remove/re-add 无限动画(防相位重启与合成抖动)
 }
 
 - (instancetype)initWithRingDiameter:(CGFloat)diameter lineWidth:(CGFloat)lineWidth {
@@ -451,6 +462,10 @@ static CPDisplayStatus CPDisplayStatusForAgents(NSArray<CPAgent *> *agents, CPRe
 }
 
 - (void)updateRipples {
+    NSString *key = [NSString stringWithFormat:@"%ld|%d|%d|%.3f", (long)self.displayStatus,
+                                               (int)self.reduceMotion, (int)self.rippleSuppressed, self.ripplePeakOpacity];
+    if (_appliedKey && [_appliedKey isEqualToString:key]) return; // 参数未变:保留正在运行的动画
+    _appliedKey = key;
     for (CAShapeLayer *ring in [self cpAllRippleLayers]) [ring removeAllAnimations];
     NSColor *color = CPDisplayStatusColor(self.displayStatus);
     // 固定基础环:固定半径、固定线宽、固定状态色,永不动画;reduce motion 时提升为实色固定环。
@@ -476,6 +491,10 @@ static CPDisplayStatus CPDisplayStatusForAgents(NSArray<CPAgent *> *agents, CPRe
         CPRippleApplyPairAnimations(self.rippleLayers[(NSUInteger)i], self.rippleTroughLayers[(NSUInteger)i],
                                     i, duration, self.ripplePeakOpacity, troughAlpha);
     }
+}
+
+- (void)invalidateRippleCache {
+    _appliedKey = nil;
 }
 
 @end
@@ -775,6 +794,7 @@ static NSInteger CPBadgeCountForAgents(NSArray<CPAgent *> *agents, CPReviewStore
 @interface CPAgentStatusButton : NSButton
 @property NSString *agentID;
 @property (nonatomic) BOOL reduceMotion;
+@property (nonatomic) BOOL animationsPaused; // HUD 收起/不可见时暂停 8 层无限涟漪(可见性驱动降载)
 @property CPDisplayStatus displayStatus;
 @property BOOL statusSelected;
 @property CAShapeLayer *ringLayer;
@@ -787,6 +807,7 @@ static NSInteger CPBadgeCountForAgents(NSArray<CPAgent *> *agents, CPReviewStore
 
 @implementation CPAgentStatusButton {
     BOOL _hovered; // 显式 hover 状态,hide/移出窗口时强制复位,防止状态残留
+    NSString *_appliedAnimKey; // 上次实际应用的动画参数签名:未变化时保留运行中的动画,不重启相位
 }
 
 - (instancetype)initWithFrame:(NSRect)frame {
@@ -947,11 +968,20 @@ static NSInteger CPBadgeCountForAgents(NSArray<CPAgent *> *agents, CPReviewStore
     return [self.rippleTroughLayers arrayByAddingObjectsFromArray:self.rippleLayers];
 }
 
+- (void)setAnimationsPaused:(BOOL)animationsPaused {
+    _animationsPaused = animationsPaused;
+    [self applyAnimations];
+}
+
 - (void)applyAnimations {
+    NSString *key = [NSString stringWithFormat:@"%d|%d|%ld|%d", (int)self.reduceMotion, (int)self.statusSelected,
+                                               (long)self.displayStatus, (int)self.animationsPaused];
+    if (_appliedAnimKey && [_appliedAnimKey isEqualToString:key]) return; // 参数未变:不重建动画
+    _appliedAnimKey = key;
     for (CAShapeLayer *ring in [self cpAllRippleLayers]) [ring removeAllAnimations];
     [self.innerRingLayer removeAllAnimations];
-    if (self.reduceMotion) {
-        // 减少动态效果:停止所有 CAAnimation,只留固定状态环(实色/细环由 cpApplyRingState 决定),不缩放不闪烁。
+    if (self.reduceMotion || self.animationsPaused) {
+        // 减少动态效果/宿主不可见:停止所有 CAAnimation,只留固定状态环(实色/细环由 cpApplyRingState 决定),不缩放不闪烁。
         for (CAShapeLayer *ring in [self cpAllRippleLayers]) {
             ring.hidden = YES;
             ring.opacity = 1.0;
@@ -1082,10 +1112,29 @@ static CPRolloutState *CPReadRolloutState(NSString *path) {
 }
 
 @interface CPStateReader : NSObject
+@property (nonatomic) NSMutableDictionary<NSString *, NSDictionary *> *rolloutCache; // path → {mtime,size,state}
 - (NSArray<CPAgent *> *)readAgents;
+// rollout 尾部解析按 (mtime,size) 缓存:文件未变直接复用上轮结果,不重复读 256KB/逐行 JSON。
+- (CPRolloutState *)rolloutStateForPath:(NSString *)path;
 @end
 
 @implementation CPStateReader
+
+- (CPRolloutState *)rolloutStateForPath:(NSString *)path {
+    if (!path.length) return CPRolloutState.new;
+    if (!self.rolloutCache) self.rolloutCache = NSMutableDictionary.dictionary;
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+    NSDate *mtime = attrs[NSFileModificationDate] ?: NSDate.distantPast;
+    NSNumber *size = attrs[NSFileSize] ?: @0;
+    NSDictionary *cached = self.rolloutCache[path];
+    if (cached && [cached[@"mtime"] isEqual:mtime] && [cached[@"size"] isEqual:size]) {
+        return cached[@"state"];
+    }
+    CPRolloutState *state = CPReadRolloutState(path);
+    if (self.rolloutCache.count > 32) [self.rolloutCache removeAllObjects]; // 上限兜底,防无限增长
+    self.rolloutCache[path] = @{@"mtime": mtime, @"size": size, @"state": state};
+    return state;
+}
 
 - (NSArray<CPAgent *> *)readAgents {
     CPAgent *codex = [self readCodexAgent];
@@ -1163,6 +1212,11 @@ static CPRolloutState *CPReadRolloutState(NSString *path) {
 }
 
 - (CPTask *)sampleTask:(NSString *)taskID title:(NSString *)title project:(NSString *)project path:(NSString *)path status:(CPStatus)status activity:(NSString *)activity {
+    // 占位示例数据必须在会话内完全静态:每轮 readAgents 若用 NSDate.date,updatedAt 会变,
+    // 可见数据签名随之抖动,签名跳过机制被架空(静态数据也每 3s 全量重绘)。
+    static NSDate *sampleBaseDate = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ sampleBaseDate = NSDate.date; });
     CPTask *task = CPTask.new;
     task.taskID = taskID;
     task.title = title;
@@ -1170,14 +1224,14 @@ static CPRolloutState *CPReadRolloutState(NSString *path) {
     task.projectPath = path;
     task.status = status;
     task.activity = activity;
-    task.createdAt = NSDate.date;
-    task.updatedAt = NSDate.date;
+    task.createdAt = sampleBaseDate;
+    task.updatedAt = sampleBaseDate;
     task.tokensUsed = 0;
     return task;
 }
 
 - (void)enrichTask:(CPTask *)task logsDB:(sqlite3 *)logsDB {
-    CPRolloutState *rollout = CPReadRolloutState(task.rolloutPath);
+    CPRolloutState *rollout = [self rolloutStateForPath:task.rolloutPath];
     if (!logsDB) {
         task.status = CPInferTaskStatus(nil, rollout.lastStarted, rollout.lastComplete,
                                         rollout.attentionPending, nil, NSDate.date);
@@ -1439,9 +1493,11 @@ static CPRolloutState *CPReadRolloutState(NSString *path) {
 - (BOOL)isFlipped { return YES; }
 @end
 
-// Todo 行:hover 时显示浅底色并放行尾删除钮;无 hover 时删除钮完全透明,绝不常驻抢眼。
+// Todo 行(B 版):hover 时行底色提亮并同时放行尾编辑铅笔与删除垃圾桶;
+// 非 hover 两个动作钮完全透明,绝不常驻抢眼。
 @interface CPTodoRowView : NSView
 @property (nonatomic, weak) NSButton *cpDeleteButton;
+@property (nonatomic, weak) NSButton *cpEditButton;
 @end
 @implementation CPTodoRowView
 - (void)updateTrackingAreas {
@@ -1455,26 +1511,41 @@ static CPRolloutState *CPReadRolloutState(NSString *path) {
                                                        userInfo:nil];
     [self addTrackingArea:area];
 }
+- (void)cpSetActionsVisible:(BOOL)visible {
+    self.layer.backgroundColor = (visible ? [CPFg() colorWithAlphaComponent:0.05] : NSColor.clearColor).CGColor;
+    self.cpDeleteButton.alphaValue = visible ? 1.0 : 0.0;
+    self.cpEditButton.alphaValue = visible ? 1.0 : 0.0;
+}
 - (void)mouseEntered:(NSEvent *)event {
     [super mouseEntered:event];
-    self.layer.backgroundColor = [CPFg() colorWithAlphaComponent:0.05].CGColor;
-    self.cpDeleteButton.alphaValue = 1.0;
+    [self cpSetActionsVisible:YES];
 }
 - (void)mouseExited:(NSEvent *)event {
     [super mouseExited:event];
-    self.layer.backgroundColor = NSColor.clearColor.CGColor;
-    self.cpDeleteButton.alphaValue = 0.0;
+    [self cpSetActionsVisible:NO];
 }
 @end
 
-// Todo 删除钮:平时透明(由行 hover 放行),hover 图标本身时 xmark 变红(danger)。
+// Todo 删除钮(B 版垃圾桶):平时透明(由行 hover 放行),hover 图标本身时变红(danger)。
 @interface CPTodoDeleteButton : CPHoverButton
 @end
 @implementation CPTodoDeleteButton
 - (void)cpSetHovered:(BOOL)hovered {
     [super cpSetHovered:hovered];
     NSColor *tint = hovered ? CPRed() : CPMuted();
-    self.image = CPSymbol(@"xmark", 10, tint);
+    self.image = CPSymbol(@"trash", 11, tint);
+    self.contentTintColor = tint;
+}
+@end
+
+// Todo 编辑钮(B 版铅笔):平时透明(由行 hover 放行),hover 图标本身时提亮为 CPFg2。
+@interface CPTodoEditButton : CPHoverButton
+@end
+@implementation CPTodoEditButton
+- (void)cpSetHovered:(BOOL)hovered {
+    [super cpSetHovered:hovered];
+    NSColor *tint = hovered ? CPFg2() : CPMuted();
+    self.image = CPSymbol(@"pencil", 11, tint);
     self.contentTintColor = tint;
 }
 @end
@@ -1563,13 +1634,16 @@ static const CGFloat CPWorkbenchInset = 20.0;
 static const CGFloat CPCardWidth = 520.0;
 static const CGFloat CPCardHeight = 360.0; // 内容区高度(头部 + 三列);Todo 栏在此基础上向下加高卡片
 
-// Todo 栏布局常量(方案 B 精致卡片型):Todo 区是一张与"最近活动"同族的卡片
-// (CPSurface 底 + hairline 描边 + 10px 圆角,四周 12pt 留白),收起态只露 30pt 卡片头横条
+// Todo 栏布局常量(方案 B 精致卡片型):Todo 区是 CPBg 工作台上的一张 CPSurface 卡片
+// (hairline 描边 + 10px 圆角,四周 12pt 留白),收起态只露 34pt 卡片头横条
 // (始终参与布局,绝不 overlay);展开时卡片/窗口整体向下加高 CPTodoExpandedExtra,任务区高度不变。
-static const CGFloat CPTodoStripHeight = 30.0;
+// 尺寸对齐原型 B:strip padding 10px 12px;行 min-height 30;输入框 padding 7px 10px;
+// 列表 5 行可见,超出滚动;卡片底内边距 10。
+static const CGFloat CPTodoStripHeight = 34.0;
 static const CGFloat CPTodoCardMargin = 12.0; // Todo 卡片距工作台卡片左右/底部的留白
-static const CGFloat CPTodoCollapsedHeight = 42.0; // 30 横条 + 12 卡片下内边距
-static const CGFloat CPTodoExpandedExtra = 188.0; // 8 上间距 + 30 输入行 + 6 间距 + 132 列表(约 5 行) + 12 下内边距
+static const CGFloat CPTodoCollapsedHeight = 46.0; // 34 横条 + 12 卡片下内边距
+static const CGFloat CPTodoRowHeight = 30.0; // B 版行 min-height 30
+static const CGFloat CPTodoExpandedExtra = 210.0; // 2 上间距 + 32 输入行 + 8 间距 + 158 列表(5 行) + 10 下内边距
 
 - (instancetype)init {
     self = [super init];
@@ -1648,7 +1722,8 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
 
     self.card = [[NSView alloc] initWithFrame:NSMakeRect(CPWorkbenchInset, CPWorkbenchInset, CPCardWidth, self.cardHeight)];
     self.card.wantsLayer = YES;
-    self.card.layer.backgroundColor = CPSurface().CGColor;
+    // B 版层次:工作台整体是 CPBg 深色底,Todo 卡片才是 CPSurface(原型 window 底 vs todo-shell)。
+    self.card.layer.backgroundColor = CPBg().CGColor;
     self.card.layer.cornerRadius = 18.0;
     self.card.layer.borderWidth = 1.0;
     self.card.layer.borderColor = CPBorder().CGColor;
@@ -1745,7 +1820,7 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     ]];
 
     self.leftColumn = [self columnWithBackground:CPBg()];
-    self.middleColumn = [self columnWithBackground:CPSurface()];
+    self.middleColumn = [self columnWithBackground:CPBg()]; // B 版:主区与窗口同底,卡片层次只由 Todo 卡片承载
     // 详情列用命中拦截容器:盖住任务列表时,下层完全不可点击(修复穿透 bug)。
     self.rightColumn = [self barrierColumnWithBackground:CPDyn(0.110, 0.120, 0.160, 0.095, 0.105, 0.140)];
 
@@ -1786,10 +1861,10 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
 
 #pragma mark - Todo Bar (工作台底部常驻栏,参与布局,不 overlay)
 
-// Todo 区(方案 B 精致卡片型)= 一张与"最近活动"同族的卡片:CPSurface 底 + 1px hairline(CPBorder)
-// 描边 + 10px 圆角,四周 12pt 留白,不再像外挂插件。卡片头 = 常驻 30pt 横条
-// (「待办」标签 + 未完成计数 pill + chevron,整条可点);展开内容(输入行 + 滚动列表)排在头部下方。
-// 展开时卡片/窗口整体向下加高,任务区高度不变。
+// Todo 区(方案 B 精致卡片型)= CPBg 工作台上的一张 CPSurface 卡片:1px hairline(8% 白,
+// CPHairline,不是亮一档的 CPBorder)描边 + 10px 圆角,四周 12pt 留白,不再像外挂插件。
+// 卡片头 = 常驻 34pt 横条(「待办」标签 + 未完成计数 pill + chevron,整条可点);
+// 展开内容(输入行 + 滚动列表)排在头部下方。展开时卡片/窗口整体向下加高,任务区高度不变。
 - (void)buildTodoBar {
     NSView *container = [[NSView alloc] initWithFrame:NSZeroRect];
     container.wantsLayer = YES;
@@ -1797,7 +1872,7 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     container.layer.cornerRadius = 10.0;
     container.layer.masksToBounds = YES;
     container.layer.borderWidth = 1.0;
-    container.layer.borderColor = CPBorder().CGColor;
+    container.layer.borderColor = CPHairline().CGColor;
     container.translatesAutoresizingMaskIntoConstraints = NO;
     self.todoContainer = container;
     [self.card addSubview:container];
@@ -1829,14 +1904,14 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     title.maximumNumberOfLines = 1;
     title.translatesAutoresizingMaskIntoConstraints = NO;
 
-    // 未完成计数 pill:muted 底小圆角胶囊,计数只出现在 Todo 区,不进任何提醒聚合。
+    // 未完成计数 pill(B 版):7% 白底小圆角胶囊,10.5pt muted;计数只出现在 Todo 区,不进任何提醒聚合。
     NSView *pill = [[NSView alloc] initWithFrame:NSZeroRect];
     pill.wantsLayer = YES;
     pill.layer.backgroundColor = [CPFg() colorWithAlphaComponent:0.07].CGColor;
-    pill.layer.cornerRadius = 8.0;
+    pill.layer.cornerRadius = 8.0; // 16pt 高胶囊的半高圆角
     pill.translatesAutoresizingMaskIntoConstraints = NO;
     self.todoCountPill = pill;
-    self.todoCountLabel = CPLabel(@"", 11, NSFontWeightRegular, CPMuted());
+    self.todoCountLabel = CPLabel(@"", 10.5, NSFontWeightRegular, CPMuted());
     self.todoCountLabel.maximumNumberOfLines = 1;
     self.todoCountLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [pill addSubview:self.todoCountLabel];
@@ -1878,24 +1953,29 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
         [expanded.heightAnchor constraintEqualToConstant:CPTodoExpandedExtra]
     ]];
 
-    // 输入行:嵌入式圆角字段(比卡片更深的 CPBg 底 + hairline 描边),聚焦时描边变 CPAccent
-    // 并带极淡 accent 光环(见 cpUpdateTodoInputFocus:);回车即新增,空串忽略。
+    // 输入行(B 版):嵌入式圆角字段(22% 黑底 + hairline 描边),左侧常驻「＋」,
+    // 聚焦时描边变 CPAccent 并带极淡 accent 光环(见 cpUpdateTodoInputFocus:);回车即新增,空串忽略。
     NSView *inputWrap = [[NSView alloc] initWithFrame:NSZeroRect];
     inputWrap.wantsLayer = YES;
-    inputWrap.layer.backgroundColor = CPBg().CGColor;
+    inputWrap.layer.backgroundColor = [NSColor colorWithSRGBRed:0.0 green:0.0 blue:0.0 alpha:0.22].CGColor;
     inputWrap.layer.cornerRadius = 8.0;
     inputWrap.layer.borderWidth = 1.0;
-    inputWrap.layer.borderColor = CPBorder().CGColor;
+    inputWrap.layer.borderColor = CPHairline().CGColor;
     inputWrap.translatesAutoresizingMaskIntoConstraints = NO;
     self.todoInputWrap = inputWrap;
     [expanded addSubview:inputWrap];
+
+    NSTextField *plus = CPLabel(@"＋", 13, NSFontWeightRegular, CPMuted());
+    plus.maximumNumberOfLines = 1;
+    plus.translatesAutoresizingMaskIntoConstraints = NO;
+    [inputWrap addSubview:plus];
 
     NSTextField *input = [[NSTextField alloc] initWithFrame:NSZeroRect];
     input.bordered = NO;
     input.bezeled = NO;
     input.drawsBackground = NO;
     input.focusRingType = NSFocusRingTypeNone;
-    input.font = [NSFont systemFontOfSize:12 weight:NSFontWeightRegular];
+    input.font = [NSFont systemFontOfSize:12.5 weight:NSFontWeightRegular];
     input.textColor = CPFg();
     input.placeholderString = @"随手记下待办，回车保存";
     input.target = self;
@@ -1907,14 +1987,16 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     [NSLayoutConstraint activateConstraints:@[
         [inputWrap.leadingAnchor constraintEqualToAnchor:expanded.leadingAnchor constant:12],
         [inputWrap.trailingAnchor constraintEqualToAnchor:expanded.trailingAnchor constant:-12],
-        [inputWrap.topAnchor constraintEqualToAnchor:expanded.topAnchor constant:8],
-        [inputWrap.heightAnchor constraintEqualToConstant:30],
-        [input.leadingAnchor constraintEqualToAnchor:inputWrap.leadingAnchor constant:10],
+        [inputWrap.topAnchor constraintEqualToAnchor:expanded.topAnchor constant:2],
+        [inputWrap.heightAnchor constraintEqualToConstant:32],
+        [plus.leadingAnchor constraintEqualToAnchor:inputWrap.leadingAnchor constant:10],
+        [plus.centerYAnchor constraintEqualToAnchor:inputWrap.centerYAnchor],
+        [input.leadingAnchor constraintEqualToAnchor:plus.trailingAnchor constant:8],
         [input.trailingAnchor constraintEqualToAnchor:inputWrap.trailingAnchor constant:-10],
         [input.centerYAnchor constraintEqualToAnchor:inputWrap.centerYAnchor]
     ]];
 
-    // 列表:纵向滚动、无横向、背景透明;固定 132pt(约 5 行),超出滚动。
+    // 列表:纵向滚动、无横向、背景透明;固定 158pt(5 行 × 30 + 行距),超出滚动。
     NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSZeroRect];
     scroll.translatesAutoresizingMaskIntoConstraints = NO;
     scroll.drawsBackground = NO;
@@ -1935,8 +2017,8 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     [NSLayoutConstraint activateConstraints:@[
         [scroll.leadingAnchor constraintEqualToAnchor:expanded.leadingAnchor constant:8],
         [scroll.trailingAnchor constraintEqualToAnchor:expanded.trailingAnchor constant:-8],
-        [scroll.topAnchor constraintEqualToAnchor:inputWrap.bottomAnchor constant:6],
-        [scroll.heightAnchor constraintEqualToConstant:132],
+        [scroll.topAnchor constraintEqualToAnchor:inputWrap.bottomAnchor constant:8],
+        [scroll.heightAnchor constraintEqualToConstant:158],
         [stack.leadingAnchor constraintEqualToAnchor:scroll.contentView.leadingAnchor],
         [stack.topAnchor constraintEqualToAnchor:scroll.contentView.topAnchor],
         [stack.widthAnchor constraintEqualToAnchor:scroll.contentView.widthAnchor]
@@ -1993,7 +2075,7 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     NSArray<CPTodo *> *todos = [self.todoStore allTodos];
     if (!todos.count) {
         // 空状态:一行 muted 居中小字(文案沿用既有)。
-        NSTextField *empty = CPLabel(@"暂无待办，随手记一条", 11, NSFontWeightRegular, CPMuted());
+        NSTextField *empty = CPLabel(@"暂无待办，随手记一条", 11.5, NSFontWeightRegular, CPMuted());
         empty.alignment = NSTextAlignmentCenter;
         [self.todoStack addArrangedSubview:empty];
         [empty.widthAnchor constraintEqualToAnchor:self.todoStack.widthAnchor].active = YES;
@@ -2016,16 +2098,16 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     row.wantsLayer = YES;
     row.layer.cornerRadius = 6.0;
     row.translatesAutoresizingMaskIntoConstraints = NO;
-    [row.heightAnchor constraintEqualToConstant:28].active = YES;
+    [row.heightAnchor constraintEqualToConstant:CPTodoRowHeight].active = YES;
 
-    // 完成/恢复勾选钮:14pt 圆形勾选框,未完成 hairline 空心圆,勾中后 accent 填充。
+    // 完成/恢复勾选钮(B 版):15pt 圆形勾选框,未完成 muted 空心圆,勾中后绿色 CPGreen 填充。
     NSButton *check = [CPHoverButton buttonWithTitle:@"" target:self action:@selector(toggleTodo:)];
     check.bordered = NO;
     [check setButtonType:NSButtonTypeMomentaryChange];
     check.tag = todo.todoID;
-    check.image = CPSymbol(todo.completed ? @"checkmark.circle.fill" : @"circle", 14,
-                           todo.completed ? CPAccent() : CPMuted());
-    check.contentTintColor = todo.completed ? CPAccent() : CPMuted();
+    check.image = CPSymbol(todo.completed ? @"checkmark.circle.fill" : @"circle", 15,
+                           todo.completed ? CPGreen() : CPMuted());
+    check.contentTintColor = todo.completed ? CPGreen() : CPMuted();
     check.toolTip = todo.completed ? @"恢复为待办" : @"标记完成";
     check.translatesAutoresizingMaskIntoConstraints = NO;
     [check.widthAnchor constraintEqualToConstant:22].active = YES;
@@ -2043,7 +2125,7 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
         edit.wantsLayer = YES;
         edit.layer.cornerRadius = 4.0;
         edit.focusRingType = NSFocusRingTypeNone;
-        edit.font = [NSFont systemFontOfSize:12 weight:NSFontWeightRegular];
+        edit.font = [NSFont systemFontOfSize:12.5 weight:NSFontWeightRegular];
         edit.textColor = CPFg();
         edit.stringValue = todo.title;
         edit.target = self;
@@ -2053,7 +2135,7 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
         self.todoEditField = edit;
         titleView = edit;
     } else {
-        // 标题即按钮:点击进入行内编辑;完成态只降为 muted 灰,不加删除线,保持可读。
+        // 标题即按钮:点击进入行内编辑;B 版配色:未完成正文 CPFg2 次级前景,完成态 muted 灰。
         NSButton *titleButton = [CPHoverButton buttonWithTitle:@"" target:self action:@selector(startTodoEdit:)];
         titleButton.bordered = NO;
         [titleButton setButtonType:NSButtonTypeMomentaryChange];
@@ -2061,8 +2143,8 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
         titleButton.toolTip = @"点击编辑";
         titleButton.translatesAutoresizingMaskIntoConstraints = NO;
         NSMutableDictionary<NSAttributedStringKey, id> *attrs = [NSMutableDictionary dictionary];
-        attrs[NSFontAttributeName] = [NSFont systemFontOfSize:12 weight:NSFontWeightRegular];
-        attrs[NSForegroundColorAttributeName] = todo.completed ? CPMuted() : CPFg();
+        attrs[NSFontAttributeName] = [NSFont systemFontOfSize:12.5 weight:NSFontWeightRegular];
+        attrs[NSForegroundColorAttributeName] = todo.completed ? CPMuted() : CPFg2();
         titleButton.attributedTitle = [[NSAttributedString alloc] initWithString:todo.title attributes:attrs];
         titleButton.alignment = NSTextAlignmentLeft;
         titleButton.lineBreakMode = NSLineBreakByTruncatingTail;
@@ -2070,12 +2152,26 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     }
     [row addSubview:titleView];
 
-    // 删除钮:24pt 行尾小图标,平时透明,仅 hover 该行时出现;hover 图标本身时变红(见 CPTodoDeleteButton)。
+    // 行尾动作组(B 版):编辑铅笔 + 删除垃圾桶,平时透明,仅 hover 该行时同时出现。
+    NSButton *editBtn = [CPTodoEditButton buttonWithTitle:@"" target:self action:@selector(startTodoEdit:)];
+    editBtn.bordered = NO;
+    [editBtn setButtonType:NSButtonTypeMomentaryChange];
+    editBtn.tag = todo.todoID;
+    editBtn.image = CPSymbol(@"pencil", 11, CPMuted());
+    editBtn.contentTintColor = CPMuted();
+    editBtn.alphaValue = 0.0;
+    editBtn.toolTip = @"编辑";
+    editBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [editBtn.widthAnchor constraintEqualToConstant:24].active = YES;
+    [editBtn.heightAnchor constraintEqualToConstant:24].active = YES;
+    [row addSubview:editBtn];
+    row.cpEditButton = editBtn;
+
     NSButton *delete = [CPTodoDeleteButton buttonWithTitle:@"" target:self action:@selector(deleteTodo:)];
     delete.bordered = NO;
     [delete setButtonType:NSButtonTypeMomentaryChange];
     delete.tag = todo.todoID;
-    delete.image = CPSymbol(@"xmark", 10, CPMuted());
+    delete.image = CPSymbol(@"trash", 11, CPMuted());
     delete.contentTintColor = CPMuted();
     delete.alphaValue = 0.0;
     delete.toolTip = @"删除";
@@ -2086,20 +2182,22 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     row.cpDeleteButton = delete;
 
     [NSLayoutConstraint activateConstraints:@[
-        [check.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:4],
+        [check.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:8],
         [check.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [titleView.leadingAnchor constraintEqualToAnchor:check.trailingAnchor constant:6],
+        [titleView.leadingAnchor constraintEqualToAnchor:check.trailingAnchor constant:9],
         [titleView.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [delete.leadingAnchor constraintEqualToAnchor:titleView.trailingAnchor constant:4],
-        [delete.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-2],
+        [editBtn.leadingAnchor constraintEqualToAnchor:titleView.trailingAnchor constant:4],
+        [delete.leadingAnchor constraintEqualToAnchor:editBtn.trailingAnchor constant:2],
+        [delete.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-4],
+        [editBtn.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
         [delete.centerYAnchor constraintEqualToAnchor:row.centerYAnchor]
     ]];
     return row;
 }
 
-// Todo 输入框聚焦态:描边变 CPAccent + 极淡 accent 光环;失焦恢复 hairline。
+// Todo 输入框聚焦态:描边变 CPAccent + 极淡 accent 光环;失焦恢复 8% 白 hairline。
 - (void)cpUpdateTodoInputFocus:(BOOL)focused {
-    self.todoInputWrap.layer.borderColor = (focused ? CPAccent() : CPBorder()).CGColor;
+    self.todoInputWrap.layer.borderColor = (focused ? CPAccent() : CPHairline()).CGColor;
     self.todoInputWrap.layer.shadowColor = [CPAccent() colorWithAlphaComponent:0.16].CGColor;
     self.todoInputWrap.layer.shadowOpacity = focused ? 1.0 : 0.0;
     self.todoInputWrap.layer.shadowRadius = 3.0;
@@ -3349,8 +3447,11 @@ static const CGFloat CPBarWorkbenchWidth = 82.0;
     BOOL orbVisible = (self.mode == 0 && !self.docked && !self.floatingPill.hidden);
     self.orbRippleView.hidden = !orbVisible;
     if (!orbVisible) {
+        // 悬浮球不可见:移除全部无限涟漪(不可见时不参与合成),并作废参数缓存,
+        // 下次可见时 updateRipples 一定全量重应用。
         for (CAShapeLayer *ring in self.orbRippleView.rippleLayers) [ring removeAllAnimations];
         for (CAShapeLayer *ring in self.orbRippleView.rippleTroughLayers) [ring removeAllAnimations];
+        [self.orbRippleView invalidateRippleCache];
         return;
     }
     self.orbRippleView.displayStatus = CPDisplayStatusForAgents(self.agents, self.reviewStore);
@@ -3893,9 +3994,16 @@ static const CGFloat CPHUDAgentRail = 64.0;
     self.handleView.frame = NSMakeRect(x, y, width, height);
 }
 
+- (void)cpSetRailAnimationsPaused:(BOOL)paused {
+    for (NSView *v in self.agentList.arrangedSubviews) {
+        if ([v isKindOfClass:CPAgentStatusButton.class]) ((CPAgentStatusButton *)v).animationsPaused = paused;
+    }
+}
+
 - (void)expand {
     if (self.expanded) return;
     self.expanded = YES;
+    [self cpSetRailAnimationsPaused:NO]; // 可见:恢复涟漪
     NSUInteger gen = ++self.transitionGen;
     self.visualView.alphaValue = 0.0;
     self.visualView.hidden = NO;
@@ -3934,6 +4042,7 @@ static const CGFloat CPHUDAgentRail = 64.0;
         if (gen != self.transitionGen) return; // 期间已重新展开,放弃本次收尾
         self.visualView.hidden = YES;
         self.visualView.alphaValue = 1.0;
+        [self cpSetRailAnimationsPaused:YES]; // 不可见:暂停 8 层无限涟漪,不再参与合成
         self.handleView.layer.backgroundColor = [CPAccent() colorWithAlphaComponent:0.58].CGColor;
         self.handleView.layer.borderWidth = 0.0;
         self.handleView.layer.cornerRadius = CPHUDHandleVisualWidth / 2.0;
@@ -4011,6 +4120,8 @@ static const CGFloat CPHUDAgentRail = 64.0;
         [btn.heightAnchor constraintEqualToConstant:30].active = YES;
         [self.agentList addArrangedSubview:btn];
     }
+    // HUD 收起时 rail 不可见:暂停全部无限涟漪,不参与合成;展开时恢复。
+    [self cpSetRailAnimationsPaused:!self.expanded];
 
     // Task list
     while (self.taskList.arrangedSubviews.count > 0) {
@@ -4279,6 +4390,48 @@ static const CGFloat CPHUDAgentRail = 64.0;
 
 @end
 
+#pragma mark - Refresh Pipeline (性能:后台读取 + 合并 + 签名跳过)
+
+// 可见数据签名:逐 agent/task 拼接会影响界面的字段(id/状态/更新时间/tokens/标题/活动)。
+// 后台读出的新数据与已应用签名一致时,跳过工作台/Dock/HUD/菜单全部重建——
+// 否则每 3s 反复拆建 AppKit 视图、重挂 8 层无限涟漪,是主线程卡顿与 CPU 的主要来源之一。
+static NSString *CPAgentsSignature(NSArray<CPAgent *> *agents) {
+    NSMutableString *sig = [NSMutableString string];
+    for (CPAgent *a in agents) {
+        [sig appendFormat:@"A:%@|%d|", a.agentID, (int)a.status];
+        for (CPTask *t in a.tasks) {
+            [sig appendFormat:@"T:%@|%d|%.3f|%ld|%tu|%tu;",
+                              t.taskID, (int)t.status, t.updatedAt.timeIntervalSince1970,
+                              (long)t.tokensUsed, t.title.hash, t.activity.hash];
+        }
+    }
+    return sig;
+}
+
+// 刷新闸门(仅主线程使用):同一时刻最多一个后台读取;读取期间到达的请求合并为一次 pending,
+// 结束后补跑一次,过期结果不会覆盖更新的读取。
+@interface CPRefreshGate : NSObject
+@property (nonatomic, readonly) BOOL inFlight;
+- (BOOL)beginRefresh;                 // YES=获准执行;NO=已有读取在途(本次请求被合并为 pending)
+- (BOOL)endRefreshAndShouldRunAgain;  // 结束当前读取;YES=期间有合并请求,需要再补跑一次
+@end
+@implementation CPRefreshGate {
+    BOOL _inFlight;
+    BOOL _pending;
+}
+- (BOOL)beginRefresh {
+    if (_inFlight) { _pending = YES; return NO; }
+    _inFlight = YES;
+    return YES;
+}
+- (BOOL)endRefreshAndShouldRunAgain {
+    _inFlight = NO;
+    BOOL again = _pending;
+    _pending = NO;
+    return again;
+}
+@end
+
 #pragma mark - App Delegate
 
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSPopoverDelegate>
@@ -4293,6 +4446,12 @@ static const CGFloat CPHUDAgentRail = 64.0;
 @property NSArray<CPAgent *> *agents;
 @property BOOL hudVisualTest; // --visual-test-hud
 @property BOOL detailVisualTest; // --visual-test-detail
+@property dispatch_queue_t refreshQueue;          // 串行后台队列:SQLite/rollout 读取不阻塞主线程
+@property CPRefreshGate *refreshGate;             // 同一时刻最多一个读取,多余的合并为 pending
+@property NSUInteger refreshGeneration;           // 读取代际:过期结果不覆盖更新的读取
+@property NSString *lastAppliedSignature;         // 已应用数据的签名:一致则跳过全部重建
+@property NSInteger appliedRefreshCount;          // 实际执行渲染的轮次(自测断言用)
+- (void)applyAgents:(NSArray<CPAgent *> *)agents signature:(NSString *)signature;
 @end
 
 @implementation AppDelegate
@@ -4301,7 +4460,11 @@ static const CGFloat CPHUDAgentRail = 64.0;
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
 
     self.reader = CPStateReader.new;
-    self.agents = [self.reader readAgents];
+    self.refreshQueue = dispatch_queue_create("com.codexpulse.refresh", DISPATCH_QUEUE_SERIAL);
+    self.refreshGate = CPRefreshGate.new;
+    // 首帧不在主线程做昂贵读取:先以空数据建 UI,启动后立即由 refresh 走后台队列填充。
+    self.agents = @[];
+    self.lastAppliedSignature = CPAgentsSignature(self.agents);
 
     self.statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSSquareStatusItemLength];
     self.statusItem.button.image = [NSImage imageWithSystemSymbolName:@"sparkles" accessibilityDescription:@"Codex Pulse"];
@@ -4336,6 +4499,8 @@ static const CGFloat CPHUDAgentRail = 64.0;
         [self.hud expand];
     }
     if (self.detailVisualTest) { // --visual-test-detail: 打开工作台并展示一条真实任务详情
+        // 截图模式需要同步拿到真实数据,一次性同步读取(非主路径,不进入常态刷新)。
+        [self applyAgents:[self.reader readAgents] signature:nil];
         [self showCard];
         CPAgent *a = self.card.selectedAgent;
         if (a.tasks.count) {
@@ -4373,6 +4538,7 @@ static const CGFloat CPHUDAgentRail = 64.0;
     }];
 
     self.timer = [NSTimer scheduledTimerWithTimeInterval:3.0 target:self selector:@selector(refresh:) userInfo:nil repeats:YES];
+    [self refresh:nil]; // 首帧数据后台读取填充(闸门+串行队列),启动主线程不被 SQLite/rollout 阻塞
 }
 
 - (NSMenu *)statusMenu {
@@ -4407,12 +4573,46 @@ static const CGFloat CPHUDAgentRail = 64.0;
     [self.card showNearDockRect:dockRect edge:self.dock.dockEdge];
 }
 
+// 每 3s tick:昂贵的 state/logs SQLite 查询与 rollout 尾部解析全部在串行后台队列执行,
+// 主线程只做合入与渲染。闸门保证最多一个在途读取,过期代际结果被丢弃。
 - (void)refresh:(id)sender {
-    self.agents = [self.reader readAgents];
-    self.popoverController.agents = self.agents;
-    [self.card renderAgents:self.agents];
-    [self.dock renderWithAgents:self.agents selectedAgent:self.card.selectedAgent];
-    [self.hud updateWithAgents:self.agents selectedAgent:self.card.selectedAgent];
+    (void)sender;
+    if (!self.refreshGate) { // 自测中手工构造的 AppDelegate 无队列,退化为同步路径
+        [self applyAgents:[self.reader readAgents] signature:nil];
+        return;
+    }
+    if (![self.refreshGate beginRefresh]) return; // 合并:已有读取在途
+    NSUInteger generation = ++self.refreshGeneration;
+    CPStateReader *reader = self.reader;
+    dispatch_queue_t queue = self.refreshQueue;
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(queue, ^{
+        NSArray<CPAgent *> *agents = [reader readAgents]; // 后台:IO + JSON 解析
+        NSString *signature = CPAgentsSignature(agents);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            AppDelegate *strongSelf = weakSelf;
+            if (!strongSelf) return; // 生命周期安全:app 退出后不再触达 UI
+            BOOL runAgain = [strongSelf.refreshGate endRefreshAndShouldRunAgain];
+            if (generation == strongSelf.refreshGeneration) { // 过期结果不覆盖
+                [strongSelf applyAgents:agents signature:signature];
+            }
+            if (runAgain) [strongSelf refresh:nil];
+        });
+    });
+}
+
+// 数据无可见变化(签名一致)时跳过工作台/Dock/HUD/菜单栏全部重建,
+// 不再每 3s 反复拆建视图与动画;签名变化才走完整渲染。UI 更新恒在主线程(调用方保证)。
+- (void)applyAgents:(NSArray<CPAgent *> *)agents signature:(NSString *)signature {
+    NSString *sig = signature ?: CPAgentsSignature(agents);
+    if (self.lastAppliedSignature && [sig isEqualToString:self.lastAppliedSignature]) return;
+    self.lastAppliedSignature = sig;
+    self.appliedRefreshCount += 1;
+    self.agents = agents;
+    self.popoverController.agents = agents;
+    [self.card renderAgents:agents];
+    [self.dock renderWithAgents:agents selectedAgent:self.card.selectedAgent];
+    [self.hud updateWithAgents:agents selectedAgent:self.card.selectedAgent];
     [self updateStatusBar];
 }
 
@@ -4904,6 +5104,7 @@ int main(int argc, const char *argv[]) {
             BOOL hudNoDupButtons = hud3.agentList.arrangedSubviews.count == 1;
             CPAgentStatusButton *hBtn = (CPAgentStatusButton *)hud3.agentList.arrangedSubviews.firstObject;
             hBtn.reduceMotion = NO;
+            hBtn.animationsPaused = NO; // HUD 收起默认暂停涟漪;本用例直接驱动按钮,先解除暂停
             for (NSInteger i = 0; i < 3; i++) {
                 [hBtn updateWithAgent:hAgent displayStatus:CPDisplayStatusWorking selected:YES];
             }
@@ -5639,11 +5840,14 @@ int main(int argc, const char *argv[]) {
             BOOL todoNoOverlay = fabs(todoBody.frame.origin.y - NSMaxY(todoCard.todoContainer.frame)) <= 0.5;
             todoCard.todoExpanded = YES;
             [todoCard applyTodoExpandedState];
+            // 展开时窗口 setFrame:animate:YES,先泵 runloop 等动画收尾,断言不读到中间帧。
+            [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.6]];
             NSScreen *todoScreen = todoCard.window.screen ?: NSScreen.screens.firstObject ?: NSScreen.mainScreen;
-            BOOL todoAutoReposition = !todoScreen ||
-                (fabs(NSMidX(todoCard.window.frame) - NSMidX(todoScreen.visibleFrame)) <= 1.0 &&
-                 fabs(NSMidY(todoCard.window.frame) - NSMidY(todoScreen.visibleFrame)) <= 1.0 &&
-                 NSContainsRect(todoScreen.visibleFrame, todoCard.window.frame));
+            // 与生产同一套定位契约:展开后窗口必须等于 CPCenteredRectInVisibleFrame 的结果
+            // (空间不足时按 20pt 安全边距钳制,而非越出屏幕);不再用"必须绝对居中"的过时假设。
+            NSRect todoExpected = todoScreen ? CPCenteredRectInVisibleFrame(todoScreen.visibleFrame,
+                                                                            todoCard.window.frame.size) : NSZeroRect;
+            BOOL todoAutoReposition = !todoScreen || NSEqualRects(todoCard.window.frame, todoExpected);
             BOOL todoExpand = !todoCard.todoExpandedContent.hidden &&
                               fabs(todoCard.todoHeightConstraint.constant - (CPTodoCollapsedHeight + CPTodoExpandedExtra)) <= 0.5 &&
                               fabs(todoCard.window.frame.size.height - (todoCard.cardHeight + CPWorkbenchInset * 2.0)) <= 0.5;
@@ -5671,11 +5875,140 @@ int main(int argc, const char *argv[]) {
             NSInteger badgeBefore = CPBadgeCountForAgents(@[todoBadgeAgent], todoBadgeReview);
             [todoCard.todoStore addTodoWithTitle:@"不应计入角标"];
             BOOL todoBadgeIsolated = badgeBefore == CPBadgeCountForAgents(@[todoBadgeAgent], todoBadgeReview);
+
+            // 方案 B 视觉 token/结构断言(对照原型 .vB,非注释宣称)
+            // 层次:工作台 CPBg 底 + Todo 卡片 CPSurface,两色必须不同,层次真实存在。
+            BOOL todoLayeringOK = CGColorEqualToColor(todoCard.card.layer.backgroundColor, CPBg().CGColor) &&
+                                  CGColorEqualToColor(todoCard.todoContainer.layer.backgroundColor, CPSurface().CGColor) &&
+                                  !CGColorEqualToColor(todoCard.card.layer.backgroundColor,
+                                                       todoCard.todoContainer.layer.backgroundColor);
+            // hairline:卡片/输入框描边为 8% 白 CPHairline,且不等于亮一档的 CPBorder。
+            NSColor *hairlineDark = resolveWith(CPHairline(), darkApp);
+            BOOL todoHairlineOK = hairlineDark && fabs(hairlineDark.alphaComponent - 0.08) < 0.01 &&
+                                  fabs(hairlineDark.redComponent - 1.0) < 0.01 &&
+                                  CGColorEqualToColor(todoCard.todoContainer.layer.borderColor, CPHairline().CGColor) &&
+                                  CGColorEqualToColor(todoCard.todoInputWrap.layer.borderColor, CPHairline().CGColor) &&
+                                  !CGColorEqualToColor(todoCard.todoContainer.layer.borderColor, CPBorder().CGColor);
+            // 输入聚焦:描边 CPAccent + 光环;失焦恢复 hairline。
+            [todoCard cpUpdateTodoInputFocus:YES];
+            BOOL todoFocusOK = CGColorEqualToColor(todoCard.todoInputWrap.layer.borderColor, CPAccent().CGColor) &&
+                               todoCard.todoInputWrap.layer.shadowOpacity > 0.0;
+            [todoCard cpUpdateTodoInputFocus:NO];
+            todoFocusOK = todoFocusOK &&
+                          CGColorEqualToColor(todoCard.todoInputWrap.layer.borderColor, CPHairline().CGColor);
+            // 输入框左侧常驻「＋」,且排在输入框左边。
+            [todoCard.todoInputWrap layoutSubtreeIfNeeded];
+            NSTextField *plusLabel = nil;
+            for (NSView *v in todoCard.todoInputWrap.subviews) {
+                if ([v isKindOfClass:NSTextField.class] && [((NSTextField *)v).stringValue isEqualToString:@"＋"]) plusLabel = (NSTextField *)v;
+            }
+            BOOL todoPlusOK = plusLabel != nil && NSMaxX(plusLabel.frame) <= NSMinX(todoCard.todoInput.frame) + 0.5;
+            // 行结构:hover 同时放行编辑铅笔 + 删除垃圾桶,非 hover 全隐藏;行高 30。
+            [todoCard renderTodos];
+            CPTodoRowView *rowB = (CPTodoRowView *)todoCard.todoStack.arrangedSubviews.firstObject;
+            BOOL todoRowActionsOK = [rowB isKindOfClass:CPTodoRowView.class] &&
+                                    rowB.cpEditButton != nil && rowB.cpDeleteButton != nil &&
+                                    rowB.cpEditButton.alphaValue == 0.0 && rowB.cpDeleteButton.alphaValue == 0.0;
+            NSEvent *rowNilEvent = nil; // 仅触发行 hover 状态翻转,事件本身不被使用
+            [rowB mouseEntered:rowNilEvent];
+            todoRowActionsOK = todoRowActionsOK &&
+                               rowB.cpEditButton.alphaValue == 1.0 && rowB.cpDeleteButton.alphaValue == 1.0 &&
+                               CGColorGetAlpha(rowB.layer.backgroundColor) > 0.02;
+            [rowB mouseExited:rowNilEvent];
+            todoRowActionsOK = todoRowActionsOK &&
+                               rowB.cpEditButton.alphaValue == 0.0 && rowB.cpDeleteButton.alphaValue == 0.0;
+            [todoCard.card layoutSubtreeIfNeeded];
+            BOOL todoSizesOK = CPTodoStripHeight >= 32.0 &&
+                               fabs(rowB.frame.size.height - CPTodoRowHeight) <= 0.5 && CPTodoRowHeight >= 30.0;
+            // 勾选配色:未完成 muted 空心、完成 CPGreen;正文未完成 CPFg2、完成 muted。
+            NSButton *checkPending = nil, *titlePending = nil;
+            for (NSView *v in rowB.subviews) {
+                if (![v isKindOfClass:NSButton.class]) continue;
+                NSButton *b = (NSButton *)v;
+                if (b.action == @selector(toggleTodo:)) checkPending = b;
+                else if (b.action == @selector(startTodoEdit:) && [b isMemberOfClass:CPHoverButton.class]) titlePending = b;
+            }
+            NSColor *pendingTitleColor = [titlePending.attributedTitle attribute:NSForegroundColorAttributeName
+                                                                         atIndex:0 effectiveRange:NULL];
+            BOOL todoColorsOK = checkPending && titlePending &&
+                                CGColorEqualToColor(checkPending.contentTintColor.CGColor, CPMuted().CGColor) &&
+                                CGColorEqualToColor(pendingTitleColor.CGColor, CPFg2().CGColor);
+            [todoCard.todoStore setTodo:checkPending.tag completed:YES];
+            [todoCard renderTodos];
+            CPTodoRowView *rowDone = (CPTodoRowView *)todoCard.todoStack.arrangedSubviews.lastObject; // 完成沉底
+            NSButton *checkDone = nil, *titleDone = nil;
+            for (NSView *v in rowDone.subviews) {
+                if (![v isKindOfClass:NSButton.class]) continue;
+                NSButton *b = (NSButton *)v;
+                if (b.action == @selector(toggleTodo:)) checkDone = b;
+                else if (b.action == @selector(startTodoEdit:) && [b isMemberOfClass:CPHoverButton.class]) titleDone = b;
+            }
+            NSColor *doneTitleColor = [titleDone.attributedTitle attribute:NSForegroundColorAttributeName
+                                                                   atIndex:0 effectiveRange:NULL];
+            todoColorsOK = todoColorsOK && checkDone && titleDone &&
+                           CGColorEqualToColor(checkDone.contentTintColor.CGColor, CPGreen().CGColor) &&
+                           CGColorEqualToColor(doneTitleColor.CGColor, CPMuted().CGColor);
+            // 计数 pill:10.5pt;空库:空状态文案 + pill 收起(新控制器 = 新的隔离空库)。
+            BOOL todoPillOK = fabs(todoCard.todoCountLabel.font.pointSize - 10.5) < 0.1;
+            CPWorkbenchCardController *emptyCard = CPWorkbenchCardController.new;
+            emptyCard.todoExpanded = YES;
+            [emptyCard applyTodoExpandedState];
+            NSView *emptyRow = emptyCard.todoStack.arrangedSubviews.firstObject;
+            BOOL todoEmptyOK = emptyCard.todoStack.arrangedSubviews.count == 1 &&
+                               [emptyRow isKindOfClass:NSTextField.class] &&
+                               [((NSTextField *)emptyRow).stringValue isEqualToString:@"暂无待办，随手记一条"] &&
+                               emptyCard.todoCountPill.hidden;
+            [emptyCard.window orderOut:nil];
+            BOOL todoBStyle = todoLayeringOK && todoHairlineOK && todoFocusOK && todoPlusOK &&
+                              todoRowActionsOK && todoSizesOK && todoColorsOK && todoPillOK && todoEmptyOK;
             [todoCard.window orderOut:nil];
 
             BOOL todoUI = todoAdd && todoBlankIgnored && todoComplete && todoRestore && todoEdit && todoDelete &&
                           todoPersist && todoAgentNull && todoStrip && todoNoOverlay && todoExpand &&
-                          todoAutoReposition && todoExpandNoOverlay && todoCardStyle && todoUICount && todoBadgeIsolated;
+                          todoAutoReposition && todoExpandNoOverlay && todoCardStyle && todoUICount && todoBadgeIsolated &&
+                          todoBStyle;
+
+            // Perf UI: 同签名跳过渲染、状态变化触发渲染(AppDelegate 合入路径,无窗口亦可断言计数)
+            AppDelegate *perfDelegate = AppDelegate.new;
+            CPAgent *perfA1 = CPTestAgent(@"perf-agent", @[CPTestTask(@"p1", CPStatusWorking, 100)]);
+            NSString *perfSig1 = CPAgentsSignature(@[perfA1]);
+            [perfDelegate applyAgents:@[perfA1] signature:perfSig1];
+            [perfDelegate applyAgents:@[perfA1] signature:perfSig1]; // 同签名:必须跳过
+            CPAgent *perfA2 = CPTestAgent(@"perf-agent", @[CPTestTask(@"p1", CPStatusCompleted, 200)]);
+            [perfDelegate applyAgents:@[perfA2] signature:CPAgentsSignature(@[perfA2])]; // 变化:必须渲染
+            BOOL perfSkipOK = perfDelegate.appliedRefreshCount == 2;
+
+            // Perf UI: 8 层无限涟漪的去抖与可见性暂停
+            // 相同参数重复 updateRipples 不重建动画(对象同一,相位不重启);参数变化才重建。
+            CPRippleView *rvPerf = [[CPRippleView alloc] initWithRingDiameter:52 lineWidth:0.75];
+            rvPerf.displayStatus = CPDisplayStatusWorking;
+            [rvPerf updateRipples];
+            CAAnimation *firstRun = [rvPerf.rippleLayers.firstObject animationForKey:@"ripple0"];
+            [rvPerf updateRipples];
+            BOOL rippleNoRestart = firstRun != nil &&
+                                   firstRun == [rvPerf.rippleLayers.firstObject animationForKey:@"ripple0"];
+            rvPerf.displayStatus = CPDisplayStatusFailed;
+            [rvPerf updateRipples];
+            BOOL rippleRestartsOnChange = firstRun != [rvPerf.rippleLayers.firstObject animationForKey:@"ripple0"];
+            // HUD rail:收起(默认)时涟漪暂停、展开时恢复(可见性驱动,保留设计效果)。
+            CPHUDWindowController *hudPerf = CPHUDWindowController.new;
+            CPAgent *perfHudAgent = CPTestAgent(@"perf-hud", @[CPTestTask(@"ph1", CPStatusWorking, 1)]);
+            [hudPerf updateWithAgents:@[perfHudAgent] selectedAgent:perfHudAgent];
+            CPAgentStatusButton *perfBtn = (CPAgentStatusButton *)hudPerf.agentList.arrangedSubviews.firstObject;
+            BOOL hudPausedWhenCollapsed = perfBtn.animationsPaused &&
+                                          perfBtn.rippleLayers.firstObject.animationKeys.count == 0;
+            perfBtn.reduceMotion = NO; // 排除系统 reduce-motion 干扰,断言确定性
+            [hudPerf.window orderFrontRegardless]; // 窗口不可见时动画 completion 不会回投,收起收尾收不到
+            [hudPerf expand];
+            BOOL hudResumesOnExpand = !perfBtn.animationsPaused &&
+                                      perfBtn.rippleLayers.firstObject.animationKeys.count > 0;
+            [hudPerf collapse];
+            [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.6]];
+            BOOL hudRepausesOnCollapse = perfBtn.animationsPaused &&
+                                         perfBtn.rippleLayers.firstObject.animationKeys.count == 0;
+            [hudPerf.window orderOut:nil];
+            BOOL perfUI = perfSkipOK && rippleNoRestart && rippleRestartsOnChange &&
+                          hudPausedWhenCollapsed && hudResumesOnExpand && hudRepausesOnCollapse;
 
             BOOL passed = centered && draggableHeader && labeledWorkbench && onlyRealAgents && labeledAgent && buttonReceivesClick &&
                           agentStatusDotsAligned && attentionBadgeClearsOnOpen &&
@@ -5684,7 +6017,7 @@ int main(int argc, const char *argv[]) {
                           hudCollapsed6x72 && hudCollapsedOnMainScreen && hudExpandedSizeOK && hudExpandedOnMainScreen &&
                           shadowCarrierScales && handleAnchoredTopRight && contentNotSizable && hudClickViewIsBackgroundView &&
                           hudVisualFrameExact && hudExpandedHandleHidden && m2ui && m3ui && m3entries && m4ui && m5ui && m7ui && m8ui && m9ui && m10ui &&
-                          hoverResidualOK && todoUI;
+                          hoverResidualOK && todoUI && perfUI;
             NSMutableString *result = [NSMutableString stringWithFormat:
                 @"Codex Pulse UI self-test: center=%@ drag=%@ workbench-label=%@ real-agents=%@ agent-label=%@ button-hit=%@ "
                 @"card-mask=%@ carrier-mask=%@ card-child=%@ win-inset=%@ card-520x402=%@ two-column=%@ right-overlay=%@ "
@@ -5849,9 +6182,30 @@ int main(int argc, const char *argv[]) {
                 todoCardStyle ? @"OK" : @"FAIL",
                 todoUICount ? @"OK" : @"FAIL",
                 todoBadgeIsolated ? @"OK" : @"FAIL"];
+            [result appendFormat:@"Todo B self-test: layering=%@ hairline=%@ focus=%@ plus=%@ row-actions=%@ sizes=%@ colors=%@ pill=%@ empty=%@\n",
+                todoLayeringOK ? @"OK" : @"FAIL",
+                todoHairlineOK ? @"OK" : @"FAIL",
+                todoFocusOK ? @"OK" : @"FAIL",
+                todoPlusOK ? @"OK" : @"FAIL",
+                todoRowActionsOK ? @"OK" : @"FAIL",
+                todoSizesOK ? @"OK" : @"FAIL",
+                todoColorsOK ? @"OK" : @"FAIL",
+                todoPillOK ? @"OK" : @"FAIL",
+                todoEmptyOK ? @"OK" : @"FAIL"];
+            [result appendFormat:@"Perf UI self-test: signature-skip=%@ ripple-no-restart=%@ ripple-restart-on-change=%@ hud-paused-collapsed=%@ hud-resume-expand=%@ hud-repause-collapse=%@\n",
+                perfSkipOK ? @"OK" : @"FAIL",
+                rippleNoRestart ? @"OK" : @"FAIL",
+                rippleRestartsOnChange ? @"OK" : @"FAIL",
+                hudPausedWhenCollapsed ? @"OK" : @"FAIL",
+                hudResumesOnExpand ? @"OK" : @"FAIL",
+                hudRepausesOnCollapse ? @"OK" : @"FAIL"];
             if (!centered) {
                 [result appendFormat:@"  diagnostic: testVisible=%@ cardFrame=%@ hasScreen=%@\n",
                  NSStringFromRect(testVisible), NSStringFromRect(cardFrame), hasScreen ? @"YES" : @"NO"];
+            }
+            if (!todoAutoReposition) {
+                [result appendFormat:@"  diagnostic: todoScreen=%@ todoWindow=%@\n",
+                 NSStringFromRect(todoScreen.visibleFrame), NSStringFromRect(todoCard.window.frame)];
             }
             fputs(result.UTF8String, stdout);
             fflush(stdout);
@@ -6009,7 +6363,64 @@ int main(int argc, const char *argv[]) {
                 ctMdLink ? @"OK" : @"FAIL", ctMdMulti ? @"OK" : @"FAIL",
                 ctBareURI ? @"OK" : @"FAIL", ctMdTrunc ? @"OK" : @"FAIL"];
             fputs(m6line.UTF8String, stdout);
-            return (taskCount > 0 && internalThreadsFiltered && m2 && taskRoutingOK && m6) ? 0 : 2;
+
+            // Perf: 刷新合并闸门 / 可见数据签名 / rollout 解析缓存(确定性行为断言,无 profiling 日志)
+            CPRefreshGate *gate = CPRefreshGate.new;
+            BOOL gateOK = [gate beginRefresh] &&                    // 首个请求获准
+                          gate.inFlight &&
+                          ![gate beginRefresh] &&                   // 在途时第二个请求被合并
+                          [gate endRefreshAndShouldRunAgain] &&     // 合并的 pending 要求补跑
+                          [gate beginRefresh] &&
+                          ![gate endRefreshAndShouldRunAgain] &&    // 无 pending 不补跑
+                          !gate.inFlight;
+            CPAgent *sigA = CPTestAgent(@"sig", @[CPTestTask(@"s1", CPStatusWorking, 100)]);
+            CPAgent *sigB = CPTestAgent(@"sig", @[CPTestTask(@"s1", CPStatusWorking, 100)]);
+            BOOL sigSame = [CPAgentsSignature(@[sigA]) isEqualToString:CPAgentsSignature(@[sigB])];
+            CPAgent *sigStatus = CPTestAgent(@"sig", @[CPTestTask(@"s1", CPStatusCompleted, 100)]);
+            CPAgent *sigTime = CPTestAgent(@"sig", @[CPTestTask(@"s1", CPStatusWorking, 200)]);
+            CPTask *sigTokensTask = CPTestTask(@"s1", CPStatusWorking, 100);
+            sigTokensTask.tokensUsed = 42;
+            CPAgent *sigTokens = CPTestAgent(@"sig", @[sigTokensTask]);
+            BOOL sigDiff = ![CPAgentsSignature(@[sigA]) isEqualToString:CPAgentsSignature(@[sigStatus])] &&
+                           ![CPAgentsSignature(@[sigA]) isEqualToString:CPAgentsSignature(@[sigTime])] &&
+                           ![CPAgentsSignature(@[sigA]) isEqualToString:CPAgentsSignature(@[sigTokens])];
+
+            NSString *rollPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"codexpulse-rollout-cache-test.jsonl"];
+            [[NSFileManager defaultManager] removeItemAtPath:rollPath error:nil];
+            [@"{\"type\":\"event_msg\",\"timestamp\":\"2026-08-10T15:00:00.000Z\",\"payload\":{\"type\":\"task_started\"}}\n"
+                writeToFile:rollPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            CPStateReader *cacheReader = CPStateReader.new;
+            CPRolloutState *rs1 = [cacheReader rolloutStateForPath:rollPath];
+            CPRolloutState *rs2 = [cacheReader rolloutStateForPath:rollPath];
+            BOOL rollCacheHit = rs1 && rs1 == rs2 && rs1.lastStarted != nil; // 文件未变:复用同一解析结果
+            NSString *rollExisting = [NSString stringWithContentsOfFile:rollPath encoding:NSUTF8StringEncoding error:nil];
+            [[rollExisting stringByAppendingString:
+              @"{\"type\":\"event_msg\",\"timestamp\":\"2026-08-10T15:01:00.000Z\",\"payload\":{\"type\":\"task_complete\"}}\n"]
+                writeToFile:rollPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            CPRolloutState *rs3 = [cacheReader rolloutStateForPath:rollPath];
+            BOOL rollCacheInvalidate = rs3 && rs3 != rs1 && rs3.lastComplete != nil; // 文件变化:重新解析
+            [[NSFileManager defaultManager] removeItemAtPath:rollPath error:nil];
+
+            BOOL perfOK = gateOK && sigSame && sigDiff && rollCacheHit && rollCacheInvalidate;
+
+            // 回归:占位 Agent 的示例数据必须在会话内静态,两轮 readAgents 的签名一致,
+            // 否则静态数据也会每 3s 变签名、签名跳过机制失效(曾用 NSDate.date 作 updatedAt)。
+            CPStateReader *stabReader = CPStateReader.new;
+            NSArray<CPAgent *> *stabR1 = [stabReader readAgents];
+            NSArray<CPAgent *> *stabR2 = [stabReader readAgents];
+            CPAgent *ph1 = nil, *ph2 = nil;
+            for (CPAgent *a in stabR1) if (a.placeholder) ph1 = a;
+            for (CPAgent *a in stabR2) if (a.placeholder) ph2 = a;
+            BOOL placeholderSigStable = ph1 && ph2 &&
+                                        [CPAgentsSignature(@[ph1]) isEqualToString:CPAgentsSignature(@[ph2])];
+            perfOK = perfOK && placeholderSigStable;
+            NSString *perfLine = [NSString stringWithFormat:
+                @"Perf self-test: refresh-gate=%@ signature-same=%@ signature-diff=%@ rollout-cache-hit=%@ rollout-cache-invalidate=%@ placeholder-signature-stable=%@\n",
+                gateOK ? @"OK" : @"FAIL", sigSame ? @"OK" : @"FAIL", sigDiff ? @"OK" : @"FAIL",
+                rollCacheHit ? @"OK" : @"FAIL", rollCacheInvalidate ? @"OK" : @"FAIL",
+                placeholderSigStable ? @"OK" : @"FAIL"];
+            fputs(perfLine.UTF8String, stdout);
+            return (taskCount > 0 && internalThreadsFiltered && m2 && taskRoutingOK && m6 && perfOK) ? 0 : 2;
         }
         if (CPAnotherInstanceIsRunning()) return 0;
         NSApplication *app = NSApplication.sharedApplication;
