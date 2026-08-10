@@ -6,6 +6,7 @@
 #pragma mark - Constants
 
 static BOOL CPRunningSelfTests = NO;
+static BOOL CPTodoUseIsolatedStore = NO; // 仅 --ui-self-test:Todo 用临时库,不读写用户真实待办
 
 // 高对比通道调整：亮通道更亮、暗通道更暗，提高对比度。
 static CGFloat CPContrastAdjustChannel(CGFloat v) {
@@ -725,7 +726,7 @@ static NSString *CPDisplayStatusTitle(CPDisplayStatus s) {
     switch (s) {
         case CPDisplayStatusFailed: return @"失败";
         case CPDisplayStatusWaiting: return @"需关注";
-        case CPDisplayStatusCompletedPendingReview: return @"已完成";
+        case CPDisplayStatusCompletedPendingReview: return @"已就绪"; // Agent 级完成态面向用户显示「已就绪」;任务级「已完成」语义不变
         case CPDisplayStatusWorking: return @"工作中";
         case CPDisplayStatusIdle: return @"空闲";
     }
@@ -1234,6 +1235,170 @@ static CPRolloutState *CPReadRolloutState(NSString *path) {
 
 @end
 
+#pragma mark - Todo Store
+
+// 轻量个人待办:独立于 Agent,与只读的 Codex 状态库完全无关。
+// agent_id/thread_id 为 nullable 预留字段,供未来可选的 Agent 联动;当前 UI 恒不写入(恒 NULL)。
+// Todo 计数只显示在工作台 Todo 栏内,绝不进入 HUD/Dock badge/悬浮球角标/Agent 状态灯等提醒聚合。
+
+@interface CPTodo : NSObject
+@property NSInteger todoID;
+@property NSString *title;
+@property BOOL completed;
+@property NSString *agentID;  // 预留,当前恒为 nil
+@property NSString *threadID; // 预留,当前恒为 nil
+@property NSDate *createdAt;
+@property NSDate *updatedAt;
+@end
+@implementation CPTodo @end
+
+@interface CPTodoStore : NSObject
+@property NSString *path;
++ (NSString *)defaultPath;
+- (instancetype)initWithPath:(NSString *)path;
+- (NSArray<CPTodo *> *)allTodos; // 未完成在前(created_at 升序),已完成在后
+- (NSInteger)pendingCount;
+- (CPTodo *)addTodoWithTitle:(NSString *)title;
+- (void)setTodo:(NSInteger)todoID completed:(BOOL)completed;
+- (void)updateTodo:(NSInteger)todoID title:(NSString *)title;
+- (void)deleteTodo:(NSInteger)todoID;
+@end
+
+@implementation CPTodoStore {
+    sqlite3 *_db;
+}
+
++ (NSString *)defaultPath {
+    NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/Codex Pulse"];
+    return [dir stringByAppendingPathComponent:@"todos.sqlite"];
+}
+
+- (instancetype)initWithPath:(NSString *)path {
+    self = [super init];
+    if (!self) return nil;
+    self.path = path;
+    [[NSFileManager defaultManager] createDirectoryAtPath:path.stringByDeletingLastPathComponent
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    if (sqlite3_open_v2(path.UTF8String, &_db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK) {
+        if (_db) { sqlite3_close(_db); _db = NULL; }
+        return nil;
+    }
+    sqlite3_busy_timeout(_db, 150);
+    const char *sql =
+        "CREATE TABLE IF NOT EXISTS todos("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "title TEXT NOT NULL, "
+        "completed INTEGER NOT NULL DEFAULT 0, "
+        "agent_id TEXT NULL, "
+        "thread_id TEXT NULL, "
+        "created_at REAL NOT NULL, "
+        "updated_at REAL NOT NULL)";
+    sqlite3_exec(_db, sql, NULL, NULL, NULL);
+    return self;
+}
+
+- (void)dealloc {
+    if (_db) sqlite3_close(_db);
+}
+
+- (NSArray<CPTodo *> *)allTodos {
+    NSMutableArray<CPTodo *> *todos = NSMutableArray.array;
+    if (!_db) return todos;
+    const char *sql = "SELECT id, title, completed, agent_id, thread_id, created_at, updated_at "
+                      "FROM todos ORDER BY completed ASC, created_at ASC, id ASC";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            CPTodo *todo = CPTodo.new;
+            todo.todoID = (NSInteger)sqlite3_column_int64(stmt, 0);
+            todo.title = [NSString stringWithUTF8String:(const char *)sqlite3_column_text(stmt, 1)] ?: @"";
+            todo.completed = sqlite3_column_int(stmt, 2) != 0;
+            todo.agentID = sqlite3_column_text(stmt, 3)
+                ? [NSString stringWithUTF8String:(const char *)sqlite3_column_text(stmt, 3)] : nil;
+            todo.threadID = sqlite3_column_text(stmt, 4)
+                ? [NSString stringWithUTF8String:(const char *)sqlite3_column_text(stmt, 4)] : nil;
+            todo.createdAt = CPDateFromSeconds(sqlite3_column_double(stmt, 5)) ?: NSDate.date;
+            todo.updatedAt = CPDateFromSeconds(sqlite3_column_double(stmt, 6)) ?: NSDate.date;
+            [todos addObject:todo];
+        }
+    }
+    if (stmt) sqlite3_finalize(stmt);
+    return todos;
+}
+
+- (NSInteger)pendingCount {
+    if (!_db) return 0;
+    NSInteger count = 0;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(_db, "SELECT COUNT(*) FROM todos WHERE completed=0", -1, &stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) count = (NSInteger)sqlite3_column_int64(stmt, 0);
+    }
+    if (stmt) sqlite3_finalize(stmt);
+    return count;
+}
+
+- (BOOL)exec:(const char *)sql bind:(void (^)(sqlite3_stmt *stmt))bind {
+    if (!_db) return NO;
+    sqlite3_stmt *stmt = NULL;
+    BOOL ok = NO;
+    if (sqlite3_prepare_v2(_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        if (bind) bind(stmt);
+        ok = sqlite3_step(stmt) == SQLITE_DONE;
+    }
+    if (stmt) sqlite3_finalize(stmt);
+    return ok;
+}
+
+- (CPTodo *)addTodoWithTitle:(NSString *)title {
+    NSString *trimmed = [title stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (!trimmed.length) return nil;
+    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+    BOOL ok = [self exec:"INSERT INTO todos(title, completed, created_at, updated_at) VALUES(?, 0, ?, ?)"
+                    bind:^(sqlite3_stmt *stmt) {
+        sqlite3_bind_text(stmt, 1, trimmed.UTF8String, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_double(stmt, 2, now);
+        sqlite3_bind_double(stmt, 3, now);
+    }];
+    if (!ok) return nil;
+    CPTodo *todo = CPTodo.new;
+    todo.todoID = (NSInteger)sqlite3_last_insert_rowid(_db);
+    todo.title = trimmed;
+    todo.completed = NO;
+    todo.createdAt = [NSDate dateWithTimeIntervalSince1970:now];
+    todo.updatedAt = todo.createdAt;
+    return todo;
+}
+
+- (void)setTodo:(NSInteger)todoID completed:(BOOL)completed {
+    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+    [self exec:"UPDATE todos SET completed=?, updated_at=? WHERE id=?"
+         bind:^(sqlite3_stmt *stmt) {
+        sqlite3_bind_int(stmt, 1, completed ? 1 : 0);
+        sqlite3_bind_double(stmt, 2, now);
+        sqlite3_bind_int64(stmt, 3, todoID);
+    }];
+}
+
+- (void)updateTodo:(NSInteger)todoID title:(NSString *)title {
+    NSString *trimmed = [title stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (!trimmed.length) return;
+    [self exec:"UPDATE todos SET title=?, updated_at=? WHERE id=?"
+         bind:^(sqlite3_stmt *stmt) {
+        sqlite3_bind_text(stmt, 1, trimmed.UTF8String, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_double(stmt, 2, NSDate.date.timeIntervalSince1970);
+        sqlite3_bind_int64(stmt, 3, todoID);
+    }];
+}
+
+- (void)deleteTodo:(NSInteger)todoID {
+    [self exec:"DELETE FROM todos WHERE id=?"
+         bind:^(sqlite3_stmt *stmt) {
+        sqlite3_bind_int64(stmt, 1, todoID);
+    }];
+}
+
+@end
+
 #pragma mark - Workbench Card
 
 @interface CPDraggableHeaderView : NSView
@@ -1248,6 +1413,8 @@ static CPRolloutState *CPReadRolloutState(NSString *path) {
     return [hit isKindOfClass:NSButton.class] ? hit : self;
 }
 - (BOOL)acceptsFirstMouse:(NSEvent *)event { return YES; }
+// 允许成为 initialFirstResponder:把自动焦点挡在拖动头,Todo 输入框只有被点击才进入编辑。
+- (BOOL)acceptsFirstResponder { return YES; }
 - (void)mouseDown:(NSEvent *)event {
     self.draggingWindow = YES;
     self.dragStartMouse = NSEvent.mouseLocation;
@@ -1308,6 +1475,18 @@ static CPRolloutState *CPReadRolloutState(NSString *path) {
 @property NSTextField *centerMeta;
 @property NSButton *detailBackButton;
 @property NSButton *detailOpenAgentButton;
+// 工作台底部全宽 Todo 栏:可收起/展开;计数只显示在栏内,不进入任何提醒聚合。
+@property CPTodoStore *todoStore;
+@property NSView *todoContainer;
+@property NSLayoutConstraint *todoHeightConstraint;
+@property NSView *todoExpandedContent;
+@property NSTextField *todoInput;
+@property NSTextField *todoEditField;
+@property NSInteger todoEditingID;
+@property NSStackView *todoStack;
+@property NSTextField *todoCountLabel;
+@property NSImageView *todoChevron;
+@property BOOL todoExpanded;
 @property NSArray<CPAgent *> *agents;
 @property CPAgent *selectedAgent;
 @property CPTask *selectedTask;
@@ -1337,8 +1516,15 @@ static CPRolloutState *CPReadRolloutState(NSString *path) {
 
 @implementation CPWorkbenchCardController
 
+static const CGFloat CPWorkbenchInset = 20.0;
+
 static const CGFloat CPCardWidth = 520.0;
-static const CGFloat CPCardHeight = 360.0;
+static const CGFloat CPCardHeight = 360.0; // 内容区高度(头部 + 三列);Todo 栏在此基础上向下加高卡片
+
+// Todo 栏布局常量:收起态为常驻 30pt 横条(始终参与布局,绝不 overlay);
+// 展开时卡片/窗口整体向下加高 CPTodoExpandedExtra,任务区高度不变。
+static const CGFloat CPTodoStripHeight = 30.0;
+static const CGFloat CPTodoExpandedExtra = 182.0; // 8 上间距 + 30 输入行 + 6 间距 + 132 列表(约 5 行) + 6 下间距
 
 - (instancetype)init {
     self = [super init];
@@ -1346,11 +1532,33 @@ static const CGFloat CPCardHeight = 360.0;
     self.pinned = YES;
     self.dockMode = 0;
     self.reviewStore = [[CPReviewStore alloc] initWithDefaults:NSUserDefaults.standardUserDefaults];
+    // 自测用临时库,不污染用户真实待办数据;每次自测运行从空库开始,保证计数断言确定。
+    NSString *todoPath = CPTodoUseIsolatedStore
+        ? [NSTemporaryDirectory() stringByAppendingPathComponent:@"codexpulse-ui-test-todos.sqlite"]
+        : CPTodoStore.defaultPath;
+    if (CPTodoUseIsolatedStore) [[NSFileManager defaultManager] removeItemAtPath:todoPath error:nil];
+    self.todoStore = [[CPTodoStore alloc] initWithPath:todoPath];
+    self.todoExpanded = [NSUserDefaults.standardUserDefaults boolForKey:@"workbench.todoExpanded"];
     [self buildWindow];
     return self;
 }
 
-static const CGFloat CPWorkbenchInset = 20.0;
+// 当前 Todo 栏高度(收起 30 / 展开 30+182)。
+- (CGFloat)todoBarHeight {
+    return CPTodoStripHeight + (self.todoExpanded ? CPTodoExpandedExtra : 0.0);
+}
+
+// 卡片总高 = 内容区 + Todo 栏。
+- (CGFloat)cardHeight {
+    return CPCardHeight + self.todoBarHeight;
+}
+
+// 卡片几何唯一入口:frame 与阴影路径随时与展开状态一致(构建/展开收起/显示前都走这里)。
+- (void)applyCardGeometry {
+    self.card.frame = NSMakeRect(CPWorkbenchInset, CPWorkbenchInset, CPCardWidth, self.cardHeight);
+    self.shadowCarrier.layer.shadowPath =
+        [NSBezierPath bezierPathWithRoundedRect:self.card.frame xRadius:18 yRadius:18].CGPath;
+}
 
 // Pure geometry helpers: depend only on a visibleFrame rect and a target size,
 // so headless self-tests can drive the exact same code paths with synthetic rects.
@@ -1368,7 +1576,7 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
 
 - (void)buildWindow {
     CGFloat windowW = CPCardWidth + CPWorkbenchInset * 2.0;
-    CGFloat windowH = CPCardHeight + CPWorkbenchInset * 2.0;
+    CGFloat windowH = self.cardHeight + CPWorkbenchInset * 2.0;
     self.window = [[CPWorkbenchPanel alloc] initWithContentRect:NSMakeRect(0, 0, windowW, windowH)
                                                       styleMask:NSWindowStyleMaskBorderless
                                                         backing:NSBackingStoreBuffered
@@ -1391,10 +1599,9 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     self.shadowCarrier.layer.shadowOffset = CGSizeMake(0, -8);
     self.shadowCarrier.layer.shadowRadius = 30.0;
     self.shadowCarrier.layer.shadowOpacity = 1.0;
-    self.shadowCarrier.layer.shadowPath = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(CPWorkbenchInset, CPWorkbenchInset, CPCardWidth, CPCardHeight) xRadius:18 yRadius:18].CGPath;
     self.window.contentView = self.shadowCarrier;
 
-    self.card = [[NSView alloc] initWithFrame:NSMakeRect(CPWorkbenchInset, CPWorkbenchInset, CPCardWidth, CPCardHeight)];
+    self.card = [[NSView alloc] initWithFrame:NSMakeRect(CPWorkbenchInset, CPWorkbenchInset, CPCardWidth, self.cardHeight)];
     self.card.wantsLayer = YES;
     self.card.layer.backgroundColor = CPSurface().CGColor;
     self.card.layer.cornerRadius = 18.0;
@@ -1403,8 +1610,10 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     self.card.layer.masksToBounds = YES;
     self.card.autoresizingMask = NSViewNotSizable;
     [self.shadowCarrier addSubview:self.card];
+    [self applyCardGeometry];
 
     [self buildHeader];
+    [self buildTodoBar]; // Todo 栏先于 body 建立:body 底部约束到 Todo 栏顶部
     [self buildBody];
 
     [[NSNotificationCenter defaultCenter] addObserver:self
@@ -1417,6 +1626,8 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     CPDraggableHeaderView *header = [[CPDraggableHeaderView alloc] initWithFrame:NSMakeRect(0, CPCardHeight - 48, CPCardWidth, 48)];
     header.toolTip = @"拖动以移动工作台";
     header.translatesAutoresizingMaskIntoConstraints = NO;
+    // 工作台成为 key 时焦点落在拖动头,而不是 Todo 输入框——避免开窗即进入编辑态、Esc 语义被抢走。
+    self.window.initialFirstResponder = header;
     [self.card addSubview:header];
     [NSLayoutConstraint activateConstraints:@[
         [header.leadingAnchor constraintEqualToAnchor:self.card.leadingAnchor],
@@ -1484,7 +1695,8 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
         [body.leadingAnchor constraintEqualToAnchor:self.card.leadingAnchor],
         [body.trailingAnchor constraintEqualToAnchor:self.card.trailingAnchor],
         [body.topAnchor constraintEqualToAnchor:self.card.topAnchor constant:49],
-        [body.bottomAnchor constraintEqualToAnchor:self.card.bottomAnchor]
+        // Todo 栏常驻参与布局:body 底部钉在 Todo 栏顶部,任何状态下都不重叠。
+        [body.bottomAnchor constraintEqualToAnchor:self.todoContainer.topAnchor]
     ]];
 
     self.leftColumn = [self columnWithBackground:CPBg()];
@@ -1525,6 +1737,331 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     [self buildLeftColumn];
     [self buildMiddleColumn];
     [self buildRightColumn];
+}
+
+#pragma mark - Todo Bar (工作台底部常驻栏,参与布局,不 overlay)
+
+// Todo 栏 = 底部常驻 30pt 横条(图标 + 标题 + 未完成计数 + chevron,整条可点)
+// + 展开内容(输入行 + 滚动列表)。展开时卡片/窗口整体向下加高,任务区高度不变。
+- (void)buildTodoBar {
+    NSView *container = [[NSView alloc] initWithFrame:NSZeroRect];
+    container.wantsLayer = YES;
+    container.layer.backgroundColor = CPBg().CGColor;
+    container.translatesAutoresizingMaskIntoConstraints = NO;
+    self.todoContainer = container;
+    [self.card addSubview:container];
+    self.todoHeightConstraint = [container.heightAnchor constraintEqualToConstant:self.todoBarHeight];
+    [NSLayoutConstraint activateConstraints:@[
+        [container.leadingAnchor constraintEqualToAnchor:self.card.leadingAnchor],
+        [container.trailingAnchor constraintEqualToAnchor:self.card.trailingAnchor],
+        [container.bottomAnchor constraintEqualToAnchor:self.card.bottomAnchor],
+        self.todoHeightConstraint
+    ]];
+
+    // 与三列内容区的分隔线(贴 Todo 栏顶部)。
+    NSBox *sep = [[NSBox alloc] initWithFrame:NSZeroRect];
+    sep.boxType = NSBoxSeparator;
+    sep.translatesAutoresizingMaskIntoConstraints = NO;
+    [container addSubview:sep];
+    [NSLayoutConstraint activateConstraints:@[
+        [sep.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
+        [sep.trailingAnchor constraintEqualToAnchor:container.trailingAnchor],
+        [sep.topAnchor constraintEqualToAnchor:container.topAnchor],
+        [sep.heightAnchor constraintEqualToConstant:1]
+    ]];
+
+    // 展开内容:输入行 + 列表,从容错器顶部向下排;收起时整体隐藏。
+    NSView *expanded = [[NSView alloc] initWithFrame:NSZeroRect];
+    expanded.translatesAutoresizingMaskIntoConstraints = NO;
+    expanded.hidden = !self.todoExpanded;
+    self.todoExpandedContent = expanded;
+    [container addSubview:expanded];
+    [NSLayoutConstraint activateConstraints:@[
+        [expanded.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
+        [expanded.trailingAnchor constraintEqualToAnchor:container.trailingAnchor],
+        [expanded.topAnchor constraintEqualToAnchor:container.topAnchor constant:1],
+        [expanded.heightAnchor constraintEqualToConstant:CPTodoExpandedExtra]
+    ]];
+
+    // 输入行:圆角浅底盘 + 无边框输入框,回车即新增,空串忽略。
+    NSView *inputWrap = [[NSView alloc] initWithFrame:NSZeroRect];
+    inputWrap.wantsLayer = YES;
+    inputWrap.layer.backgroundColor = CPSurface().CGColor;
+    inputWrap.layer.cornerRadius = 8.0;
+    inputWrap.layer.borderWidth = 1.0;
+    inputWrap.layer.borderColor = CPBorder().CGColor;
+    inputWrap.translatesAutoresizingMaskIntoConstraints = NO;
+    [expanded addSubview:inputWrap];
+
+    NSTextField *input = [[NSTextField alloc] initWithFrame:NSZeroRect];
+    input.bordered = NO;
+    input.bezeled = NO;
+    input.drawsBackground = NO;
+    input.focusRingType = NSFocusRingTypeNone;
+    input.font = [NSFont systemFontOfSize:12 weight:NSFontWeightRegular];
+    input.textColor = CPFg();
+    input.placeholderString = @"随手记下待办，回车保存";
+    input.target = self;
+    input.action = @selector(addTodoFromInput:);
+    input.translatesAutoresizingMaskIntoConstraints = NO;
+    self.todoInput = input;
+    [inputWrap addSubview:input];
+    [NSLayoutConstraint activateConstraints:@[
+        [inputWrap.leadingAnchor constraintEqualToAnchor:expanded.leadingAnchor constant:12],
+        [inputWrap.trailingAnchor constraintEqualToAnchor:expanded.trailingAnchor constant:-12],
+        [inputWrap.topAnchor constraintEqualToAnchor:expanded.topAnchor constant:8],
+        [inputWrap.heightAnchor constraintEqualToConstant:30],
+        [input.leadingAnchor constraintEqualToAnchor:inputWrap.leadingAnchor constant:10],
+        [input.trailingAnchor constraintEqualToAnchor:inputWrap.trailingAnchor constant:-10],
+        [input.centerYAnchor constraintEqualToAnchor:inputWrap.centerYAnchor]
+    ]];
+
+    // 列表:纵向滚动、无横向、背景透明;固定 132pt(约 5 行),超出滚动。
+    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSZeroRect];
+    scroll.translatesAutoresizingMaskIntoConstraints = NO;
+    scroll.drawsBackground = NO;
+    scroll.borderType = NSNoBorder;
+    scroll.hasVerticalScroller = YES;
+    scroll.hasHorizontalScroller = NO;
+    scroll.autohidesScrollers = YES;
+    [expanded addSubview:scroll];
+
+    NSStackView *stack = [CPFlippedStackView stackViewWithViews:@[]];
+    stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+    stack.alignment = NSLayoutAttributeLeading;
+    stack.spacing = 2;
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    self.todoStack = stack;
+    scroll.documentView = stack;
+
+    [NSLayoutConstraint activateConstraints:@[
+        [scroll.leadingAnchor constraintEqualToAnchor:expanded.leadingAnchor constant:12],
+        [scroll.trailingAnchor constraintEqualToAnchor:expanded.trailingAnchor constant:-12],
+        [scroll.topAnchor constraintEqualToAnchor:inputWrap.bottomAnchor constant:6],
+        [scroll.heightAnchor constraintEqualToConstant:132],
+        [stack.leadingAnchor constraintEqualToAnchor:scroll.contentView.leadingAnchor],
+        [stack.topAnchor constraintEqualToAnchor:scroll.contentView.topAnchor],
+        [stack.widthAnchor constraintEqualToAnchor:scroll.contentView.widthAnchor]
+    ]];
+
+    // 常驻横条(30pt,贴容错器底部):整条是可点按钮,子视图只负责排版。
+    NSButton *strip = [CPHoverButton buttonWithTitle:@"" target:self action:@selector(toggleTodoBar:)];
+    strip.bordered = NO;
+    [strip setButtonType:NSButtonTypeMomentaryChange];
+    strip.layer.cornerRadius = 0.0;
+    strip.toolTip = @"展开/收起待办";
+    strip.accessibilityLabel = @"待办，展开/收起";
+    strip.translatesAutoresizingMaskIntoConstraints = NO;
+    [container addSubview:strip];
+    [NSLayoutConstraint activateConstraints:@[
+        [strip.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
+        [strip.trailingAnchor constraintEqualToAnchor:container.trailingAnchor],
+        [strip.bottomAnchor constraintEqualToAnchor:container.bottomAnchor],
+        [strip.heightAnchor constraintEqualToConstant:CPTodoStripHeight]
+    ]];
+
+    NSImageView *icon = [[NSImageView alloc] initWithFrame:NSMakeRect(0, 0, 14, 14)];
+    icon.image = CPSymbol(@"checklist", 12, CPAccent());
+    icon.contentTintColor = CPAccent();
+    icon.translatesAutoresizingMaskIntoConstraints = NO;
+    [icon.widthAnchor constraintEqualToConstant:14].active = YES;
+    [icon.heightAnchor constraintEqualToConstant:14].active = YES;
+
+    NSTextField *title = CPLabel(@"待办", 12, NSFontWeightSemibold, CPFg());
+    title.maximumNumberOfLines = 1;
+    title.translatesAutoresizingMaskIntoConstraints = NO;
+    self.todoCountLabel = CPLabel(@"", 11, NSFontWeightRegular, CPMuted());
+    self.todoCountLabel.maximumNumberOfLines = 1;
+    self.todoCountLabel.translatesAutoresizingMaskIntoConstraints = NO;
+
+    NSImageView *chevron = [[NSImageView alloc] initWithFrame:NSMakeRect(0, 0, 10, 10)];
+    chevron.image = CPSymbol(self.todoExpanded ? @"chevron.down" : @"chevron.up", 10, CPMuted());
+    chevron.contentTintColor = CPMuted();
+    chevron.translatesAutoresizingMaskIntoConstraints = NO;
+    self.todoChevron = chevron;
+
+    [strip addSubview:icon];
+    [strip addSubview:title];
+    [strip addSubview:self.todoCountLabel];
+    [strip addSubview:chevron];
+    [NSLayoutConstraint activateConstraints:@[
+        [icon.leadingAnchor constraintEqualToAnchor:strip.leadingAnchor constant:12],
+        [icon.centerYAnchor constraintEqualToAnchor:strip.centerYAnchor],
+        [title.leadingAnchor constraintEqualToAnchor:icon.trailingAnchor constant:6],
+        [title.centerYAnchor constraintEqualToAnchor:strip.centerYAnchor],
+        [self.todoCountLabel.leadingAnchor constraintEqualToAnchor:title.trailingAnchor constant:8],
+        [self.todoCountLabel.centerYAnchor constraintEqualToAnchor:strip.centerYAnchor],
+        [chevron.trailingAnchor constraintEqualToAnchor:strip.trailingAnchor constant:-12],
+        [chevron.centerYAnchor constraintEqualToAnchor:strip.centerYAnchor]
+    ]];
+
+    [self renderTodos];
+}
+
+// 展开/收起:Todo 栏高度 + 卡片/窗口整体高度一起变,顶部边缘在屏幕上保持不动。
+- (void)toggleTodoBar:(id)sender {
+    (void)sender;
+    self.todoExpanded = !self.todoExpanded;
+    [NSUserDefaults.standardUserDefaults setBool:self.todoExpanded forKey:@"workbench.todoExpanded"];
+    [self applyTodoExpandedState];
+}
+
+- (void)applyTodoExpandedState {
+    self.todoHeightConstraint.constant = self.todoBarHeight;
+    self.todoExpandedContent.hidden = !self.todoExpanded;
+    self.todoChevron.image = CPSymbol(self.todoExpanded ? @"chevron.down" : @"chevron.up", 10, CPMuted());
+    [self applyCardGeometry];
+    // 窗口高度始终与展开状态一致(隐藏时也要对齐,下次显示/几何断言才正确);顶部边缘在屏幕上保持不动。
+    CGFloat currentExtra = self.window.frame.size.height - (CPCardHeight + CPTodoStripHeight + CPWorkbenchInset * 2.0);
+    CGFloat wantedExtra = self.todoExpanded ? CPTodoExpandedExtra : 0.0;
+    CGFloat delta = wantedExtra - currentExtra;
+    if (fabs(delta) > 0.5) {
+        NSRect frame = self.window.frame;
+        frame.origin.y -= delta;
+        frame.size.height += delta;
+        [self.window setFrame:frame display:YES animate:NO];
+    }
+}
+
+- (CPTodo *)todoWithID:(NSInteger)todoID {
+    for (CPTodo *todo in [self.todoStore allTodos]) {
+        if (todo.todoID == todoID) return todo;
+    }
+    return nil;
+}
+
+- (void)renderTodos {
+    while (self.todoStack.arrangedSubviews.count > 0) {
+        NSView *v = self.todoStack.arrangedSubviews.lastObject;
+        [self.todoStack removeArrangedSubview:v];
+        [v removeFromSuperview];
+    }
+    NSArray<CPTodo *> *todos = [self.todoStore allTodos];
+    if (!todos.count) {
+        [self.todoStack addArrangedSubview:CPLabel(@"暂无待办，随手记一条", 11, NSFontWeightRegular, CPMuted())];
+    } else {
+        for (CPTodo *todo in todos) {
+            NSView *row = [self todoRow:todo];
+            [self.todoStack addArrangedSubview:row];
+            [row.widthAnchor constraintEqualToAnchor:self.todoStack.widthAnchor].active = YES;
+        }
+    }
+    NSInteger pending = [self.todoStore pendingCount];
+    self.todoCountLabel.stringValue = !todos.count ? @""
+        : (pending ? [NSString stringWithFormat:@"%ld 项待办", (long)pending] : @"全部完成");
+}
+
+- (NSView *)todoRow:(CPTodo *)todo {
+    NSView *row = [[NSView alloc] initWithFrame:NSZeroRect];
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+    [row.heightAnchor constraintEqualToConstant:26].active = YES;
+
+    // 完成/恢复勾选钮:完成态绿色对勾,未完成空心圆。
+    NSButton *check = [CPHoverButton buttonWithTitle:@"" target:self action:@selector(toggleTodo:)];
+    check.bordered = NO;
+    [check setButtonType:NSButtonTypeMomentaryChange];
+    check.tag = todo.todoID;
+    check.image = CPSymbol(todo.completed ? @"checkmark.circle.fill" : @"circle", 13,
+                           todo.completed ? CPGreen() : CPMuted());
+    check.contentTintColor = todo.completed ? CPGreen() : CPMuted();
+    check.toolTip = todo.completed ? @"恢复为待办" : @"标记完成";
+    check.translatesAutoresizingMaskIntoConstraints = NO;
+    [check.widthAnchor constraintEqualToConstant:22].active = YES;
+    [check.heightAnchor constraintEqualToConstant:22].active = YES;
+    [row addSubview:check];
+
+    NSView *titleView;
+    if (self.todoEditingID == todo.todoID) {
+        // 行内编辑:回车保存,Esc 放弃(见 handleEscape)。
+        NSTextField *edit = [[NSTextField alloc] initWithFrame:NSZeroRect];
+        edit.bordered = NO;
+        edit.bezeled = NO;
+        edit.drawsBackground = NO;
+        edit.focusRingType = NSFocusRingTypeNone;
+        edit.font = [NSFont systemFontOfSize:12 weight:NSFontWeightRegular];
+        edit.textColor = CPFg();
+        edit.stringValue = todo.title;
+        edit.target = self;
+        edit.action = @selector(commitTodoEdit:);
+        edit.tag = todo.todoID;
+        edit.translatesAutoresizingMaskIntoConstraints = NO;
+        self.todoEditField = edit;
+        titleView = edit;
+    } else {
+        // 标题即按钮:点击进入行内编辑;完成态删除线 + 变淡。
+        NSButton *titleButton = [CPHoverButton buttonWithTitle:@"" target:self action:@selector(startTodoEdit:)];
+        titleButton.bordered = NO;
+        [titleButton setButtonType:NSButtonTypeMomentaryChange];
+        titleButton.tag = todo.todoID;
+        titleButton.toolTip = @"点击编辑";
+        titleButton.translatesAutoresizingMaskIntoConstraints = NO;
+        NSMutableDictionary<NSAttributedStringKey, id> *attrs = [NSMutableDictionary dictionary];
+        attrs[NSFontAttributeName] = [NSFont systemFontOfSize:12 weight:NSFontWeightRegular];
+        attrs[NSForegroundColorAttributeName] = todo.completed ? CPMuted() : CPFg();
+        if (todo.completed) attrs[NSStrikethroughStyleAttributeName] = @(NSUnderlineStyleSingle);
+        titleButton.attributedTitle = [[NSAttributedString alloc] initWithString:todo.title attributes:attrs];
+        titleButton.alignment = NSTextAlignmentLeft;
+        titleButton.lineBreakMode = NSLineBreakByTruncatingTail;
+        titleView = titleButton;
+    }
+    [row addSubview:titleView];
+
+    // 删除钮。
+    NSButton *delete = [CPHoverButton buttonWithTitle:@"" target:self action:@selector(deleteTodo:)];
+    delete.bordered = NO;
+    [delete setButtonType:NSButtonTypeMomentaryChange];
+    delete.tag = todo.todoID;
+    delete.image = CPSymbol(@"xmark", 9, CPMuted());
+    delete.contentTintColor = CPMuted();
+    delete.toolTip = @"删除";
+    delete.translatesAutoresizingMaskIntoConstraints = NO;
+    [delete.widthAnchor constraintEqualToConstant:20].active = YES;
+    [delete.heightAnchor constraintEqualToConstant:20].active = YES;
+    [row addSubview:delete];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [check.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:2],
+        [check.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [titleView.leadingAnchor constraintEqualToAnchor:check.trailingAnchor constant:4],
+        [titleView.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [delete.leadingAnchor constraintEqualToAnchor:titleView.trailingAnchor constant:4],
+        [delete.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-2],
+        [delete.centerYAnchor constraintEqualToAnchor:row.centerYAnchor]
+    ]];
+    return row;
+}
+
+- (void)addTodoFromInput:(id)sender {
+    (void)sender;
+    if ([self.todoStore addTodoWithTitle:self.todoInput.stringValue]) {
+        self.todoInput.stringValue = @"";
+        [self renderTodos];
+    }
+}
+
+- (void)toggleTodo:(NSButton *)sender {
+    CPTodo *todo = [self todoWithID:sender.tag];
+    if (!todo) return;
+    [self.todoStore setTodo:todo.todoID completed:!todo.completed];
+    [self renderTodos];
+}
+
+- (void)startTodoEdit:(NSButton *)sender {
+    self.todoEditingID = sender.tag;
+    [self renderTodos];
+    [self.window makeFirstResponder:self.todoEditField];
+}
+
+- (void)commitTodoEdit:(NSTextField *)sender {
+    [self.todoStore updateTodo:sender.tag title:sender.stringValue];
+    self.todoEditingID = 0;
+    self.todoEditField = nil;
+    [self renderTodos];
+}
+
+- (void)deleteTodo:(NSButton *)sender {
+    [self.todoStore deleteTodo:sender.tag];
+    [self renderTodos];
 }
 
 - (NSView *)columnWithBackground:(NSColor *)color {
@@ -1653,10 +2190,9 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     [head.heightAnchor constraintEqualToConstant:30].active = YES;
     NSTextField *title = CPLabel(@"任务详情", 13, NSFontWeightSemibold, CPFg());
     title.translatesAutoresizingMaskIntoConstraints = NO;
-    // 返回入口:24pt 透明热区 + 与「任务详情」13pt 标题行高等大的 18pt 正圆。
-    // 可见圆和文字上端齐平、共中线,不再是一个明显大于文字的圆饼;hover/按压
+    // 返回入口:24pt 透明热区 + 与「任务详情」13pt 标题视觉协调的 20pt 正圆。
+    // 可见圆和文字共中线;圆更大半号、描边更亮,辨识度高一档;hover/按压
     // 反馈经 cpVisualLayer 画在小圆上,热区之外完全透明。
-    // 返回入口:24pt 透明热区 + 与「任务详情」13pt 标题行高等大的 18pt 正圆。
     // chevron 不作为 NSButton.image 设置——按钮的私有内部约束曾把 24x24 热区
     // 撑成 24x29,圆角层被拉伸成椭圆;改为圆的 CALayer.contents 绘制,几何完全自控。
     NSButton *backButton = CPIconButton(@"chevron.left", self, @selector(closeDetailDrawer), @"返回任务列表");
@@ -1669,11 +2205,11 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     }
     CALayer *backCircle = [CALayer layer];
     backCircle.name = @"detailBackCircle";
-    backCircle.frame = NSMakeRect(3.0, 3.0, 18.0, 18.0); // 24pt 热区内居中
-    backCircle.cornerRadius = 9.0; // 半径恒为宽度一半,正圆
-    backCircle.borderColor = CPBorder().CGColor;
+    backCircle.frame = NSMakeRect(2.0, 2.0, 20.0, 20.0); // 24pt 热区内居中
+    backCircle.cornerRadius = 10.0; // 半径恒为宽度一半,正圆
+    backCircle.borderColor = [CPFg2() colorWithAlphaComponent:0.55].CGColor; // 比 CPBorder 亮一档,小尺寸下更清晰
     backCircle.masksToBounds = YES;
-    backCircle.contents = (__bridge id)CPSymbolCGImage(@"chevron.left", 9, CPFg(), 18.0);
+    backCircle.contents = (__bridge id)CPSymbolCGImage(@"chevron.left", 10, CPFg(), 20.0);
     backCircle.contentsGravity = kCAGravityCenter;
     backCircle.contentsScale = 2.0;
     [backButton.layer addSublayer:backCircle];
@@ -1709,6 +2245,20 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
 }
 
 - (void)handleEscape {
+    // 正在 Todo 栏输入/编辑时,Esc 只放弃当前编辑(不改数据),不关详情或工作台。
+    NSResponder *firstResponder = self.window.firstResponder;
+    if ([firstResponder isKindOfClass:NSTextView.class]) {
+        NSTextField *field = (NSTextField *)[(NSTextView *)firstResponder delegate];
+        if (field == self.todoInput || field == self.todoEditField) {
+            [self.window makeFirstResponder:nil];
+            if (field == self.todoEditField) {
+                self.todoEditingID = 0;
+                self.todoEditField = nil;
+                [self renderTodos];
+            }
+            return;
+        }
+    }
     if (!self.rightColumn.hidden) {
         [self closeDetailDrawer];
     } else {
@@ -2158,7 +2708,7 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
 }
 
 - (NSRect)targetFrameInVisibleRect:(NSRect)visible {
-    NSSize size = NSMakeSize(CPCardWidth + CPWorkbenchInset * 2.0, CPCardHeight + CPWorkbenchInset * 2.0);
+    NSSize size = NSMakeSize(CPCardWidth + CPWorkbenchInset * 2.0, self.cardHeight + CPWorkbenchInset * 2.0);
     return CPCenteredRectInVisibleFrame(visible, size);
 }
 
@@ -2171,6 +2721,7 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
 
 - (void)showNearDockRect:(NSRect)rect edge:(NSRectEdge)edge {
     self.lastDockRect = rect;
+    [self applyCardGeometry]; // 展开状态可能在隐藏期间被自测/默认值改变,显示前对齐几何
     NSRect target = [self targetFrameNearDockRect:rect edge:edge];
     if (!self.window.isVisible) {
         [self.window setFrame:target display:NO];
@@ -3867,9 +4418,13 @@ int main(int argc, const char *argv[]) {
     @autoreleasepool {
         if (argc > 1 && strcmp(argv[1], "--ui-self-test") == 0) {
             CPRunningSelfTests = YES;
+            CPTodoUseIsolatedStore = YES;
             [NSApplication sharedApplication];
 
             CPWorkbenchCardController *card = CPWorkbenchCardController.new;
+            // 展开状态来自用户 defaults,几何断言必须确定:统一按收起态测试。
+            card.todoExpanded = NO;
+            [card applyTodoExpandedState];
             NSScreen *screen = NSScreen.screens.firstObject ?: NSScreen.mainScreen;
             NSRect visible = screen ? screen.visibleFrame : NSZeroRect;
             BOOL hasScreen = !NSEqualRects(visible, NSZeroRect);
@@ -3884,9 +4439,9 @@ int main(int argc, const char *argv[]) {
             BOOL shadowCarrierNoMasks = !card.shadowCarrier.layer.masksToBounds;
             BOOL cardIsChildOfShadowCarrier = card.card.superview == card.shadowCarrier;
             BOOL windowHasWorkbenchInset = fabs(card.window.frame.size.width - (CPCardWidth + CPWorkbenchInset * 2.0)) <= 0.5 &&
-                                           fabs(card.window.frame.size.height - (CPCardHeight + CPWorkbenchInset * 2.0)) <= 0.5;
+                                           fabs(card.window.frame.size.height - (card.cardHeight + CPWorkbenchInset * 2.0)) <= 0.5;
             BOOL fixedCardSize = fabs(card.card.frame.size.width - 520.0) <= 0.5 &&
-                                 fabs(card.card.frame.size.height - 360.0) <= 0.5;
+                                 fabs(card.card.frame.size.height - (360.0 + CPTodoStripHeight)) <= 0.5; // 内容区 360 + 常驻 Todo 横条 30
             NSStackView *columnsStack = (NSStackView *)card.leftColumn.superview;
             BOOL twoColumn = [columnsStack isKindOfClass:NSStackView.class] &&
                              columnsStack.arrangedSubviews.count == 2 &&
@@ -4211,6 +4766,8 @@ int main(int argc, const char *argv[]) {
 
             // M3 entries: every entry shows-and-fronts, never toggles closed
             CPWorkbenchCardController *card3 = CPWorkbenchCardController.new;
+            card3.todoExpanded = NO;
+            [card3 applyTodoExpandedState];
             NSRect fakeDockRect = NSMakeRect(NSMaxX(testVisible) - 56, NSMidY(testVisible), 56, 56);
             [card3 showNearDockRect:fakeDockRect edge:NSRectEdgeMaxX];
             [card3 showNearDockRect:fakeDockRect edge:NSRectEdgeMaxX];
@@ -4219,7 +4776,7 @@ int main(int argc, const char *argv[]) {
             BOOL reshowVisible = card3.window.isVisible;
             BOOL reshowCentered = NSEqualRects(card3.window.frame, expectedTarget);
             BOOL reshowFixedSize = fabs(card3.window.frame.size.width - (CPCardWidth + CPWorkbenchInset * 2.0)) <= 0.5 &&
-                                   fabs(card3.window.frame.size.height - (CPCardHeight + CPWorkbenchInset * 2.0)) <= 0.5;
+                                   fabs(card3.window.frame.size.height - (card3.cardHeight + CPWorkbenchInset * 2.0)) <= 0.5;
             BOOL m3entries = reshowVisible && reshowCentered && reshowFixedSize;
 
             // M4: refresh stability — ID-based remapping, no defaults writes, no stacked animations
@@ -4960,6 +5517,70 @@ int main(int argc, const char *argv[]) {
             BOOL hoverResidualOK = hoverShown && hoverExitCleared && hoverMoveCleared &&
                                    hoverHideCleared && hoverRemoveCleared;
 
+            // Todo:独立轻量待办 — 数据层 CRUD/裁剪/排序/持久化/预留字段,
+            // UI 栏常驻参与布局(绝不 overlay),计数只在 Todo 栏内,不进 Agent 提醒聚合。
+            NSString *todoTestPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"codexpulse-todo-selftest.sqlite"];
+            [[NSFileManager defaultManager] removeItemAtPath:todoTestPath error:nil];
+            CPTodoStore *todoStore = [[CPTodoStore alloc] initWithPath:todoTestPath];
+            CPTodo *t1 = [todoStore addTodoWithTitle:@"第一条"];
+            CPTodo *t2 = [todoStore addTodoWithTitle:@"  第二条  "];
+            BOOL todoAdd = t1 && t2 && todoStore.allTodos.count == 2 && todoStore.pendingCount == 2 &&
+                           [t2.title isEqualToString:@"第二条"]; // 首尾空白裁剪
+            BOOL todoBlankIgnored = [todoStore addTodoWithTitle:@"   "] == nil && todoStore.allTodos.count == 2;
+            [todoStore setTodo:t1.todoID completed:YES];
+            BOOL todoComplete = todoStore.pendingCount == 1 &&
+                                todoStore.allTodos.firstObject.todoID == t2.todoID; // 未完成在前,完成沉底
+            [todoStore setTodo:t1.todoID completed:NO];
+            BOOL todoRestore = todoStore.pendingCount == 2;
+            [todoStore updateTodo:t2.todoID title:@"第二条改"];
+            CPTodo *t2After = nil;
+            for (CPTodo *t in todoStore.allTodos) if (t.todoID == t2.todoID) t2After = t;
+            BOOL todoEdit = [t2After.title isEqualToString:@"第二条改"];
+            [todoStore deleteTodo:t1.todoID];
+            BOOL todoDelete = todoStore.allTodos.count == 1 && todoStore.pendingCount == 1;
+            CPTodoStore *todoReopen = [[CPTodoStore alloc] initWithPath:todoTestPath]; // 重开库验证持久化
+            CPTodo *t2Persisted = todoReopen.allTodos.firstObject;
+            BOOL todoPersist = todoReopen.allTodos.count == 1 && [t2Persisted.title isEqualToString:@"第二条改"];
+            BOOL todoAgentNull = t2Persisted.agentID == nil && t2Persisted.threadID == nil; // 预留字段恒 NULL
+
+            CPWorkbenchCardController *todoCard = CPWorkbenchCardController.new;
+            todoCard.todoExpanded = NO;
+            [todoCard applyTodoExpandedState];
+            [todoCard.window orderFrontRegardless];
+            [todoCard.card layoutSubtreeIfNeeded];
+            BOOL todoStrip = !todoCard.todoContainer.hidden &&
+                             fabs(todoCard.todoHeightConstraint.constant - CPTodoStripHeight) <= 0.5 &&
+                             todoCard.todoExpandedContent.hidden; // 收起态:横条常驻、内容隐藏
+            // body(三列容器,即 columns stack 的父视图)底部钉在 Todo 栏顶部,任何状态下都不重叠。
+            NSView *todoBody = todoCard.leftColumn.superview.superview;
+            BOOL todoNoOverlay = fabs(todoBody.frame.origin.y - NSMaxY(todoCard.todoContainer.frame)) <= 0.5;
+            todoCard.todoExpanded = YES;
+            [todoCard applyTodoExpandedState];
+            BOOL todoExpand = !todoCard.todoExpandedContent.hidden &&
+                              fabs(todoCard.todoHeightConstraint.constant - (CPTodoStripHeight + CPTodoExpandedExtra)) <= 0.5 &&
+                              fabs(todoCard.window.frame.size.height - (todoCard.cardHeight + CPWorkbenchInset * 2.0)) <= 0.5;
+            [todoCard.card layoutSubtreeIfNeeded];
+            BOOL todoExpandNoOverlay = fabs(todoBody.frame.origin.y - NSMaxY(todoCard.todoContainer.frame)) <= 0.5 &&
+                                       fabs(todoBody.frame.size.height - (360.0 - 49.0)) <= 1.0; // 展开后任务区高度不变
+            todoCard.todoExpanded = NO;
+            [todoCard applyTodoExpandedState];
+
+            [todoCard.todoStore addTodoWithTitle:@"UI 条目"];
+            [todoCard renderTodos];
+            BOOL todoUICount = todoCard.todoStack.arrangedSubviews.count == 1 &&
+                               [todoCard.todoCountLabel.stringValue isEqualToString:@"1 项待办"];
+            // Todo 计数与 Agent 提醒聚合完全隔离:同一 agents 输入,加 Todo 前后角标不变。
+            CPAgent *todoBadgeAgent = CPTestAgent(@"todo-badge", @[CPTestTask(@"tb1", CPStatusWaiting, 100)]);
+            CPReviewStore *todoBadgeReview = [[CPReviewStore alloc] initWithDefaults:[[NSUserDefaults alloc] initWithSuiteName:@"todo-selftest"]];
+            NSInteger badgeBefore = CPBadgeCountForAgents(@[todoBadgeAgent], todoBadgeReview);
+            [todoCard.todoStore addTodoWithTitle:@"不应计入角标"];
+            BOOL todoBadgeIsolated = badgeBefore == CPBadgeCountForAgents(@[todoBadgeAgent], todoBadgeReview);
+            [todoCard.window orderOut:nil];
+
+            BOOL todoUI = todoAdd && todoBlankIgnored && todoComplete && todoRestore && todoEdit && todoDelete &&
+                          todoPersist && todoAgentNull && todoStrip && todoNoOverlay && todoExpand &&
+                          todoExpandNoOverlay && todoUICount && todoBadgeIsolated;
+
             BOOL passed = centered && draggableHeader && labeledWorkbench && onlyRealAgents && labeledAgent && buttonReceivesClick &&
                           agentStatusDotsAligned && attentionBadgeClearsOnOpen &&
                           cardMasksToBounds && shadowCarrierNoMasks && cardIsChildOfShadowCarrier && windowHasWorkbenchInset &&
@@ -4967,10 +5588,10 @@ int main(int argc, const char *argv[]) {
                           hudCollapsed6x72 && hudCollapsedOnMainScreen && hudExpandedSizeOK && hudExpandedOnMainScreen &&
                           shadowCarrierScales && handleAnchoredTopRight && contentNotSizable && hudClickViewIsBackgroundView &&
                           hudVisualFrameExact && hudExpandedHandleHidden && m2ui && m3ui && m3entries && m4ui && m5ui && m7ui && m8ui && m9ui && m10ui &&
-                          hoverResidualOK;
+                          hoverResidualOK && todoUI;
             NSMutableString *result = [NSMutableString stringWithFormat:
                 @"Codex Pulse UI self-test: center=%@ drag=%@ workbench-label=%@ real-agents=%@ agent-label=%@ button-hit=%@ "
-                @"card-mask=%@ carrier-mask=%@ card-child=%@ win-inset=%@ card-520x360=%@ two-column=%@ right-overlay=%@ "
+                @"card-mask=%@ carrier-mask=%@ card-child=%@ win-inset=%@ card-520x390=%@ two-column=%@ right-overlay=%@ "
                 @"hud-6x72=%@ hud-collapsed-pos=%@ hud-expanded-size=%@ hud-expanded-pos=%@ "
                 @"hud-carrier-scale=%@ hud-handle-tr=%@ hud-content-fixed=%@ hud-bg-click=%@ "
                 @"hud-visual-frame=%@ hud-expanded-handle-hidden=%@\n",
@@ -5115,6 +5736,21 @@ int main(int argc, const char *argv[]) {
                 hoverMoveCleared ? @"OK" : @"FAIL",
                 hoverHideCleared ? @"OK" : @"FAIL",
                 hoverRemoveCleared ? @"OK" : @"FAIL"];
+            [result appendFormat:@"Todo self-test: add=%@ blank-ignored=%@ complete=%@ restore=%@ edit=%@ delete=%@ persist=%@ agent-null=%@ strip=%@ no-overlay=%@ expand=%@ expand-no-overlay=%@ ui-count=%@ badge-isolated=%@\n",
+                todoAdd ? @"OK" : @"FAIL",
+                todoBlankIgnored ? @"OK" : @"FAIL",
+                todoComplete ? @"OK" : @"FAIL",
+                todoRestore ? @"OK" : @"FAIL",
+                todoEdit ? @"OK" : @"FAIL",
+                todoDelete ? @"OK" : @"FAIL",
+                todoPersist ? @"OK" : @"FAIL",
+                todoAgentNull ? @"OK" : @"FAIL",
+                todoStrip ? @"OK" : @"FAIL",
+                todoNoOverlay ? @"OK" : @"FAIL",
+                todoExpand ? @"OK" : @"FAIL",
+                todoExpandNoOverlay ? @"OK" : @"FAIL",
+                todoUICount ? @"OK" : @"FAIL",
+                todoBadgeIsolated ? @"OK" : @"FAIL"];
             if (!centered) {
                 [result appendFormat:@"  diagnostic: testVisible=%@ cardFrame=%@ hasScreen=%@\n",
                  NSStringFromRect(testVisible), NSStringFromRect(cardFrame), hasScreen ? @"YES" : @"NO"];
