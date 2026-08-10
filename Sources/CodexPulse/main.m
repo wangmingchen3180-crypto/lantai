@@ -510,17 +510,59 @@ static NSTextField *CPLabel(NSString *text, CGFloat size, NSFontWeight weight, N
     return l;
 }
 
-// 通用 hover/pressed 反馈按钮：圆角背景 + 边框，hover 高亮，pressed 下沉变色。
+// Reduce Motion:动画全部退化为立即切换,不留过渡。
+static BOOL CPHoverReduceMotion(void) {
+    return NSWorkspace.sharedWorkspace.accessibilityDisplayShouldReduceMotion;
+}
+
+// hover wash 唯一动画入口:只动 overlay 的 opacity,不碰布局、不碰 borderWidth。
+// 进入 120ms ease-out,退出 150ms ease-in-out;始终从 presentation 当前值起跳,
+// 快速打断/反向时画面连续不闪;model opacity 先置为终态,动画结束或被移除都不弹回。
+static void CPAnimateWashOpacity(CALayer *overlay, CGFloat target) {
+    if (!overlay) return;
+    if (CPHoverReduceMotion()) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        [overlay removeAllAnimations];
+        overlay.opacity = target;
+        [CATransaction commit];
+        return;
+    }
+    CALayer *pres = (CALayer *)overlay.presentationLayer ?: overlay;
+    CGFloat from = pres.opacity;
+    // model 赋值必须禁隐式动画,否则与显式动画叠加、keys 堆积、时序不可控。
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [overlay removeAllAnimations];
+    overlay.opacity = target; // model 立即为终态
+    [CATransaction commit];
+    if (fabs(from - target) < 0.001) return;
+    CABasicAnimation *anim = [CABasicAnimation animationWithKeyPath:@"opacity"];
+    anim.fromValue = @(from);
+    anim.toValue = @(target);
+    BOOL entering = target > from;
+    anim.duration = entering ? 0.12 : 0.15;
+    anim.timingFunction = [CAMediaTimingFunction functionWithName:entering ? kCAMediaTimingFunctionEaseOut
+                                                                            : kCAMediaTimingFunctionEaseInEaseOut];
+    [overlay addAnimation:anim forKey:@"cpHoverFade"];
+}
+
+// 通用 hover/pressed 反馈按钮：独立白色 wash overlay 层，hover/pressed 只调 overlay
+// 的 opacity(对照原型 4%~7% 白),不再用 .16 muted 灰块,也不再在 hover 时新增描边。
 @interface CPHoverButton : NSButton
 @property (nonatomic, strong) NSColor *cpBaseBackground;
 @property (nonatomic) BOOL cpAlwaysBorder; // 常驻 1px 描边(如详情关闭按钮)
-// 可选的视觉层:设置后 hover/按压的底色与描边画在这层上,按钮自身 layer 保持透明。
+// 可选的视觉层:设置后底色/描边/wash 都画在这层上,按钮自身 layer 保持透明。
 // 用于"点击热区 > 可见图形"的场景(如详情返回钮:24pt 热区 + 与标题行高等大的小圆)。
 @property (nonatomic, strong) CALayer *cpVisualLayer;
+@property (nonatomic, readonly) CALayer *cpHoverOverlay; // 自测断言用
+@property (nonatomic) CGFloat cpHoverWash;   // hover 白 wash 不透明度,默认 0.07(图标钮);行级 0.04~0.05
+@property (nonatomic) CGFloat cpPressedWash; // pressed 白 wash 不透明度,默认 0.10
 @end
 
 @implementation CPHoverButton {
     BOOL _cpHovered; // 显式 hover 状态:mouseEntered/Exited 维护,hide/移出窗口时强制复位
+    CALayer *_cpHoverOverlay;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame {
@@ -528,9 +570,15 @@ static NSTextField *CPLabel(NSString *text, CGFloat size, NSFontWeight weight, N
     if (!self) return nil;
     self.wantsLayer = YES;
     self.layer.cornerRadius = 6.0;
-    // 静止态不显示描边;hover/pressed 时才出现轻微描边与底色。
     self.layer.borderWidth = 0.0;
     self.layer.borderColor = CPBorder().CGColor;
+    _cpHoverWash = 0.07;
+    _cpPressedWash = 0.10;
+    _cpHoverOverlay = [CALayer layer];
+    _cpHoverOverlay.name = @"cpHoverWash";
+    _cpHoverOverlay.backgroundColor = NSColor.whiteColor.CGColor;
+    _cpHoverOverlay.opacity = 0.0;
+    [self.layer addSublayer:_cpHoverOverlay];
     return self;
 }
 
@@ -546,22 +594,46 @@ static NSTextField *CPLabel(NSString *text, CGFloat size, NSFontWeight weight, N
     [self addTrackingArea:area];
 }
 
-- (void)cpApplyBackground {
-    if (self.isHighlighted) {
-        self.cpVisualTarget.borderWidth = 1.0;
-        self.cpVisualTarget.backgroundColor = [CPMuted() colorWithAlphaComponent:0.30].CGColor;
-    } else {
-        BOOL hovered = _cpHovered && self.window && !self.isHiddenOrHasHiddenAncestor;
-        self.cpVisualTarget.borderWidth = (hovered || self.cpAlwaysBorder) ? 1.0 : 0.0;
-        self.cpVisualTarget.backgroundColor = (hovered ? [CPMuted() colorWithAlphaComponent:0.16] : (self.cpBaseBackground ?: NSColor.clearColor)).CGColor;
+- (CALayer *)cpOverlayHost {
+    return self.cpVisualLayer ?: self.layer;
+}
+
+// overlay 始终铺满宿主层并跟随圆角,保证 wash 完整覆盖可见区域(如 Todo 收起整条 34pt)。
+- (void)cpSyncOverlay {
+    CALayer *host = self.cpOverlayHost;
+    if (_cpHoverOverlay.superlayer != host) {
+        [_cpHoverOverlay removeFromSuperlayer];
+        [host insertSublayer:_cpHoverOverlay atIndex:0];
     }
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    _cpHoverOverlay.frame = host.bounds;
+    _cpHoverOverlay.cornerRadius = host.cornerRadius;
+    [CATransaction commit];
+}
+
+- (void)layout {
+    [super layout];
+    [self cpSyncOverlay];
+}
+
+- (void)cpApplyBackground {
+    [self cpSyncOverlay];
+    BOOL hovered = _cpHovered && self.window && !self.isHiddenOrHasHiddenAncestor;
+    CGFloat wash = self.isHighlighted ? self.cpPressedWash : (hovered ? self.cpHoverWash : 0.0);
+    CPAnimateWashOpacity(_cpHoverOverlay, wash);
+    CALayer *target = self.cpVisualTarget;
+    target.borderWidth = self.cpAlwaysBorder ? 1.0 : 0.0;
+    target.backgroundColor = (self.cpBaseBackground ?: NSColor.clearColor).CGColor;
 }
 
 - (CALayer *)cpVisualTarget {
     // 有视觉层时按钮自身 layer 不承载任何可见绘制,热区之外完全透明。
     if (self.cpVisualLayer) {
-        self.layer.borderWidth = 0.0;
-        self.layer.backgroundColor = NSColor.clearColor.CGColor;
+        if (self.cpVisualLayer != self.layer) {
+            self.layer.borderWidth = 0.0;
+            self.layer.backgroundColor = NSColor.clearColor.CGColor;
+        }
         return self.cpVisualLayer;
     }
     return self.layer;
@@ -572,6 +644,20 @@ static NSTextField *CPLabel(NSString *text, CGFloat size, NSFontWeight weight, N
 - (void)cpClearHover {
     _cpHovered = NO;
     [self cpApplyBackground];
+}
+
+// 立即清理(滚动/失焦/关闭):移除动画、禁隐式动画把 model opacity 直接归 0,
+// 连续滚动时不会每帧重启 150ms 退出动画造成拖影,终态也不会有残留动画弹回。
+- (void)cpClearHoverImmediate {
+    _cpHovered = NO;
+    CALayer *target = self.cpVisualTarget;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [_cpHoverOverlay removeAllAnimations];
+    _cpHoverOverlay.opacity = 0.0;
+    target.borderWidth = self.cpAlwaysBorder ? 1.0 : 0.0;
+    target.backgroundColor = (self.cpBaseBackground ?: NSColor.clearColor).CGColor;
+    [CATransaction commit];
 }
 
 // 指针真实位置重校验:窗口移动/缩放(如切换 dock 模式、面板展开收回)时,静止的鼠标
@@ -621,6 +707,8 @@ static NSTextField *CPLabel(NSString *text, CGFloat size, NSFontWeight weight, N
 - (void)setCpBaseBackground:(NSColor *)color { _cpBaseBackground = color; [self cpApplyBackground]; }
 - (void)setCpAlwaysBorder:(BOOL)flag { _cpAlwaysBorder = flag; [self cpApplyBackground]; }
 - (void)setCpVisualLayer:(CALayer *)layer { _cpVisualLayer = layer; [self cpApplyBackground]; }
+- (void)setCpHoverWash:(CGFloat)wash { _cpHoverWash = wash; [self cpApplyBackground]; }
+- (void)setCpPressedWash:(CGFloat)wash { _cpPressedWash = wash; [self cpApplyBackground]; }
 
 @end
 
@@ -1493,13 +1581,18 @@ static CPRolloutState *CPReadRolloutState(NSString *path) {
 - (BOOL)isFlipped { return YES; }
 @end
 
-// Todo 行(B 版):hover 时行底色提亮并同时放行尾编辑铅笔与删除垃圾桶;
-// 非 hover 两个动作钮完全透明,绝不常驻抢眼。
+// Todo 行(B 版):hover 时行底色经独立 wash overlay 淡入(对照原型 .row:hover 5% 白),
+// 并同时放行尾编辑铅笔与删除垃圾桶;非 hover 两个动作钮完全透明,绝不常驻抢眼。
+// 与按钮同一套可中断 opacity 动画;hide/移出窗口/移出父视图时强制复位,不留残留。
 @interface CPTodoRowView : NSView
 @property (nonatomic, weak) NSButton *cpDeleteButton;
 @property (nonatomic, weak) NSButton *cpEditButton;
+@property (nonatomic, readonly) CALayer *cpHoverOverlay; // 自测断言用
 @end
-@implementation CPTodoRowView
+@implementation CPTodoRowView {
+    BOOL _cpRowHovered;
+    CALayer *_cpHoverOverlay;
+}
 - (void)updateTrackingAreas {
     [super updateTrackingAreas];
     for (NSTrackingArea *area in self.trackingAreas) {
@@ -1511,19 +1604,61 @@ static CPRolloutState *CPReadRolloutState(NSString *path) {
                                                        userInfo:nil];
     [self addTrackingArea:area];
 }
-- (void)cpSetActionsVisible:(BOOL)visible {
-    self.layer.backgroundColor = (visible ? [CPFg() colorWithAlphaComponent:0.05] : NSColor.clearColor).CGColor;
-    self.cpDeleteButton.alphaValue = visible ? 1.0 : 0.0;
-    self.cpEditButton.alphaValue = visible ? 1.0 : 0.0;
+- (void)cpEnsureOverlay {
+    if (_cpHoverOverlay || !self.layer) return;
+    _cpHoverOverlay = [CALayer layer];
+    _cpHoverOverlay.name = @"cpHoverWash";
+    _cpHoverOverlay.backgroundColor = NSColor.whiteColor.CGColor;
+    _cpHoverOverlay.opacity = 0.0;
+    [self.layer insertSublayer:_cpHoverOverlay atIndex:0];
+}
+- (void)layout {
+    [super layout];
+    [self cpEnsureOverlay];
+    if (_cpHoverOverlay) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        _cpHoverOverlay.frame = self.layer.bounds;
+        _cpHoverOverlay.cornerRadius = self.layer.cornerRadius;
+        [CATransaction commit];
+    }
+}
+- (void)cpSetRowHovered:(BOOL)hovered {
+    _cpRowHovered = hovered;
+    [self cpEnsureOverlay];
+    [self layout];
+    CPAnimateWashOpacity(_cpHoverOverlay, hovered ? 0.05 : 0.0);
+    // 行尾动作钮同步淡入淡出(NSViewAnimator 天然可中断接续)。
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext *ctx) {
+        ctx.duration = CPHoverReduceMotion() ? 0.0 : (hovered ? 0.12 : 0.15);
+        self.cpDeleteButton.animator.alphaValue = hovered ? 1.0 : 0.0;
+        self.cpEditButton.animator.alphaValue = hovered ? 1.0 : 0.0;
+    }];
+}
+// 立即清理(滚动/失焦/关闭):overlay 与行尾动作组直接归 0,不重启退出动画。
+- (void)cpClearRowHoverImmediate {
+    _cpRowHovered = NO;
+    [self cpEnsureOverlay];
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [_cpHoverOverlay removeAllAnimations];
+    _cpHoverOverlay.opacity = 0.0;
+    self.cpDeleteButton.alphaValue = 0.0;
+    self.cpEditButton.alphaValue = 0.0;
+    [CATransaction commit];
 }
 - (void)mouseEntered:(NSEvent *)event {
     [super mouseEntered:event];
-    [self cpSetActionsVisible:YES];
+    [self cpSetRowHovered:YES];
 }
 - (void)mouseExited:(NSEvent *)event {
     [super mouseExited:event];
-    [self cpSetActionsVisible:NO];
+    [self cpSetRowHovered:NO];
 }
+// 生命周期兜底:收不到 mouseExited 的场景(hide/移出窗口/刷新重建移除)一律复位。
+- (void)viewDidHide { [super viewDidHide]; [self cpSetRowHovered:NO]; }
+- (void)viewDidMoveToWindow { [super viewDidMoveToWindow]; if (!self.window) [self cpSetRowHovered:NO]; }
+- (void)removeFromSuperview { [self cpSetRowHovered:NO]; [super removeFromSuperview]; }
 @end
 
 // Todo 删除钮(B 版垃圾桶):平时透明(由行 hover 放行),hover 图标本身时变红(danger)。
@@ -1596,9 +1731,13 @@ static CPRolloutState *CPReadRolloutState(NSString *path) {
 @property NSTextField *todoEditField;
 @property NSInteger todoEditingID;
 @property NSStackView *todoStack;
+@property NSButton *todoStripButton;
+@property NSScrollView *todoScrollView;
 @property NSTextField *todoCountLabel;
 @property NSView *todoCountPill;
 @property NSImageView *todoChevron;
+@property NSString *todoChevronSymbolName; // 当前 chevron 符号名(自测断言用)
+@property NSInteger hoverRevalidateGeneration; // 滚动停止 revalidate 的去抖代际
 @property BOOL todoExpanded;
 @property NSArray<CPAgent *> *agents;
 @property CPAgent *selectedAgent;
@@ -1635,13 +1774,15 @@ static const CGFloat CPCardWidth = 520.0;
 static const CGFloat CPCardHeight = 360.0; // 内容区高度(头部 + 三列);Todo 栏在此基础上向下加高卡片
 
 // Todo 栏布局常量(方案 B 精致卡片型):Todo 区是 CPBg 工作台上的一张 CPSurface 卡片
-// (hairline 描边 + 10px 圆角,四周 12pt 留白),收起态只露 34pt 卡片头横条
-// (始终参与布局,绝不 overlay);展开时卡片/窗口整体向下加高 CPTodoExpandedExtra,任务区高度不变。
+// (hairline 描边 + 10px 圆角,四周 12pt 外部留白),收起态 shell 精确等于 34pt 卡片头横条
+// (对照原型 .vB:12px 是 .todo 外部 padding,shell 收起只等于 strip,不含任何内部空尾);
+// 展开时卡片/窗口整体向下加高 CPTodoExpandedExtra,任务区高度不变;展开内容自己的
+// 底内边距留在 expanded content 内,不污染 collapsed shell。
 // 尺寸对齐原型 B:strip padding 10px 12px;行 min-height 30;输入框 padding 7px 10px;
-// 列表 5 行可见,超出滚动;卡片底内边距 10。
+// 列表 5 行可见,超出滚动;展开内容底内边距 10。
 static const CGFloat CPTodoStripHeight = 34.0;
-static const CGFloat CPTodoCardMargin = 12.0; // Todo 卡片距工作台卡片左右/底部的留白
-static const CGFloat CPTodoCollapsedHeight = 46.0; // 34 横条 + 12 卡片下内边距
+static const CGFloat CPTodoCardMargin = 12.0; // Todo 卡片距工作台卡片左右/底部的外部留白
+static const CGFloat CPTodoCollapsedHeight = CPTodoStripHeight; // 收起 = 34 横条,无内部空尾
 static const CGFloat CPTodoRowHeight = 30.0; // B 版行 min-height 30
 static const CGFloat CPTodoExpandedExtra = 210.0; // 2 上间距 + 32 输入行 + 8 间距 + 158 列表(5 行) + 10 下内边距
 
@@ -1662,7 +1803,7 @@ static const CGFloat CPTodoExpandedExtra = 210.0; // 2 上间距 + 32 输入行 
     return self;
 }
 
-// 当前 Todo 栏高度(收起 42 / 展开 42+188)。
+// 当前 Todo 栏高度(收起 34 / 展开 34+210)。
 - (CGFloat)todoBarHeight {
     return CPTodoCollapsedHeight + (self.todoExpanded ? CPTodoExpandedExtra : 0.0);
 }
@@ -1735,6 +1876,7 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     [self buildHeader];
     [self buildTodoBar]; // Todo 栏先于 body 建立:body 底部约束到 Todo 栏顶部
     [self buildBody];
+    [self cpInstallHoverGuards];
 
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(dockModeChanged:)
@@ -1884,14 +2026,18 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
         self.todoHeightConstraint
     ]];
 
-    // 卡片头(30pt,贴卡片顶部):整条是可点按钮,子视图只负责排版。
+    // 卡片头(34pt,贴卡片顶部):整条是可点按钮,子视图只负责排版。
+    // 对照原型 .vB .strip:hover = 4% 白 wash,无新增描边;pressed 约 7%。
     NSButton *strip = [CPHoverButton buttonWithTitle:@"" target:self action:@selector(toggleTodoBar:)];
     strip.bordered = NO;
     [strip setButtonType:NSButtonTypeMomentaryChange];
     strip.layer.cornerRadius = 10.0; // hover/按压 wash 按卡片圆角裁切(容器 masksToBounds 兜底)
+    ((CPHoverButton *)strip).cpHoverWash = 0.04;
+    ((CPHoverButton *)strip).cpPressedWash = 0.07;
     strip.toolTip = @"展开/收起待办";
     strip.accessibilityLabel = @"待办，展开/收起";
     strip.translatesAutoresizingMaskIntoConstraints = NO;
+    self.todoStripButton = strip;
     [container addSubview:strip];
     [NSLayoutConstraint activateConstraints:@[
         [strip.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
@@ -1923,7 +2069,9 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     ]];
 
     NSImageView *chevron = [[NSImageView alloc] initWithFrame:NSMakeRect(0, 0, 10, 10)];
-    chevron.image = CPSymbol(self.todoExpanded ? @"chevron.down" : @"chevron.up", 10, CPMuted());
+    // 对照原型:收起=向下(可展开),展开=向上(可收起)。
+    self.todoChevronSymbolName = self.todoExpanded ? @"chevron.up" : @"chevron.down";
+    chevron.image = CPSymbol(self.todoChevronSymbolName, 10, CPMuted());
     chevron.contentTintColor = CPMuted();
     chevron.translatesAutoresizingMaskIntoConstraints = NO;
     self.todoChevron = chevron;
@@ -2004,6 +2152,7 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     scroll.hasVerticalScroller = YES;
     scroll.hasHorizontalScroller = NO;
     scroll.autohidesScrollers = YES;
+    self.todoScrollView = scroll;
     [expanded addSubview:scroll];
 
     NSStackView *stack = [CPFlippedStackView stackViewWithViews:@[]];
@@ -2038,7 +2187,8 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
 - (void)applyTodoExpandedState {
     self.todoHeightConstraint.constant = self.todoBarHeight;
     self.todoExpandedContent.hidden = !self.todoExpanded;
-    self.todoChevron.image = CPSymbol(self.todoExpanded ? @"chevron.down" : @"chevron.up", 10, CPMuted());
+    self.todoChevronSymbolName = self.todoExpanded ? @"chevron.up" : @"chevron.down";
+    self.todoChevron.image = CPSymbol(self.todoChevronSymbolName, 10, CPMuted());
     [self applyCardGeometry];
     // 窗口高度始终与展开状态一致。可见时按完整新尺寸重新居中，避免 Todo 向下展开后
     // 落到屏幕底部之外、迫使用户再手动把整个工作台拖上去；隐藏时只更新尺寸，
@@ -2455,6 +2605,8 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     row.layer.cornerRadius = 8.0;
     row.layer.borderWidth = 0.0;
     ((CPHoverButton *)row).cpBaseBackground = selected ? CPDyn(0.24, 0.32, 0.50, 0.20, 0.28, 0.45) : NSColor.clearColor;
+    ((CPHoverButton *)row).cpHoverWash = 0.05; // 对照原型 .agent:hover;selected 底色独立,wash 只叠 5% 不抢层级
+    ((CPHoverButton *)row).cpPressedWash = 0.08;
     row.tag = [self.agents indexOfObject:agent];
     row.translatesAutoresizingMaskIntoConstraints = NO;
     [row.heightAnchor constraintEqualToConstant:36].active = YES;
@@ -2508,6 +2660,8 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     row.layer.cornerRadius = 10.0;
     row.layer.borderWidth = 0.0;
     ((CPHoverButton *)row).cpBaseBackground = NSColor.clearColor;
+    ((CPHoverButton *)row).cpHoverWash = 0.04; // 对照原型 .task:hover
+    ((CPHoverButton *)row).cpPressedWash = 0.07;
     row.tag = index;
     row.toolTip = [NSString stringWithFormat:@"查看任务详情：%@", task.title];
     row.accessibilityLabel = [NSString stringWithFormat:@"%@，查看任务详情", task.title];
@@ -2595,6 +2749,8 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
 
     // Add Agent placeholder
     NSButton *add = [CPHoverButton buttonWithTitle:@"+ 添加 Agent" target:self action:@selector(addAgent:)];
+    ((CPHoverButton *)add).cpHoverWash = 0.05; // 对照原型 .add-agent:hover
+    ((CPHoverButton *)add).cpPressedWash = 0.08;
     add.bordered = NO;
     add.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
     add.contentTintColor = CPMuted();
@@ -2928,10 +3084,91 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
 }
 
 - (void)close {
+    [self cpInvalidateHoverImmediately];
     BOOL wasKey = self.window.isKeyWindow;
     [self.window orderOut:nil];
     if (wasKey) [NSApp deactivate]; // 焦点交还,避免 app 激活态悬空
     [self removeClickMonitor];
+}
+
+#pragma mark - Hover 残留防护(滚动 / 窗口生命周期)
+
+// 滚动时鼠标常常静止,AppKit 不会给被滚走的行补发 mouseExited,hover 蒙层会残留在
+// 原位。统一在 clip view bounds 变化(含 live scroll/惯性滚动)时立即清空全部 hover
+// (不重启退出动画,连续滚动不拖影),停止后用带代际的短 debounce 按真实 window
+// mouse point 重校验,保证任何时刻最多只有实际鼠标下的一个 row 处于 hover;
+// 不用常驻 timer。窗口 resign/close/orderOut、app deactivate 同样立即清理,
+// 并递增代际取消尚未触发的 revalidate。
+- (void)cpInstallHoverGuards {
+    NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+    for (NSScrollView *scroll in @[self.taskScrollView, self.todoScrollView]) {
+        scroll.contentView.postsBoundsChangedNotifications = YES;
+        [center addObserver:self selector:@selector(cpScrollHoverInvalidate:)
+                       name:NSViewBoundsDidChangeNotification object:scroll.contentView];
+    }
+    [center addObserver:self selector:@selector(cpHoverInvalidateNotification:)
+                   name:NSWindowDidResignKeyNotification object:self.window];
+    [center addObserver:self selector:@selector(cpHoverInvalidateNotification:)
+                   name:NSWindowWillCloseNotification object:self.window];
+    [center addObserver:self selector:@selector(cpHoverInvalidateNotification:)
+                   name:NSApplicationDidResignActiveNotification object:NSApp];
+}
+
+- (void)dealloc {
+    [NSNotificationCenter.defaultCenter removeObserver:self];
+}
+
+// 立即清理全部 hover:不重启 150ms 退出动画,overlay model opacity 与 Todo 行尾
+// 动作组直接归 0,连续滚动/失焦/关闭场景不拖影、不弹回。
+- (void)cpClearAllHoverImmediately {
+    NSMutableArray<NSView *> *queue = [NSMutableArray arrayWithArray:self.card.subviews];
+    while (queue.count) {
+        NSView *v = queue.firstObject;
+        [queue removeObjectAtIndex:0];
+        if ([v isKindOfClass:CPHoverButton.class]) [(CPHoverButton *)v cpClearHoverImmediate];
+        else if ([v isKindOfClass:CPTodoRowView.class]) [(CPTodoRowView *)v cpClearRowHoverImmediate];
+        [queue addObjectsFromArray:v.subviews];
+    }
+}
+
+- (void)cpInvalidateHoverImmediately {
+    self.hoverRevalidateGeneration++; // 取消尚未触发的 revalidate
+    [self cpClearAllHoverImmediately];
+}
+
+- (void)cpHoverInvalidateNotification:(NSNotification *)note {
+    (void)note;
+    [self cpInvalidateHoverImmediately];
+}
+
+- (void)cpScrollHoverInvalidate:(NSNotification *)note {
+    (void)note;
+    [self cpInvalidateHoverImmediately]; // 滚动期间一律抑制 hover
+    // 停止滚动(bounds 不再变)120ms 后按真实鼠标位置恢复唯一 hover;代际失效防堆积。
+    NSInteger generation = self.hoverRevalidateGeneration;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (generation != self.hoverRevalidateGeneration) return;
+        [self cpRevalidateHoverUnderMouse];
+    });
+}
+
+// 命中恢复:鼠标停在 Todo 子按钮(勾选/标题/编辑/删除)上时,必须同时恢复其
+// CPTodoRowView 祖先——否则只有子按钮 hover,行高亮与行尾动作组不恢复。
+- (void)cpRestoreHoverForHitView:(NSView *)hit {
+    CPTodoRowView *row = nil;
+    CPHoverButton *button = nil;
+    for (NSView *v = hit; v && v != self.card; v = v.superview) {
+        if (!row && [v isKindOfClass:CPTodoRowView.class]) row = (CPTodoRowView *)v;
+        if (!button && [v isKindOfClass:CPHoverButton.class]) button = (CPHoverButton *)v;
+    }
+    if (row) [row cpSetRowHovered:YES];
+    if (button) [button cpSetHovered:YES];
+}
+
+- (void)cpRevalidateHoverUnderMouse {
+    if (!self.window.isVisible) return;
+    NSPoint p = [self.card convertPoint:self.window.mouseLocationOutsideOfEventStream fromView:nil];
+    [self cpRestoreHoverForHitView:[self.card hitTest:p]];
 }
 
 - (BOOL)isVisible {
@@ -5766,8 +6003,9 @@ int main(int argc, const char *argv[]) {
             BOOL m10ui = m10ScrollStruct && m10HeaderFixed && m10Scrollable &&
                          m10FirstRowOK && m10LastRowOK && m10WidthOK;
 
-            // L2: hover 蒙层残留回归 — 正常进出清零;窗口移动(鼠标静止相对移出)、
-            // 隐藏、移出父视图等收不到 mouseExited 的场景必须强制复位。
+            // L2: hover 蒙层残留回归 — wash 只动 overlay opacity,hover 不再新增描边;
+            // 正常进出清零;窗口移动(鼠标静止相对移出)、隐藏、移出父视图等收不到
+            // mouseExited 的场景必须强制复位,model opacity 终态必为 0。
             NSWindow *hoverWin = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 120, 120)
                                                              styleMask:NSWindowStyleMaskBorderless
                                                                backing:NSBackingStoreBuffered
@@ -5777,26 +6015,22 @@ int main(int argc, const char *argv[]) {
             [hoverWin.contentView addSubview:hoverBtn];
             [hoverWin orderFrontRegardless];
             [hoverBtn cpSetHovered:YES];
-            CGColorRef hoverBg = hoverBtn.layer.backgroundColor;
-            BOOL hoverShown = hoverBg && CGColorGetAlpha(hoverBg) > 0.05;
+            BOOL hoverShown = hoverBtn.cpHoverOverlay.opacity > 0.05 &&
+                              hoverBtn.layer.borderWidth == 0.0; // hover 不再加描边
             [hoverBtn cpSetHovered:NO];
-            CGColorRef exitBg = hoverBtn.layer.backgroundColor;
-            BOOL hoverExitCleared = !exitBg || CGColorGetAlpha(exitBg) == 0.0;
+            BOOL hoverExitCleared = hoverBtn.cpHoverOverlay.opacity == 0.0;
             // 窗口移动到远离真实鼠标的位置:tracking area 不会补发 exited,必须靠重校验清零。
             [hoverBtn cpSetHovered:YES];
             NSPoint realMouse = NSEvent.mouseLocation;
             [hoverWin setFrameOrigin:NSMakePoint(realMouse.x + 800.0, realMouse.y + 800.0)];
-            CGColorRef moveBg = hoverBtn.layer.backgroundColor;
-            BOOL hoverMoveCleared = !moveBg || CGColorGetAlpha(moveBg) == 0.0;
+            BOOL hoverMoveCleared = hoverBtn.cpHoverOverlay.opacity == 0.0;
             [hoverBtn cpSetHovered:YES];
             hoverBtn.hidden = YES; // 收不到 mouseExited:viewDidHide 兜底
-            CGColorRef hideBg = hoverBtn.layer.backgroundColor;
-            BOOL hoverHideCleared = !hideBg || CGColorGetAlpha(hideBg) == 0.0;
+            BOOL hoverHideCleared = hoverBtn.cpHoverOverlay.opacity == 0.0;
             hoverBtn.hidden = NO;
             [hoverBtn cpSetHovered:YES];
             [hoverBtn removeFromSuperview]; // 刷新重建时旧按钮被移除
-            CGColorRef removedBg = hoverBtn.layer.backgroundColor;
-            BOOL hoverRemoveCleared = !removedBg || CGColorGetAlpha(removedBg) == 0.0;
+            BOOL hoverRemoveCleared = hoverBtn.cpHoverOverlay.opacity == 0.0;
             [hoverWin orderOut:nil];
             BOOL hoverResidualOK = hoverShown && hoverExitCleared && hoverMoveCleared &&
                                    hoverHideCleared && hoverRemoveCleared;
@@ -5913,10 +6147,11 @@ int main(int argc, const char *argv[]) {
             [rowB mouseEntered:rowNilEvent];
             todoRowActionsOK = todoRowActionsOK &&
                                rowB.cpEditButton.alphaValue == 1.0 && rowB.cpDeleteButton.alphaValue == 1.0 &&
-                               CGColorGetAlpha(rowB.layer.backgroundColor) > 0.02;
+                               rowB.cpHoverOverlay.opacity > 0.02; // 5% 白 wash overlay
             [rowB mouseExited:rowNilEvent];
             todoRowActionsOK = todoRowActionsOK &&
-                               rowB.cpEditButton.alphaValue == 0.0 && rowB.cpDeleteButton.alphaValue == 0.0;
+                               rowB.cpEditButton.alphaValue == 0.0 && rowB.cpDeleteButton.alphaValue == 0.0 &&
+                               rowB.cpHoverOverlay.opacity == 0.0;
             [todoCard.card layoutSubtreeIfNeeded];
             BOOL todoSizesOK = CPTodoStripHeight >= 32.0 &&
                                fabs(rowB.frame.size.height - CPTodoRowHeight) <= 0.5 && CPTodoRowHeight >= 30.0;
@@ -5961,12 +6196,105 @@ int main(int argc, const char *argv[]) {
             [emptyCard.window orderOut:nil];
             BOOL todoBStyle = todoLayeringOK && todoHairlineOK && todoFocusOK && todoPlusOK &&
                               todoRowActionsOK && todoSizesOK && todoColorsOK && todoPillOK && todoEmptyOK;
+
+            // L3a: Todo 收起几何回归 — collapsed shell 精确 34pt(= strip,无内部空尾),
+            // strip/wash overlay 完整覆盖整个 shell;收起 chevron.down、展开 chevron.up;
+            // strip hover = 4% 白 wash,不新增描边。
+            [todoCard.card layoutSubtreeIfNeeded];
+            CPHoverButton *stripBtn = (CPHoverButton *)todoCard.todoStripButton;
+            BOOL todoCollapsedGeo = fabs(todoCard.todoHeightConstraint.constant - 34.0) <= 0.5 &&
+                                    CPTodoCollapsedHeight == CPTodoStripHeight &&
+                                    NSEqualRects(stripBtn.frame, todoCard.todoContainer.bounds) &&
+                                    NSEqualRects(stripBtn.cpHoverOverlay.frame, stripBtn.layer.bounds) &&
+                                    stripBtn.layer.borderWidth == 0.0;
+            [stripBtn cpSetHovered:YES];
+            todoCollapsedGeo = todoCollapsedGeo &&
+                               fabs(stripBtn.cpHoverOverlay.opacity - 0.04) < 0.001 &&
+                               stripBtn.layer.borderWidth == 0.0; // hover 不加描边
+            [stripBtn cpSetHovered:NO];
+            todoCollapsedGeo = todoCollapsedGeo && stripBtn.cpHoverOverlay.opacity == 0.0;
+            BOOL todoChevronOK = [todoCard.todoChevronSymbolName isEqualToString:@"chevron.down"]; // 收起向下
+            todoCard.todoExpanded = YES;
+            [todoCard applyTodoExpandedState];
+            todoChevronOK = todoChevronOK && [todoCard.todoChevronSymbolName isEqualToString:@"chevron.up"]; // 展开向上
+            todoCard.todoExpanded = NO;
+            [todoCard applyTodoExpandedState];
             [todoCard.window orderOut:nil];
+
+            // L3b: 滚动残留回归 — 鼠标静止、clip bounds 改变(滚动)时旧行 hover 立即清零:
+            // model/presentation 均为 0、无残留 animationKeys、Todo 行尾动作组 alpha 归 0;
+            // 递增代际取消 pending revalidate。
+            CPHoverButton *scrollRowA = (CPHoverButton *)card10.taskStack.arrangedSubviews[0];
+            CPHoverButton *scrollRowB = (CPHoverButton *)card10.taskStack.arrangedSubviews[1];
+            [scrollRowA cpSetHovered:YES];
+            BOOL scrollHoverShown = scrollRowA.cpHoverOverlay.opacity > 0.0;
+            NSInteger genBefore = card10.hoverRevalidateGeneration;
+            [[NSNotificationCenter defaultCenter] postNotificationName:NSViewBoundsDidChangeNotification
+                                                                object:card10.taskScrollView.contentView];
+            CALayer *scrollPresA = (CALayer *)scrollRowA.cpHoverOverlay.presentationLayer ?: scrollRowA.cpHoverOverlay;
+            BOOL scrollClearsHover = scrollRowA.cpHoverOverlay.opacity == 0.0 &&
+                                     scrollPresA.opacity == 0.0 &&
+                                     scrollRowA.cpHoverOverlay.animationKeys.count == 0 && // immediate:不重启退出动画
+                                     card10.hoverRevalidateGeneration > genBefore;
+            // Todo 行滚动清理:行 wash 与编辑/删除动作组同步归 0。
+            CPTodoRowView *todoScrollRow = (CPTodoRowView *)todoCard.todoStack.arrangedSubviews.firstObject;
+            [todoScrollRow cpSetRowHovered:YES];
+            BOOL todoRowHoverShown = todoScrollRow.cpHoverOverlay.opacity > 0.0 &&
+                                     todoScrollRow.cpEditButton.alphaValue == 1.0;
+            [[NSNotificationCenter defaultCenter] postNotificationName:NSViewBoundsDidChangeNotification
+                                                                object:todoCard.todoScrollView.contentView];
+            scrollClearsHover = scrollClearsHover && todoRowHoverShown &&
+                                todoScrollRow.cpHoverOverlay.opacity == 0.0 &&
+                                todoScrollRow.cpHoverOverlay.animationKeys.count == 0 &&
+                                todoScrollRow.cpEditButton.alphaValue == 0.0 &&
+                                todoScrollRow.cpDeleteButton.alphaValue == 0.0;
+            // Todo 子按钮命中恢复:revalidate 命中删除钮时,必须同时恢复行 hover 与动作组。
+            [todoCard cpRestoreHoverForHitView:todoScrollRow.cpDeleteButton];
+            BOOL todoRowRestoreOK = todoScrollRow.cpHoverOverlay.opacity > 0.0 &&
+                                    todoScrollRow.cpEditButton.alphaValue == 1.0 &&
+                                    todoScrollRow.cpDeleteButton.alphaValue == 1.0;
+            [todoCard cpClearAllHoverImmediately];
+            // 窗口失焦:立即清理 + 递增代际,取消滚动后尚未触发的 pending revalidate。
+            [[NSNotificationCenter defaultCenter] postNotificationName:NSViewBoundsDidChangeNotification
+                                                                object:card10.taskScrollView.contentView];
+            NSInteger genAfterScroll = card10.hoverRevalidateGeneration;
+            [[NSNotificationCenter defaultCenter] postNotificationName:NSWindowDidResignKeyNotification
+                                                                object:card10.window];
+            BOOL resignCancelsPending = card10.hoverRevalidateGeneration > genAfterScroll;
+            [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.25]];
+            NSInteger hoveredAfterScroll = 0;
+            for (NSView *v in card10.taskStack.arrangedSubviews) {
+                if ([v isKindOfClass:CPHoverButton.class] &&
+                    ((CPHoverButton *)v).cpHoverOverlay.opacity > 0.0) hoveredAfterScroll++;
+            }
+            // 停止后按真实鼠标位置重校验:任何时刻最多只有实际鼠标下的一个 row hover。
+            scrollClearsHover = scrollClearsHover && hoveredAfterScroll <= 1 && resignCancelsPending;
+            [card10 cpClearAllHoverImmediately];
+
+            // L3c: 快速 A→B→A 切换 — 动画可中断不堆积,最终 model/presentation 状态准确。
+            [scrollRowA cpSetHovered:YES];
+            [scrollRowA cpSetHovered:NO];
+            [scrollRowB cpSetHovered:YES];
+            [scrollRowB cpSetHovered:NO];
+            [scrollRowA cpSetHovered:YES];
+            BOOL rapidModelA = fabs(scrollRowA.cpHoverOverlay.opacity - scrollRowA.cpHoverWash) < 0.001;
+            BOOL rapidModelB = scrollRowB.cpHoverOverlay.opacity == 0.0;
+            BOOL rapidKeysA = scrollRowA.cpHoverOverlay.animationKeys.count <= 1;
+            BOOL rapidKeysB = scrollRowB.cpHoverOverlay.animationKeys.count <= 1;
+            BOOL rapidHoverOK = rapidModelA && rapidModelB && rapidKeysA && rapidKeysB;
+            [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.4]];
+            CALayer *presA = (CALayer *)scrollRowA.cpHoverOverlay.presentationLayer ?: scrollRowA.cpHoverOverlay;
+            CALayer *presB = (CALayer *)scrollRowB.cpHoverOverlay.presentationLayer ?: scrollRowB.cpHoverOverlay;
+            BOOL rapidPresA = fabs(presA.opacity - scrollRowA.cpHoverWash) < 0.01; // 收敛到终态
+            BOOL rapidPresB = presB.opacity < 0.01; // 退出动画收敛到 0,不弹回
+            rapidHoverOK = rapidHoverOK && rapidPresA && rapidPresB;
+            [scrollRowA cpSetHovered:NO];
+            BOOL hoverMotionOK = scrollHoverShown && scrollClearsHover && todoRowRestoreOK && rapidHoverOK;
 
             BOOL todoUI = todoAdd && todoBlankIgnored && todoComplete && todoRestore && todoEdit && todoDelete &&
                           todoPersist && todoAgentNull && todoStrip && todoNoOverlay && todoExpand &&
                           todoAutoReposition && todoExpandNoOverlay && todoCardStyle && todoUICount && todoBadgeIsolated &&
-                          todoBStyle;
+                          todoBStyle && todoCollapsedGeo && todoChevronOK;
 
             // Perf UI: 同签名跳过渲染、状态变化触发渲染(AppDelegate 合入路径,无窗口亦可断言计数)
             AppDelegate *perfDelegate = AppDelegate.new;
@@ -6017,7 +6345,7 @@ int main(int argc, const char *argv[]) {
                           hudCollapsed6x72 && hudCollapsedOnMainScreen && hudExpandedSizeOK && hudExpandedOnMainScreen &&
                           shadowCarrierScales && handleAnchoredTopRight && contentNotSizable && hudClickViewIsBackgroundView &&
                           hudVisualFrameExact && hudExpandedHandleHidden && m2ui && m3ui && m3entries && m4ui && m5ui && m7ui && m8ui && m9ui && m10ui &&
-                          hoverResidualOK && todoUI && perfUI;
+                          hoverResidualOK && hoverMotionOK && todoUI && perfUI;
             NSMutableString *result = [NSMutableString stringWithFormat:
                 @"Codex Pulse UI self-test: center=%@ drag=%@ workbench-label=%@ real-agents=%@ agent-label=%@ button-hit=%@ "
                 @"card-mask=%@ carrier-mask=%@ card-child=%@ win-inset=%@ card-520x402=%@ two-column=%@ right-overlay=%@ "
@@ -6192,6 +6520,20 @@ int main(int argc, const char *argv[]) {
                 todoColorsOK ? @"OK" : @"FAIL",
                 todoPillOK ? @"OK" : @"FAIL",
                 todoEmptyOK ? @"OK" : @"FAIL"];
+            [result appendFormat:@"L3 UI self-test(hover 动效/滚动残留): collapsed-geo=%@ chevron=%@ scroll-shown=%@ scroll-clears=%@ todo-row-restore=%@ rapid-aba=%@\n",
+                todoCollapsedGeo ? @"OK" : @"FAIL",
+                todoChevronOK ? @"OK" : @"FAIL",
+                scrollHoverShown ? @"OK" : @"FAIL",
+                scrollClearsHover ? @"OK" : @"FAIL",
+                todoRowRestoreOK ? @"OK" : @"FAIL",
+                rapidHoverOK ? @"OK" : @"FAIL"];
+            if (!rapidHoverOK) {
+                [result appendFormat:@"  diagnostic: modelA=%d modelB=%d keysA=%d keysB=%d presA=%d presB=%d (countA=%lu keys=%@)\n",
+                 rapidModelA ? 1 : 0, rapidModelB ? 1 : 0, rapidKeysA ? 1 : 0, rapidKeysB ? 1 : 0,
+                 rapidPresA ? 1 : 0, rapidPresB ? 1 : 0,
+                 (unsigned long)scrollRowA.cpHoverOverlay.animationKeys.count,
+                 [scrollRowA.cpHoverOverlay.animationKeys componentsJoinedByString:@","]];
+            }
             [result appendFormat:@"Perf UI self-test: signature-skip=%@ ripple-no-restart=%@ ripple-restart-on-change=%@ hud-paused-collapsed=%@ hud-resume-expand=%@ hud-repause-collapse=%@\n",
                 perfSkipOK ? @"OK" : @"FAIL",
                 rippleNoRestart ? @"OK" : @"FAIL",
