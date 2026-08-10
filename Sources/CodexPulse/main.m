@@ -54,7 +54,7 @@ static NSString *CPStatusTitle(CPStatus s) {
         case CPStatusWorking: return @"工作中";
         case CPStatusWaiting: return @"等待中";
         case CPStatusAttention: return @"需关注";
-        case CPStatusCompleted: return @"已完成";
+        case CPStatusCompleted: return @"已就绪";
         case CPStatusFailed: return @"失败";
         case CPStatusIdle: return @"空闲";
     }
@@ -726,7 +726,7 @@ static NSString *CPDisplayStatusTitle(CPDisplayStatus s) {
     switch (s) {
         case CPDisplayStatusFailed: return @"失败";
         case CPDisplayStatusWaiting: return @"需关注";
-        case CPDisplayStatusCompletedPendingReview: return @"已就绪"; // Agent 级完成态面向用户显示「已就绪」;任务级「已完成」语义不变
+        case CPDisplayStatusCompletedPendingReview: return @"已就绪"; // 完成事件的底层语义不变，界面统一显示「已就绪」
         case CPDisplayStatusWorking: return @"工作中";
         case CPDisplayStatusIdle: return @"空闲";
     }
@@ -1898,7 +1898,7 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     [self renderTodos];
 }
 
-// 展开/收起:Todo 栏高度 + 卡片/窗口整体高度一起变,顶部边缘在屏幕上保持不动。
+// 展开/收起:Todo 栏高度 + 卡片/窗口整体高度一起变。
 - (void)toggleTodoBar:(id)sender {
     (void)sender;
     self.todoExpanded = !self.todoExpanded;
@@ -1911,7 +1911,9 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     self.todoExpandedContent.hidden = !self.todoExpanded;
     self.todoChevron.image = CPSymbol(self.todoExpanded ? @"chevron.down" : @"chevron.up", 10, CPMuted());
     [self applyCardGeometry];
-    // 窗口高度始终与展开状态一致(隐藏时也要对齐,下次显示/几何断言才正确);顶部边缘在屏幕上保持不动。
+    // 窗口高度始终与展开状态一致。可见时按完整新尺寸重新居中，避免 Todo 向下展开后
+    // 落到屏幕底部之外、迫使用户再手动把整个工作台拖上去；隐藏时只更新尺寸，
+    // 下次 showNearDockRect: 会按同一套居中逻辑显示。
     CGFloat currentExtra = self.window.frame.size.height - (CPCardHeight + CPTodoStripHeight + CPWorkbenchInset * 2.0);
     CGFloat wantedExtra = self.todoExpanded ? CPTodoExpandedExtra : 0.0;
     CGFloat delta = wantedExtra - currentExtra;
@@ -1919,7 +1921,12 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
         NSRect frame = self.window.frame;
         frame.origin.y -= delta;
         frame.size.height += delta;
-        [self.window setFrame:frame display:YES animate:NO];
+        BOOL visible = self.window.isVisible;
+        NSScreen *screen = self.window.screen ?: NSScreen.screens.firstObject ?: NSScreen.mainScreen;
+        if (visible && screen) {
+            frame = CPCenteredRectInVisibleFrame(screen.visibleFrame, frame.size);
+        }
+        [self.window setFrame:frame display:YES animate:visible];
     }
 }
 
@@ -3988,7 +3995,7 @@ static const CGFloat CPHUDAgentRail = 64.0;
     NSArray<NSArray *> *rows = @[
         @[@"失败", CPRed()],
         @[@"等待处理", CPOrange()],
-        @[@"已完成", CPBlue()],
+        @[@"已就绪", CPBlue()],
         @[@"运行中", CPGreen()],
         @[@"待机", CPDisplayStatusColor(CPDisplayStatusIdle)],
     ];
@@ -5279,7 +5286,7 @@ int main(int argc, const char *argv[]) {
                 legendOK = legendOK && dotCount == 5 &&
                            [legendTexts containsObject:@"失败"] &&
                            [legendTexts containsObject:@"等待处理"] &&
-                           [legendTexts containsObject:@"已完成"] &&
+                           [legendTexts containsObject:@"已就绪"] &&
                            [legendTexts containsObject:@"运行中"] &&
                            [legendTexts containsObject:@"待机"] &&
                            [legendTexts containsObject:@"Agent 环跟随最近更新的任务"] &&
@@ -5556,6 +5563,11 @@ int main(int argc, const char *argv[]) {
             BOOL todoNoOverlay = fabs(todoBody.frame.origin.y - NSMaxY(todoCard.todoContainer.frame)) <= 0.5;
             todoCard.todoExpanded = YES;
             [todoCard applyTodoExpandedState];
+            NSScreen *todoScreen = todoCard.window.screen ?: NSScreen.screens.firstObject ?: NSScreen.mainScreen;
+            BOOL todoAutoReposition = !todoScreen ||
+                (fabs(NSMidX(todoCard.window.frame) - NSMidX(todoScreen.visibleFrame)) <= 1.0 &&
+                 fabs(NSMidY(todoCard.window.frame) - NSMidY(todoScreen.visibleFrame)) <= 1.0 &&
+                 NSContainsRect(todoScreen.visibleFrame, todoCard.window.frame));
             BOOL todoExpand = !todoCard.todoExpandedContent.hidden &&
                               fabs(todoCard.todoHeightConstraint.constant - (CPTodoStripHeight + CPTodoExpandedExtra)) <= 0.5 &&
                               fabs(todoCard.window.frame.size.height - (todoCard.cardHeight + CPWorkbenchInset * 2.0)) <= 0.5;
@@ -5579,7 +5591,7 @@ int main(int argc, const char *argv[]) {
 
             BOOL todoUI = todoAdd && todoBlankIgnored && todoComplete && todoRestore && todoEdit && todoDelete &&
                           todoPersist && todoAgentNull && todoStrip && todoNoOverlay && todoExpand &&
-                          todoExpandNoOverlay && todoUICount && todoBadgeIsolated;
+                          todoAutoReposition && todoExpandNoOverlay && todoUICount && todoBadgeIsolated;
 
             BOOL passed = centered && draggableHeader && labeledWorkbench && onlyRealAgents && labeledAgent && buttonReceivesClick &&
                           agentStatusDotsAligned && attentionBadgeClearsOnOpen &&
@@ -5736,7 +5748,7 @@ int main(int argc, const char *argv[]) {
                 hoverMoveCleared ? @"OK" : @"FAIL",
                 hoverHideCleared ? @"OK" : @"FAIL",
                 hoverRemoveCleared ? @"OK" : @"FAIL"];
-            [result appendFormat:@"Todo self-test: add=%@ blank-ignored=%@ complete=%@ restore=%@ edit=%@ delete=%@ persist=%@ agent-null=%@ strip=%@ no-overlay=%@ expand=%@ expand-no-overlay=%@ ui-count=%@ badge-isolated=%@\n",
+            [result appendFormat:@"Todo self-test: add=%@ blank-ignored=%@ complete=%@ restore=%@ edit=%@ delete=%@ persist=%@ agent-null=%@ strip=%@ no-overlay=%@ expand=%@ auto-reposition=%@ expand-no-overlay=%@ ui-count=%@ badge-isolated=%@\n",
                 todoAdd ? @"OK" : @"FAIL",
                 todoBlankIgnored ? @"OK" : @"FAIL",
                 todoComplete ? @"OK" : @"FAIL",
@@ -5748,6 +5760,7 @@ int main(int argc, const char *argv[]) {
                 todoStrip ? @"OK" : @"FAIL",
                 todoNoOverlay ? @"OK" : @"FAIL",
                 todoExpand ? @"OK" : @"FAIL",
+                todoAutoReposition ? @"OK" : @"FAIL",
                 todoExpandNoOverlay ? @"OK" : @"FAIL",
                 todoUICount ? @"OK" : @"FAIL",
                 todoBadgeIsolated ? @"OK" : @"FAIL"];
