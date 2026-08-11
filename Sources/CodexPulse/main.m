@@ -202,6 +202,7 @@ static NSString *CPFormatDateCN(NSDate *date) {
 @property NSString *projectPath;
 @property NSString *projectName;
 @property NSString *rolloutPath;
+@property NSString *sourceKind; // 任务来源:"codex" / "kimi-cli" / "kimi-desktop"(未来 "claude" 等),路由按它分流
 @property NSString *activity;
 @property NSDate *createdAt;
 @property NSDate *updatedAt;
@@ -730,25 +731,6 @@ static NSImage *CPSymbol(NSString *name, CGFloat pointSize, NSColor *color) {
     return img;
 }
 
-// 把符号渲染成 side x side(pt)的位图,供 CALayer.contents 使用。
-// 按钮内部私有布局约束会撑坏热区几何(曾把 24x24 热区撑成 24x29 椭圆),
-// 因此 chevron 不走 NSButton.image,而作为圆的 layer 内容绘制,几何完全可控。
-static CGImageRef CPSymbolCGImage(NSString *name, CGFloat pointSize, NSColor *color, CGFloat side) {
-    CGFloat scale = 2.0;
-    NSSize px = NSMakeSize(side * scale, side * scale);
-    NSImage *symbol = CPSymbol(name, pointSize, color);
-    NSImage *rendered = [[NSImage alloc] initWithSize:px];
-    [rendered lockFocus];
-    [[NSGraphicsContext currentContext] setImageInterpolation:NSImageInterpolationHigh];
-    NSSize s = symbol.size;
-    NSRect dst = NSMakeRect((px.width - s.width) / 2.0, (px.height - s.height) / 2.0, s.width, s.height);
-    [symbol drawInRect:dst fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1.0];
-    [rendered unlockFocus];
-    NSRect proposed = NSMakeRect(0, 0, px.width, px.height);
-    CGImageRef cg = [rendered CGImageForProposedRect:&proposed context:nil hints:nil];
-    return (CGImageRef)CFRetain(cg);
-}
-
 // 把官方 app 图标裁成 side x side 的圆形,放进状态环内。
 static NSImage *CPCircularIcon(NSImage *source, CGFloat side) {
     NSSize size = NSMakeSize(side, side);
@@ -790,16 +772,26 @@ static NSImage *CPAppIconForAgent(NSString *agentID, CGFloat side) {
 }
 
 // 返回可精确定位任务的 Agent 深链。未知/占位 Agent 返回 nil，由调用方降级为仅唤起应用。
+// Kimi:desktop daimon 会话在本机注册了 kimi:// scheme 时返回 kimi:// 深链;
+// Kimi Code CLI 会话无安全精确的 resume 入口,明确返回 nil(降级唤起 Kimi 客户端,不伪造成功)。
 static NSURL *CPDeepLinkForAgentTask(CPAgent *agent, CPTask *task) {
     if (!agent || !task || !task.taskID.length || agent.placeholder) return nil;
-    NSString *escapedID = [task.taskID stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLPathAllowedCharacterSet];
-    if (!escapedID.length) return nil;
     NSString *agentID = agent.agentID.lowercaseString;
     if ([agentID isEqualToString:@"codex"]) {
+        NSString *escapedID = [task.taskID stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLPathAllowedCharacterSet];
+        if (!escapedID.length) return nil;
         return [NSURL URLWithString:[NSString stringWithFormat:@"codex://threads/%@", escapedID]];
     }
     if ([agentID isEqualToString:@"kimi"]) {
-        return [NSURL URLWithString:[NSString stringWithFormat:@"kimi-work://chat/%@", escapedID]];
+        if (![task.sourceKind isEqualToString:@"kimi-desktop"]) return nil;
+        NSString *rawID = task.taskID;
+        NSString *prefix = @"kimi-desktop-";
+        if ([rawID hasPrefix:prefix]) rawID = [rawID substringFromIndex:prefix.length];
+        NSString *escapedID = [rawID stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLPathAllowedCharacterSet];
+        if (!escapedID.length) return nil;
+        NSURL *probe = [NSURL URLWithString:@"kimi://"];
+        if (!probe || ![NSWorkspace.sharedWorkspace URLForApplicationToOpenURL:probe]) return nil; // 未注册 kimi:// 不试深链
+        return [NSURL URLWithString:[NSString stringWithFormat:@"kimi://chat/%@", escapedID]];
     }
     return nil;
 }
@@ -1199,38 +1191,84 @@ static CPRolloutState *CPReadRolloutState(NSString *path) {
     return state;
 }
 
+#pragma mark - Agent Source 边界
+
+// 通用解析缓存:按 path+mtime+size 复用解析结果,文件未变不重复读盘/解析。
+// state.json 小文件与 wire/context 有界尾部都走这里;上限兜底防无限增长。
+@interface CPStateCache : NSObject
+@property (nonatomic) NSMutableDictionary<NSString *, NSDictionary *> *entries; // path → {mtime,size,value}
+- (id)objectForPath:(NSString *)path parser:(id (^)(NSString *path))parser;
+@end
+
+@implementation CPStateCache
+
+- (id)objectForPath:(NSString *)path parser:(id (^)(NSString *path))parser {
+    if (!path.length || !parser) return nil;
+    if (!self.entries) self.entries = NSMutableDictionary.dictionary;
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+    NSDate *mtime = attrs[NSFileModificationDate] ?: NSDate.distantPast;
+    NSNumber *size = attrs[NSFileSize] ?: @0;
+    NSDictionary *cached = self.entries[path];
+    if (cached && [cached[@"mtime"] isEqual:mtime] && [cached[@"size"] isEqual:size]) {
+        id value = cached[@"value"];
+        return [value isKindOfClass:NSNull.class] ? nil : value;
+    }
+    id value = parser(path) ?: NSNull.null;
+    if (self.entries.count > 64) [self.entries removeAllObjects];
+    self.entries[path] = @{@"mtime": mtime, @"size": size, @"value": value};
+    return [value isKindOfClass:NSNull.class] ? nil : value;
+}
+
+@end
+
+// Agent 数据源边界:每个 harness(Codex / Kimi / 未来 Claude)实现一个 source,
+// 统一输出 CPAgent/CPTask;CPStateReader 只负责按注册数组聚合,不理解任何来源细节。
+@protocol CPAgentSource <NSObject>
+- (CPAgent *)readAgent;
+@end
+
+// Agent 总体状态:取最近更新任务的状态(同刻按严重度决胜)。供各 source 复用。
+static CPStatus CPOverallStatusForTasks(NSArray<CPTask *> *tasks) {
+    CPTask *latest = nil;
+    for (CPTask *t in tasks) {
+        NSComparisonResult order = latest ? [t.updatedAt compare:latest.updatedAt] : NSOrderedDescending;
+        if (!latest || order == NSOrderedDescending ||
+            (order == NSOrderedSame && CPStatusTiePriority(t.status) > CPStatusTiePriority(latest.status))) latest = t;
+    }
+    return latest ? latest.status : CPStatusIdle;
+}
+
 @interface CPStateReader : NSObject
-@property (nonatomic) NSMutableDictionary<NSString *, NSDictionary *> *rolloutCache; // path → {mtime,size,state}
+@property (nonatomic) CPStateCache *cache;
+@property (nonatomic) NSArray<id<CPAgentSource>> *sources;
 - (NSArray<CPAgent *> *)readAgents;
 // rollout 尾部解析按 (mtime,size) 缓存:文件未变直接复用上轮结果,不重复读 256KB/逐行 JSON。
 - (CPRolloutState *)rolloutStateForPath:(NSString *)path;
 @end
 
-@implementation CPStateReader
+#pragma mark - Codex Source
+
+@interface CPCodexSource : NSObject <CPAgentSource>
+@property (nonatomic) CPStateCache *cache;
+- (instancetype)initWithCache:(CPStateCache *)cache;
+@end
+
+@implementation CPCodexSource
+
+- (instancetype)initWithCache:(CPStateCache *)cache {
+    self = [super init];
+    if (!self) return nil;
+    self.cache = cache;
+    return self;
+}
 
 - (CPRolloutState *)rolloutStateForPath:(NSString *)path {
     if (!path.length) return CPRolloutState.new;
-    if (!self.rolloutCache) self.rolloutCache = NSMutableDictionary.dictionary;
-    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
-    NSDate *mtime = attrs[NSFileModificationDate] ?: NSDate.distantPast;
-    NSNumber *size = attrs[NSFileSize] ?: @0;
-    NSDictionary *cached = self.rolloutCache[path];
-    if (cached && [cached[@"mtime"] isEqual:mtime] && [cached[@"size"] isEqual:size]) {
-        return cached[@"state"];
-    }
-    CPRolloutState *state = CPReadRolloutState(path);
-    if (self.rolloutCache.count > 32) [self.rolloutCache removeAllObjects]; // 上限兜底,防无限增长
-    self.rolloutCache[path] = @{@"mtime": mtime, @"size": size, @"state": state};
-    return state;
+    CPRolloutState *state = [self.cache objectForPath:path parser:^id(NSString *p) { return CPReadRolloutState(p); }];
+    return state ?: CPRolloutState.new;
 }
 
-- (NSArray<CPAgent *> *)readAgents {
-    CPAgent *codex = [self readCodexAgent];
-    CPAgent *kimi = [self kimiPlaceholderAgent];
-    return @[codex, kimi];
-}
-
-- (CPAgent *)readCodexAgent {
+- (CPAgent *)readAgent {
     CPAgent *agent = CPAgent.new;
     agent.agentID = @"codex";
     agent.name = @"Codex";
@@ -1270,6 +1308,7 @@ static CPRolloutState *CPReadRolloutState(NSString *path) {
             task.tokensUsed = (NSInteger)sqlite3_column_int64(stmt, 5);
             task.rolloutPath = sqlite3_column_text(stmt, 6)
                 ? [NSString stringWithUTF8String:(const char *)sqlite3_column_text(stmt, 6)] : @"";
+            task.sourceKind = @"codex";
             [self enrichTask:task logsDB:logsDB];
             [agent.tasks addObject:task];
         }
@@ -1278,44 +1317,8 @@ static CPRolloutState *CPReadRolloutState(NSString *path) {
     sqlite3_close(stateDB);
     if (logsDB) sqlite3_close(logsDB);
 
-    agent.status = [self overallStatusForTasks:agent.tasks];
+    agent.status = CPOverallStatusForTasks(agent.tasks);
     return agent;
-}
-
-- (CPAgent *)kimiPlaceholderAgent {
-    CPAgent *agent = CPAgent.new;
-    agent.agentID = @"kimi";
-    agent.name = @"Kimi";
-    // 品牌图标近似:Kimi(月之暗面)官方 logo 不可用,用 SF Symbol moon 呼应品牌名 + 次要色。
-    agent.iconName = @"moon";
-    agent.color = CPMuted();
-    agent.placeholder = YES;
-    agent.status = CPStatusWorking;
-    agent.tasks = [NSMutableArray arrayWithArray:@[
-        [self sampleTask:@"k1" title:@"整理本周会议纪要（示例）" project:@"team-sync" path:@"~/Notes/team-sync" status:CPStatusWorking activity:@"正在从本地日志提取待办事项（数据源待接入）。"],
-        [self sampleTask:@"k2" title:@"润色产品发布文案（示例）" project:@"launch-copy" path:@"~/Notes/launch-copy" status:CPStatusWaiting activity:@"等待用户提供品牌语气参考。"],
-        [self sampleTask:@"k3" title:@"分析上季度数据报告（示例）" project:@"q3-review" path:@"~/Notes/q3-review" status:CPStatusCompleted activity:@"已生成摘要，保存为 q3-summary.md。"]
-    ]];
-    return agent;
-}
-
-- (CPTask *)sampleTask:(NSString *)taskID title:(NSString *)title project:(NSString *)project path:(NSString *)path status:(CPStatus)status activity:(NSString *)activity {
-    // 占位示例数据必须在会话内完全静态:每轮 readAgents 若用 NSDate.date,updatedAt 会变,
-    // 可见数据签名随之抖动,签名跳过机制被架空(静态数据也每 3s 全量重绘)。
-    static NSDate *sampleBaseDate = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ sampleBaseDate = NSDate.date; });
-    CPTask *task = CPTask.new;
-    task.taskID = taskID;
-    task.title = title;
-    task.projectName = project;
-    task.projectPath = path;
-    task.status = status;
-    task.activity = activity;
-    task.createdAt = sampleBaseDate;
-    task.updatedAt = sampleBaseDate;
-    task.tokensUsed = 0;
-    return task;
 }
 
 - (void)enrichTask:(CPTask *)task logsDB:(sqlite3 *)logsDB {
@@ -1365,14 +1368,377 @@ static CPRolloutState *CPReadRolloutState(NSString *path) {
     return task.status == CPStatusCompleted ? @"任务已完成" : @"Codex 正在活动";
 }
 
-- (CPStatus)overallStatusForTasks:(NSArray<CPTask *> *)tasks {
-    CPTask *latest = nil;
-    for (CPTask *t in tasks) {
-        NSComparisonResult order = latest ? [t.updatedAt compare:latest.updatedAt] : NSOrderedDescending;
-        if (!latest || order == NSOrderedDescending ||
-            (order == NSOrderedSame && CPStatusTiePriority(t.status) > CPStatusTiePriority(latest.status))) latest = t;
+@end
+
+#pragma mark - Kimi Source
+
+// Kimi 数据根:默认真实 ~/ 路径;测试用 CP_KIMI_CLI_ROOT / CP_KIMI_DESKTOP_ROOT 覆盖到 /tmp 隔离 fixture。
+static NSString *CPKimiCLIRoot(void) {
+    NSString *override = NSProcessInfo.processInfo.environment[@"CP_KIMI_CLI_ROOT"];
+    if (override.length) return override;
+    return [NSHomeDirectory() stringByAppendingPathComponent:@".kimi-code/sessions"];
+}
+
+static NSString *CPKimiDesktopRoot(void) {
+    NSString *override = NSProcessInfo.processInfo.environment[@"CP_KIMI_DESKTOP_ROOT"];
+    if (override.length) return override;
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/kimi-desktop/daimon-share/sessions"];
+}
+
+// state.json 两版 schema:v2 是 epoch 毫秒(NSNumber/数字字符串,cwd/id/archived),
+// v1 是 ISO8601 字符串(workDir)。两种都要能吃。
+static NSDate *CPKimiDateFromValue(id value) {
+    if ([value isKindOfClass:NSNumber.class]) return CPDateFromMillis([value longLongValue]);
+    if ([value isKindOfClass:NSString.class]) {
+        NSString *s = (NSString *)value;
+        if (!s.length) return nil;
+        if ([s rangeOfCharacterFromSet:NSCharacterSet.letterCharacterSet].location == NSNotFound) {
+            return CPDateFromMillis(s.longLongValue);
+        }
+        return CPDateFromISO8601(s);
     }
-    return latest ? latest.status : CPStatusIdle;
+    return nil;
+}
+
+// 只读文件尾部(对齐到行边界),绝不全量读大 wire。
+static NSString *CPReadFileTail(NSString *path, unsigned long long maxBytes) {
+    NSFileHandle *handle = [NSFileHandle fileHandleForReadingAtPath:path];
+    if (!handle) return nil;
+    NSData *tail = nil;
+    @try {
+        unsigned long long length = [handle seekToEndOfFile];
+        unsigned long long start = length > maxBytes ? length - maxBytes : 0;
+        [handle seekToFileOffset:start];
+        tail = [handle readDataToEndOfFile];
+        [handle closeFile];
+        if (start > 0 && tail.length) {
+            const uint8_t *bytes = tail.bytes;
+            for (NSUInteger i = 0; i < tail.length; i++) {
+                if (bytes[i] == '\n') {
+                    tail = i + 1 < tail.length ? [tail subdataWithRange:NSMakeRange(i + 1, tail.length - i - 1)] : NSData.data;
+                    break;
+                }
+            }
+        }
+    } @catch (__unused NSException *exception) {
+        return nil;
+    }
+    return [[NSString alloc] initWithData:tail encoding:NSUTF8StringEncoding];
+}
+
+// wire 尾部摘要:两种 wire 格式(CLI:顶层 type + time 毫秒;desktop:message.type + timestamp 秒)归一成同一结构。
+@interface CPKimiWireState : NSObject
+@property BOOL turnActive;            // 尾部最后一个 turn 未见结束
+@property NSString *lastEndReason;    // 最近一次 turn 结束原因(completed/cancelled/error…)
+@property BOOL attentionPending;      // 未解决的用户输入请求 / 中断待处理
+@property NSString *firstUserInput;   // desktop TurnBegin payload.user_input(标题兜底)
+@property NSDate *lastEventAt;
+@end
+@implementation CPKimiWireState @end
+
+static CPKimiWireState *CPKimiParseWireTail(NSString *text, BOOL desktopFormat) {
+    CPKimiWireState *state = CPKimiWireState.new;
+    if (!text.length) return state;
+    NSMutableSet<NSString *> *pendingCalls = NSMutableSet.set;
+    for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+        if (!line.length) continue;
+        NSDictionary *entry = [NSJSONSerialization JSONObjectWithData:[line dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+        if (![entry isKindOfClass:NSDictionary.class]) continue; // 坏行跳过,不崩溃
+        if (desktopFormat) {
+            NSDictionary *message = entry[@"message"];
+            if (![message isKindOfClass:NSDictionary.class]) continue;
+            NSString *type = message[@"type"];
+            if (![type isKindOfClass:NSString.class]) continue;
+            NSDate *when = CPDateFromSeconds([entry[@"timestamp"] doubleValue]);
+            if (when) state.lastEventAt = when;
+            NSDictionary *payload = [message[@"payload"] isKindOfClass:NSDictionary.class] ? message[@"payload"] : nil;
+            if ([type isEqualToString:@"TurnBegin"]) {
+                state.turnActive = YES;
+                state.attentionPending = NO;
+                NSString *input = [payload[@"user_input"] isKindOfClass:NSString.class] ? payload[@"user_input"] : nil;
+                if (input.length && !state.firstUserInput) state.firstUserInput = input;
+            } else if ([type isEqualToString:@"TurnEnd"]) {
+                state.turnActive = NO;
+                state.attentionPending = NO;
+                state.lastEndReason = @"completed";
+            } else if ([type isEqualToString:@"StepInterrupted"]) {
+                if (state.turnActive) state.attentionPending = YES; // 回合中断,等待用户处理
+            }
+            continue;
+        }
+        // CLI 格式:{"type": "...", "time": <毫秒>, ...}
+        NSString *type = [entry[@"type"] isKindOfClass:NSString.class] ? entry[@"type"] : nil;
+        if (!type) continue;
+        NSNumber *timeMs = [entry[@"time"] isKindOfClass:NSNumber.class] ? entry[@"time"] : nil;
+        if (timeMs) state.lastEventAt = CPDateFromMillis(timeMs.longLongValue);
+        if ([type isEqualToString:@"turn.ended"]) {
+            state.turnActive = NO;
+            NSString *reason = [entry[@"reason"] isKindOfClass:NSString.class] ? entry[@"reason"] : nil;
+            state.lastEndReason = reason.length ? reason : @"completed";
+            [pendingCalls removeAllObjects];
+            state.attentionPending = NO;
+            continue;
+        }
+        if ([type isEqualToString:@"turn.begin"]) {
+            state.turnActive = YES;
+            state.attentionPending = NO;
+            [pendingCalls removeAllObjects];
+            continue;
+        }
+        if ([type isEqualToString:@"llm.request"]) {
+            state.turnActive = YES; // turn.begin 在尾部窗口之外时,请求即活跃 turn 证据
+            continue;
+        }
+        if (![type isEqualToString:@"context.append_loop_event"]) continue;
+        NSDictionary *event = [entry[@"event"] isKindOfClass:NSDictionary.class] ? entry[@"event"] : nil;
+        NSString *eventType = [event[@"type"] isKindOfClass:NSString.class] ? event[@"type"] : nil;
+        if ([eventType isEqualToString:@"step.begin"]) {
+            state.turnActive = YES;
+        } else if ([eventType isEqualToString:@"tool.call"]) {
+            NSString *name = [[event[@"name"] ?: event[@"toolName"] ?: event[@"tool"] description] lowercaseString];
+            NSString *uuid = [event[@"uuid"] description];
+            if ([name containsString:@"askuserquestion"] && uuid.length) [pendingCalls addObject:uuid];
+        } else if ([eventType isEqualToString:@"tool.result"]) {
+            NSString *uuid = [event[@"uuid"] description];
+            if (uuid.length) [pendingCalls removeObject:uuid];
+        }
+    }
+    if (pendingCalls.count) state.attentionPending = YES;
+    return state;
+}
+
+// Kimi 状态映射(保守可解释):
+// 未解决的用户输入/中断 → waiting;活跃 turn 证据 + 最近 15 分钟内有活动(state 更新或 wire 写入)→ working;
+// 活跃 turn 但活动已旧 → idle(旧会话不得仅因最近修改永远 working);
+// 明确 completed → completed,error/failed → failed,cancelled/interrupted 与无证据 → idle。
+static CPStatus CPKimiStatus(NSString *stateReason, CPKimiWireState *wire, NSDate *activityAt, NSDate *now) {
+    if (wire.attentionPending) return CPStatusWaiting;
+    BOOL fresh = activityAt && [now timeIntervalSinceDate:activityAt] < 15 * 60;
+    if (wire.turnActive) return fresh ? CPStatusWorking : CPStatusIdle;
+    NSString *reason = stateReason.length ? stateReason : wire.lastEndReason;
+    if ([reason isEqualToString:@"completed"]) return CPStatusCompleted;
+    if ([reason isEqualToString:@"error"] || [reason isEqualToString:@"failed"]) return CPStatusFailed;
+    return CPStatusIdle; // cancelled / interrupted / 无证据
+}
+
+// 会话最近活动时刻:state updatedAt、wire 尾部事件时间、wire 文件 mtime 三者取最新。
+// (turn 进行中 state.json 不刷新,wire 文件却持续写入,单看 updatedAt 会把活跃长回合误判成陈旧。)
+static NSDate *CPKimiActivityAt(NSDate *updatedAt, CPKimiWireState *wire, NSString *wirePath) {
+    NSDate *latest = updatedAt;
+    if (wire.lastEventAt && (!latest || [wire.lastEventAt compare:latest] == NSOrderedDescending)) latest = wire.lastEventAt;
+    NSDate *wireMtime = [[NSFileManager defaultManager] attributesOfItemAtPath:wirePath error:nil][NSFileModificationDate];
+    if (wireMtime && (!latest || [wireMtime compare:latest] == NSOrderedDescending)) latest = wireMtime;
+    return latest;
+}
+
+static NSString *CPKimiActivity(NSString *sourceLabel, CPStatus status) {
+    NSString *phase = @"会话空闲";
+    switch (status) {
+        case CPStatusWorking: phase = @"回合进行中"; break;
+        case CPStatusWaiting: phase = @"等待用户输入"; break;
+        case CPStatusCompleted: phase = @"回合已完成"; break;
+        case CPStatusFailed: phase = @"回合出错"; break;
+        default: break;
+    }
+    return [NSString stringWithFormat:@"%@ · %@", sourceLabel, phase];
+}
+
+static NSString *CPKimiCleanTitle(NSString *raw) {
+    return CPCleanTitle((const unsigned char *)(raw.length ? raw.UTF8String : NULL));
+}
+
+@interface CPKimiSource : NSObject <CPAgentSource>
+@property (nonatomic) CPStateCache *cache;
+@property (nonatomic) NSInteger lastCLICount;     // 最近一次读取到的非归档 CLI 会话数(probe 用)
+@property (nonatomic) NSInteger lastDesktopCount; // 最近一次读取到的 desktop 会话数(probe 用)
+- (instancetype)initWithCache:(CPStateCache *)cache;
+@end
+
+@implementation CPKimiSource
+
+- (instancetype)initWithCache:(CPStateCache *)cache {
+    self = [super init];
+    if (!self) return nil;
+    self.cache = cache;
+    return self;
+}
+
+- (CPAgent *)readAgent {
+    CPAgent *agent = CPAgent.new;
+    agent.agentID = @"kimi";
+    agent.name = @"Kimi";
+    agent.iconName = @"moon";
+    agent.color = CPMuted();
+    agent.placeholder = NO; // 真实数据源:目录不存在/无会话就是真空态,不再用示例占位
+    agent.tasks = NSMutableArray.array;
+
+    NSMutableSet<NSString *> *cliRawIDs = NSMutableSet.set;
+    NSArray<CPTask *> *cliTasks = [self readCLITasksIntoRawIDs:cliRawIDs];
+    NSArray<CPTask *> *desktopTasks = [self readDesktopTasksExcludingRawIDs:cliRawIDs];
+    [agent.tasks addObjectsFromArray:cliTasks];
+    [agent.tasks addObjectsFromArray:desktopTasks];
+    [agent.tasks sortUsingComparator:^NSComparisonResult(CPTask *a, CPTask *b) {
+        return [b.updatedAt compare:a.updatedAt]; // 非归档会话按 updatedAt 降序
+    }];
+    while (agent.tasks.count > 50) [agent.tasks removeLastObject]; // 上限 50
+
+    agent.status = CPOverallStatusForTasks(agent.tasks);
+    return agent;
+}
+
+// A) Kimi Code CLI:~/.kimi-code/sessions/<workspace>/<session>/state.json(小文件全量解析,按 mtime+size 缓存)。
+- (NSArray<CPTask *> *)readCLITasksIntoRawIDs:(NSMutableSet<NSString *> *)rawIDs {
+    NSMutableArray<CPTask *> *tasks = NSMutableArray.array;
+    self.lastCLICount = 0;
+    NSString *root = CPKimiCLIRoot();
+    NSFileManager *fm = NSFileManager.defaultManager;
+    for (NSString *workspaceDir in [fm contentsOfDirectoryAtPath:root error:nil]) {
+        NSString *workspacePath = [root stringByAppendingPathComponent:workspaceDir];
+        BOOL isDir = NO;
+        if (![fm fileExistsAtPath:workspacePath isDirectory:&isDir] || !isDir) continue;
+        for (NSString *sessionDir in [fm contentsOfDirectoryAtPath:workspacePath error:nil]) {
+            NSString *sessionPath = [workspacePath stringByAppendingPathComponent:sessionDir];
+            NSString *statePath = [sessionPath stringByAppendingPathComponent:@"state.json"];
+            if (![fm fileExistsAtPath:statePath]) continue;
+            NSDictionary *state = [self.cache objectForPath:statePath parser:^id(NSString *p) {
+                NSData *data = [NSData dataWithContentsOfFile:p];
+                if (!data.length) return nil;
+                id parsed = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                return [parsed isKindOfClass:NSDictionary.class] ? parsed : nil; // 坏 JSON 跳过该会话
+            }];
+            if (!state) continue;
+            if ([state[@"archived"] boolValue]) continue; // 归档默认不展示
+
+            NSString *sessionID = [state[@"id"] isKindOfClass:NSString.class] && [state[@"id"] length]
+                                      ? state[@"id"] : sessionDir;
+            self.lastCLICount++;
+            NSString *rawID = [sessionID hasPrefix:@"session_"] ? [sessionID substringFromIndex:8] : sessionID;
+            [rawIDs addObject:rawID];
+
+            CPTask *task = CPTask.new;
+            task.taskID = [NSString stringWithFormat:@"kimi-cli-%@", sessionID];
+            task.sourceKind = @"kimi-cli";
+            task.projectPath = [state[@"cwd"] isKindOfClass:NSString.class] && [state[@"cwd"] length]
+                                   ? state[@"cwd"]
+                                   : ([state[@"workDir"] isKindOfClass:NSString.class] ? state[@"workDir"] : @"");
+            task.projectName = task.projectPath.lastPathComponent.length ? task.projectPath.lastPathComponent : @"Kimi";
+            task.createdAt = CPKimiDateFromValue(state[@"createdAt"]) ?: NSDate.date;
+            task.updatedAt = CPKimiDateFromValue(state[@"updatedAt"]) ?: task.createdAt;
+
+            NSString *title = [state[@"title"] isKindOfClass:NSString.class] ? state[@"title"] : nil;
+            NSString *lastPrompt = [state[@"lastPrompt"] isKindOfClass:NSString.class] ? state[@"lastPrompt"] : nil;
+            // isCustomTitle 为真才信 title;否则用 lastPrompt(可能超长,CPCleanTitle 清洗+截断,绝不铺进 UI)。
+            NSString *seed = ([state[@"isCustomTitle"] boolValue] && title.length) ? title
+                                                                                   : (lastPrompt.length ? lastPrompt : title);
+            task.title = CPKimiCleanTitle(seed);
+
+            // 活跃 turn 证据只读 wire 有界尾部(64KB,缓存),不全量读。
+            NSString *wirePath = [sessionPath stringByAppendingPathComponent:@"agents/main/wire.jsonl"];
+            CPKimiWireState *wire = [fm fileExistsAtPath:wirePath]
+                ? [self.cache objectForPath:wirePath parser:^id(NSString *p) {
+                      return CPKimiParseWireTail(CPReadFileTail(p, 65536), NO);
+                  }]
+                : CPKimiWireState.new;
+            wire = wire ?: CPKimiWireState.new;
+            NSString *reason = [state[@"lastTurnReason"] isKindOfClass:NSString.class] ? state[@"lastTurnReason"] : nil;
+            task.status = CPKimiStatus(reason, wire, CPKimiActivityAt(task.updatedAt, wire, wirePath), NSDate.date);
+            task.activity = CPKimiActivity(@"Kimi Code CLI", task.status);
+            [tasks addObject:task];
+        }
+    }
+    return tasks;
+}
+
+// B) Kimi 桌面 daimon:…/daimon-share/sessions/<hash>/<uuid>/{context.jsonl,wire.jsonl}。
+// 格式不完整/字段缺失直接跳过该会话;context 只读前 256KB,wire 只读尾部 64KB。
+- (NSArray<CPTask *> *)readDesktopTasksExcludingRawIDs:(NSSet<NSString *> *)cliRawIDs {
+    NSMutableArray<CPTask *> *tasks = NSMutableArray.array;
+    self.lastDesktopCount = 0;
+    NSString *root = CPKimiDesktopRoot();
+    NSFileManager *fm = NSFileManager.defaultManager;
+    for (NSString *hashDir in [fm contentsOfDirectoryAtPath:root error:nil]) {
+        NSString *hashPath = [root stringByAppendingPathComponent:hashDir];
+        BOOL isDir = NO;
+        if (![fm fileExistsAtPath:hashPath isDirectory:&isDir] || !isDir) continue;
+        for (NSString *uuidDir in [fm contentsOfDirectoryAtPath:hashPath error:nil]) {
+            NSString *sessionPath = [hashPath stringByAppendingPathComponent:uuidDir];
+            NSString *wirePath = [sessionPath stringByAppendingPathComponent:@"wire.jsonl"];
+            NSString *contextPath = [sessionPath stringByAppendingPathComponent:@"context.jsonl"];
+            if (![fm fileExistsAtPath:wirePath] || ![fm fileExistsAtPath:contextPath]) continue;
+            if ([cliRawIDs containsObject:uuidDir]) continue; // 跨源去重:CLI 已收录同一 session
+            self.lastDesktopCount++;
+
+            CPKimiWireState *wire = [self.cache objectForPath:wirePath parser:^id(NSString *p) {
+                return CPKimiParseWireTail(CPReadFileTail(p, 65536), YES);
+            }] ?: CPKimiWireState.new;
+
+            // context.jsonl 头部:取第一条 role=="user" 的消息做标题种子;坏行/缺字段跳过。
+            NSString *firstUser = nil;
+            NSFileHandle *handle = [NSFileHandle fileHandleForReadingAtPath:contextPath];
+            NSData *headData = nil;
+            @try {
+                headData = [handle readDataOfLength:262144];
+                [handle closeFile];
+            } @catch (__unused NSException *exception) {}
+            NSString *head = headData ? [[NSString alloc] initWithData:headData encoding:NSUTF8StringEncoding] : nil;
+            for (NSString *line in [head componentsSeparatedByString:@"\n"]) {
+                if (!line.length) continue;
+                NSDictionary *entry = [NSJSONSerialization JSONObjectWithData:[line dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+                if (![entry isKindOfClass:NSDictionary.class]) continue;
+                if (![entry[@"role"] isEqualToString:@"user"]) continue;
+                if ([entry[@"content"] isKindOfClass:NSString.class] && [entry[@"content"] length]) {
+                    firstUser = entry[@"content"];
+                    break;
+                }
+            }
+
+            CPTask *task = CPTask.new;
+            task.taskID = [NSString stringWithFormat:@"kimi-desktop-%@", uuidDir];
+            task.sourceKind = @"kimi-desktop";
+            // 桌面源无可验证 cwd 元数据:按 session 目录名降级。
+            task.projectPath = uuidDir;
+            task.projectName = uuidDir;
+            NSDictionary *attrs = [fm attributesOfItemAtPath:contextPath error:nil];
+            task.createdAt = attrs[NSFileCreationDate] ?: NSDate.date;
+            task.updatedAt = wire.lastEventAt ?: (attrs[NSFileModificationDate] ?: task.createdAt);
+            task.title = CPKimiCleanTitle(firstUser.length ? firstUser : wire.firstUserInput);
+            task.status = CPKimiStatus(nil, wire, CPKimiActivityAt(task.updatedAt, wire, wirePath), NSDate.date);
+            task.activity = CPKimiActivity(@"Kimi 桌面", task.status);
+            [tasks addObject:task];
+        }
+    }
+    return tasks;
+}
+
+@end
+
+#pragma mark - State Reader 聚合
+
+@implementation CPStateReader
+
+- (instancetype)init {
+    self = [super init];
+    if (!self) return nil;
+    self.cache = CPStateCache.new;
+    // 注册数组即扩展点:未来 Claude 接入只需新增 CPHarnessSource 实现并加到这里。
+    self.sources = @[[[CPCodexSource alloc] initWithCache:self.cache],
+                     [[CPKimiSource alloc] initWithCache:self.cache]];
+    return self;
+}
+
+- (NSArray<CPAgent *> *)readAgents {
+    NSMutableArray<CPAgent *> *agents = [NSMutableArray arrayWithCapacity:self.sources.count];
+    for (id<CPAgentSource> source in self.sources) {
+        CPAgent *agent = [source readAgent];
+        if (agent) [agents addObject:agent];
+    }
+    return agents;
+}
+
+- (CPRolloutState *)rolloutStateForPath:(NSString *)path {
+    if (!path.length) return CPRolloutState.new;
+    CPRolloutState *state = [self.cache objectForPath:path parser:^id(NSString *p) { return CPReadRolloutState(p); }];
+    return state ?: CPRolloutState.new;
 }
 
 @end
@@ -1703,6 +2069,14 @@ static CPRolloutState *CPReadRolloutState(NSString *path) {
 - (void)scrollWheel:(NSEvent *)event { (void)event; /* 详情打开时滚动也不落到下层列表 */ }
 @end
 
+// 不拦截命中的排版 stack:子视图(图标/文字)只做视觉,hitTest 整体穿透,
+// 保证父按钮(如详情返回胶囊)的点击/hover 命中判定不被自己的排版内容遮挡。
+@interface CPHitPassthroughStackView : NSStackView
+@end
+@implementation CPHitPassthroughStackView
+- (NSView *)hitTest:(NSPoint)point { (void)point; return nil; }
+@end
+
 @interface CPWorkbenchCardController : NSObject <NSTextFieldDelegate>
 @property NSPanel *window;
 @property NSView *shadowCarrier;
@@ -1721,6 +2095,7 @@ static CPRolloutState *CPReadRolloutState(NSString *path) {
 @property NSTextField *centerMeta;
 @property NSButton *detailBackButton;
 @property NSButton *detailOpenAgentButton;
+@property NSMapTable<NSView *, NSString *> *detailSavedRowTooltips; // 详情互斥期间暂存的 row tooltip
 // 工作台底部全宽 Todo 栏:可收起/展开;计数只显示在栏内,不进入任何提醒聚合。
 @property CPTodoStore *todoStore;
 @property NSView *todoContainer;
@@ -2521,32 +2896,38 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     [head.heightAnchor constraintEqualToConstant:30].active = YES;
     NSTextField *title = CPLabel(@"任务详情", 13, NSFontWeightSemibold, CPFg());
     title.translatesAutoresizingMaskIntoConstraints = NO;
-    // 返回入口:24pt 透明热区 + 与「任务详情」13pt 标题视觉协调的 20pt 正圆。
-    // 可见圆和文字共中线;圆更大半号、描边更亮,辨识度高一档;hover/按压
-    // 反馈经 cpVisualLayer 画在小圆上,热区之外完全透明。
-    // chevron 不作为 NSButton.image 设置——按钮的私有内部约束曾把 24x24 热区
-    // 撑成 24x29,圆角层被拉伸成椭圆;改为圆的 CALayer.contents 绘制,几何完全自控。
-    NSButton *backButton = CPIconButton(@"chevron.left", self, @selector(closeDetailDrawer), @"返回任务列表");
+    // 返回入口:56×28 胶囊(chevron.left + 「返回」),圆角 14,hairline 描边 + 极淡底色。
+    // 与「任务详情」13pt 标题同行同中线。chevron 不作为 NSButton.image 设置——按钮的
+    // 私有内部约束会撑坏热区几何(曾把热区纵向拉成椭圆);图标与文字改为子视图排版,
+    // 几何完全自控。hover/按压 wash 经 CPHoverButton overlay 画满整个胶囊,
+    // 点击热区与可视区域一致(56×28)。
+    NSButton *backButton = [CPHoverButton buttonWithTitle:@"" target:self action:@selector(closeDetailDrawer)];
+    backButton.bordered = NO;
+    backButton.toolTip = @"返回任务列表";
     backButton.accessibilityLabel = @"返回任务列表";
-    backButton.image = nil; // 杜绝 NSButton 私有布局约束
-    backButton.layer.cornerRadius = 0.0;
-    // CPIconButton 自带的 28×28 约束必须先关掉,否则与下方 24×24 冲突。
-    for (NSLayoutConstraint *c in [NSArray arrayWithArray:backButton.constraints]) {
-        if (c.firstAttribute == NSLayoutAttributeWidth || c.firstAttribute == NSLayoutAttributeHeight) c.active = NO;
-    }
-    CALayer *backCircle = [CALayer layer];
-    backCircle.name = @"detailBackCircle";
-    backCircle.frame = NSMakeRect(2.0, 2.0, 20.0, 20.0); // 24pt 热区内居中
-    backCircle.cornerRadius = 10.0; // 半径恒为宽度一半,正圆
-    backCircle.borderColor = [CPFg2() colorWithAlphaComponent:0.55].CGColor; // 比 CPBorder 亮一档,小尺寸下更清晰
-    backCircle.masksToBounds = YES;
-    backCircle.contents = (__bridge id)CPSymbolCGImage(@"chevron.left", 10, CPFg(), 20.0);
-    backCircle.contentsGravity = kCAGravityCenter;
-    backCircle.contentsScale = 2.0;
-    [backButton.layer addSublayer:backCircle];
-    ((CPHoverButton *)backButton).cpVisualLayer = backCircle;
-    ((CPHoverButton *)backButton).cpBaseBackground = CPBg();
+    backButton.layer.cornerRadius = 14.0; // 高度一半的胶囊圆角
+    backButton.layer.borderColor = [CPFg2() colorWithAlphaComponent:0.55].CGColor; // 比 CPBorder 亮一档,小尺寸下更清晰
+    ((CPHoverButton *)backButton).cpBaseBackground = CPBg(); // 极淡底色
     ((CPHoverButton *)backButton).cpAlwaysBorder = YES;
+    ((CPHoverButton *)backButton).cpHoverWash = 0.04; // 行级约定:hover 4%
+    ((CPHoverButton *)backButton).cpPressedWash = 0.08; // pressed 8%
+
+    NSImageView *backChevron = [[NSImageView alloc] initWithFrame:NSZeroRect];
+    backChevron.image = CPSymbol(@"chevron.left", 10, CPFg());
+    backChevron.contentTintColor = CPFg();
+    backChevron.translatesAutoresizingMaskIntoConstraints = NO;
+    NSTextField *backLabel = CPLabel(@"返回", 11, NSFontWeightMedium, CPFg());
+    backLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    NSStackView *pill = [CPHitPassthroughStackView stackViewWithViews:@[backChevron, backLabel]];
+    pill.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    pill.alignment = NSLayoutAttributeCenterY;
+    pill.spacing = 3;
+    pill.translatesAutoresizingMaskIntoConstraints = NO;
+    [backButton addSubview:pill];
+    [NSLayoutConstraint activateConstraints:@[
+        [pill.centerXAnchor constraintEqualToAnchor:backButton.centerXAnchor],
+        [pill.centerYAnchor constraintEqualToAnchor:backButton.centerYAnchor]
+    ]];
     backButton.translatesAutoresizingMaskIntoConstraints = NO;
     self.detailBackButton = backButton;
     [head addSubview:title];
@@ -2554,8 +2935,8 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     [NSLayoutConstraint activateConstraints:@[
         [backButton.leadingAnchor constraintEqualToAnchor:head.leadingAnchor],
         [backButton.centerYAnchor constraintEqualToAnchor:head.centerYAnchor],
-        [backButton.widthAnchor constraintEqualToConstant:24],
-        [backButton.heightAnchor constraintEqualToConstant:24],
+        [backButton.widthAnchor constraintEqualToConstant:56],
+        [backButton.heightAnchor constraintEqualToConstant:28],
         [title.leadingAnchor constraintEqualToAnchor:backButton.trailingAnchor constant:8],
         [title.centerYAnchor constraintEqualToAnchor:head.centerYAnchor],
         [title.trailingAnchor constraintLessThanOrEqualToAnchor:head.trailingAnchor]
@@ -2569,10 +2950,49 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     // 提到任务列表之上再显示。
     [self.middleColumn addSubview:self.rightColumn positioned:NSWindowAbove relativeTo:nil];
     self.rightColumn.hidden = NO;
+    [self cpSetTaskListInteractive:NO];
 }
 
 - (void)closeDetailDrawer {
     self.rightColumn.hidden = YES;
+    [self cpSetTaskListInteractive:YES];
+}
+
+// 详情打开期间任务列表真正互斥,不只靠 CPClickBarrierView 挡板:
+// 1) taskScrollView 整体 hidden —— hitTest/滚动/绘制全部不落到下层;
+// 2) 立即清空残留 hover 蒙层(复用滚动/失焦同一条清理路径);
+// 3) 遍历列表子树,nil 掉 row tooltip(先暂存,关闭时还原)并移除自有 tracking area,
+//    任何残余事件路径都不会再触发"查看任务详情…"tooltip 或 hover。
+// 关闭详情时完整恢复:显示、还原 tooltip、CPHoverButton 重装 tracking area。
+- (void)cpSetTaskListInteractive:(BOOL)interactive {
+    self.taskScrollView.hidden = !interactive;
+    [self cpInvalidateHoverImmediately];
+    if (!self.detailSavedRowTooltips) {
+        self.detailSavedRowTooltips = [NSMapTable weakToStrongObjectsMapTable];
+    }
+    NSMutableArray<NSView *> *queue = [NSMutableArray arrayWithObject:self.taskScrollView];
+    while (queue.count) {
+        NSView *v = queue.firstObject;
+        [queue removeObjectAtIndex:0];
+        [queue addObjectsFromArray:v.subviews];
+        if (!interactive) {
+            if (v.toolTip.length) {
+                [self.detailSavedRowTooltips setObject:v.toolTip forKey:v];
+                v.toolTip = nil;
+            }
+            for (NSTrackingArea *area in [NSArray arrayWithArray:v.trackingAreas]) {
+                if (area.owner == v) [v removeTrackingArea:area];
+            }
+        } else {
+            NSString *saved = [self.detailSavedRowTooltips objectForKey:v];
+            if (saved) {
+                v.toolTip = saved;
+                [self.detailSavedRowTooltips removeObjectForKey:v];
+            }
+            if ([v isKindOfClass:CPHoverButton.class]) [v updateTrackingAreas];
+        }
+    }
+    if (interactive) self.detailSavedRowTooltips = nil;
 }
 
 - (void)handleEscape {
@@ -2808,6 +3228,8 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     }
     [self renderDetail];
     [self updateMeta];
+    // 抽屉打开期间任务列表保持互斥:行重建会带回 tooltip/tracking area,重新停用。
+    if (!self.rightColumn.hidden) [self cpSetTaskListInteractive:NO];
 }
 
 - (void)renderDetail {
@@ -4683,6 +5105,7 @@ static NSString *CPAgentsSignature(NSArray<CPAgent *> *agents) {
 @property NSArray<CPAgent *> *agents;
 @property BOOL hudVisualTest; // --visual-test-hud
 @property BOOL detailVisualTest; // --visual-test-detail
+@property BOOL kimiVisualTest;   // --visual-test-kimi
 @property dispatch_queue_t refreshQueue;          // 串行后台队列:SQLite/rollout 读取不阻塞主线程
 @property CPRefreshGate *refreshGate;             // 同一时刻最多一个读取,多余的合并为 pending
 @property NSUInteger refreshGeneration;           // 读取代际:过期结果不覆盖更新的读取
@@ -4744,6 +5167,26 @@ static NSString *CPAgentsSignature(NSArray<CPAgent *> *agents) {
             NSButton *fake = NSButton.new;
             fake.tag = 0;
             [self.card taskClicked:fake];
+        }
+    }
+    if (self.kimiVisualTest) { // --visual-test-kimi: 打开工作台,选中 Kimi 并展示一条真实 Kimi 任务详情
+        [self applyAgents:[self.reader readAgents] signature:nil];
+        [self showCard];
+        NSInteger kimiIdx = NSNotFound;
+        for (NSInteger i = 0; i < (NSInteger)self.agents.count; i++) {
+            if ([self.agents[(NSUInteger)i].agentID isEqualToString:@"kimi"]) { kimiIdx = i; break; }
+        }
+        if (kimiIdx != NSNotFound) {
+            NSButton *fakeAgent = NSButton.new;
+            fakeAgent.tag = kimiIdx;
+            [self.card agentClicked:fakeAgent];
+            // CP_VISUAL_TEST_KIMI_LIST=1 时只停在选择 Kimi 后的任务列表(列表截图),不打开详情抽屉。
+            BOOL listOnly = NSProcessInfo.processInfo.environment[@"CP_VISUAL_TEST_KIMI_LIST"] != nil;
+            if (!listOnly && self.card.selectedAgent.tasks.count) {
+                NSButton *fakeTask = NSButton.new;
+                fakeTask.tag = 0;
+                [self.card taskClicked:fakeTask];
+            }
         }
     }
 
@@ -5032,7 +5475,10 @@ int main(int argc, const char *argv[]) {
 
             BOOL labeledWorkbench = [dock.barLogoButton.title isEqualToString:@"工作台"] &&
                                     [dock.barLogoButton.toolTip containsString:@"工作台"];
-            BOOL onlyRealAgents = dock.barAgentStack.arrangedSubviews.count == 1;
+            // Dock bar 只放真实(非占位)Agent:Kimi 已接入真实数据源,预期数量按当前 agents 动态计算。
+            NSInteger expectedRealAgents = 0;
+            for (CPAgent *a in agents) if (!a.placeholder) expectedRealAgents++;
+            BOOL onlyRealAgents = dock.barAgentStack.arrangedSubviews.count == (NSUInteger)expectedRealAgents;
             NSButton *agentButton = (NSButton *)dock.barAgentStack.arrangedSubviews.firstObject;
             BOOL labeledAgent = [agentButton isKindOfClass:NSButton.class] &&
                                 [agentButton.title hasPrefix:@"Codex · "] &&
@@ -5881,25 +6327,36 @@ int main(int argc, const char *argv[]) {
                 m9DashOK = dashCount >= 2; // 项目 + 活动
             }
 
-            // 左上返回按钮 hit-test 不被遮挡；详情底部提供第二次点击的 Agent 直达按钮。
+            // 左上返回胶囊 hit-test 不被遮挡；详情底部提供第二次点击的 Agent 直达按钮。
             [card9.rightColumn layoutSubtreeIfNeeded];
             NSPoint backC = NSMakePoint(NSMidX(card9.detailBackButton.bounds), NSMidY(card9.detailBackButton.bounds));
             NSPoint backInCol = [card9.detailBackButton convertPoint:backC toView:card9.rightColumn];
             BOOL m9BackHitOK = [card9.rightColumn hitTest:backInCol] == card9.detailBackButton;
             NSRect backF = [card9.detailBackButton convertRect:card9.detailBackButton.bounds toView:card9.rightColumn];
-            // 可见圆是 detailBackCircle 视觉子层(24pt 透明热区内 18pt 正圆),背景/描边检查以它为准。
-            CALayer *backCircle = nil;
-            for (CALayer *l in card9.detailBackButton.layer.sublayers) {
-                if ([l.name isEqualToString:@"detailBackCircle"]) { backCircle = l; break; }
+            // 返回胶囊:56×28(宽>高)、圆角 14、hairline 描边 + 极淡底色,
+            // 内容含 chevron 图标与「返回」文字,热区与可视区域一致。
+            BOOL m9BackHasLabel = NO;
+            BOOL m9BackHasChevron = NO;
+            {
+                NSMutableArray<NSView *> *queue = [NSMutableArray arrayWithArray:card9.detailBackButton.subviews];
+                while (queue.count) {
+                    NSView *v = queue.firstObject;
+                    [queue removeObjectAtIndex:0];
+                    if ([v isKindOfClass:NSTextField.class] && [((NSTextField *)v).stringValue isEqualToString:@"返回"]) m9BackHasLabel = YES;
+                    if ([v isKindOfClass:NSImageView.class]) m9BackHasChevron = YES;
+                    [queue addObjectsFromArray:v.subviews];
+                }
             }
-            CGColorRef backBg = backCircle.backgroundColor;
+            CGColorRef backBg = card9.detailBackButton.layer.backgroundColor;
             BOOL m9BackVisible = !card9.detailBackButton.isHidden && card9.detailBackButton.alphaValue == 1.0 &&
-                                 backF.size.width == 24.0 && backF.size.height == 24.0 && // 热区必须严格方正,否则圆角层被拉成椭圆
+                                 backF.size.width == 56.0 && backF.size.height == 28.0 &&
+                                 backF.size.width > backF.size.height && // 横向胶囊
                                  NSContainsRect(card9.rightColumn.bounds, backF) &&
-                                 backCircle && backBg && CGColorGetAlpha(backBg) > 0.0 &&
-                                 backCircle.borderWidth > 0.0 &&
-                                 backCircle.frame.size.width == backCircle.frame.size.height && // 正圆
-                                 backCircle.contents != nil; // chevron 画在圆层 contents 上
+                                 card9.detailBackButton.layer.cornerRadius == 14.0 &&
+                                 card9.detailBackButton.layer.borderWidth > 0.0 &&
+                                 backBg && CGColorGetAlpha(backBg) > 0.0 &&
+                                 m9BackHasLabel && m9BackHasChevron &&
+                                 [card9.detailBackButton.accessibilityLabel isEqualToString:@"返回任务列表"];
             NSView *head9 = card9.detailStack.arrangedSubviews.firstObject;
             NSTextField *titleLbl = nil;
             for (NSView *v in head9.subviews) {
@@ -5911,8 +6368,8 @@ int main(int argc, const char *argv[]) {
                                  fabs(backF.origin.x - 12.0) <= 2.0 &&
                                  !NSIntersectsRect(backF, titleF) &&
                                  titleF.origin.x >= NSMaxX(backF) + 4.0 &&
-                                 backLocalSize.width >= 24.0 && backLocalSize.width <= 36.0 &&
-                                 backLocalSize.height >= 24.0 && backLocalSize.height <= 36.0;
+                                 fabs(backLocalSize.width - 56.0) <= 1.0 &&  // 热区 ≥ 可视区域(此处一致)
+                                 fabs(backLocalSize.height - 28.0) <= 1.0;
             BOOL m9DirectOpen = card9.detailOpenAgentButton != nil &&
                                 [card9.detailOpenAgentButton.title isEqualToString:@"在 m9-agent 中打开"] &&
                                 card9.detailOpenAgentButton.action == @selector(openSelectedTaskInAgent:) &&
@@ -5962,16 +6419,36 @@ int main(int argc, const char *argv[]) {
             NSView *hitOpen = [card9.middleColumn hitTest:midPt];
             BOOL m9BarrierOpen = [card9.rightColumn isKindOfClass:CPClickBarrierView.class] &&
                                  hitOpen != nil && [hitOpen isDescendantOf:card9.rightColumn];
+            // 互斥(不只靠挡板):任务列表整体隐藏、hitTest 落不到 row、
+            // row tooltip 与自有 tracking area 全部停用。
+            BOOL m9MutexOpen = card9.taskScrollView.isHidden &&
+                               ![hitOpen isDescendantOf:card9.taskScrollView];
+            for (NSView *r in card9.taskStack.arrangedSubviews) {
+                if (r.toolTip.length) m9MutexOpen = NO;
+                for (NSTrackingArea *ta in r.trackingAreas) {
+                    if (ta.owner == r) m9MutexOpen = NO;
+                }
+            }
             [card9 closeDetailDrawer];
             NSView *hitClosed = [card9.middleColumn hitTest:midPt];
             BOOL m9BarrierRestored = hitClosed != nil &&
                                      ![hitClosed isDescendantOf:card9.rightColumn] &&
                                      [hitClosed isDescendantOf:card9.taskScrollView];
+            // 关闭后完整恢复:列表可见、row 可 hit、tooltip 与 tracking area 还原。
+            BOOL m9MutexRestored = !card9.taskScrollView.isHidden;
+            for (NSView *r in card9.taskStack.arrangedSubviews) {
+                BOOL hasTracking = NO;
+                for (NSTrackingArea *ta in r.trackingAreas) {
+                    if (ta.owner == r) hasTracking = YES;
+                }
+                if (!r.toolTip.length || !hasTracking) m9MutexRestored = NO;
+            }
 
             BOOL m9ui = m9FullWidth && m9GridOK && m9TitleTruncOK && m9ActivityTruncOK && m9TokensOK &&
                         m9DateOK && m9DashOK && m9BackHitOK && m9BackVisible && m9BackTopLeft && m9DirectOpen &&
                         m9RefreshKeep && m9RefreshGone && m9Esc1 && m9Esc2 &&
-                        m9Keyable && m9ShowMakesKey && m9BarrierOpen && m9BarrierRestored;
+                        m9Keyable && m9ShowMakesKey && m9BarrierOpen && m9BarrierRestored &&
+                        m9MutexOpen && m9MutexRestored;
 
             // M10: 工作台任务列表 NSScrollView 化
             CPWorkbenchCardController *card10 = CPWorkbenchCardController.new;
@@ -6460,7 +6937,7 @@ int main(int argc, const char *argv[]) {
                 legendOK ? @"OK" : @"FAIL"];
             [result appendFormat:@"M5 UI self-test(动画生命周期): hud-rapid-toggle=%@\n",
                 hudRapidOK ? @"OK" : @"FAIL"];
-            [result appendFormat:@"M9 UI self-test: detail-fullwidth=%@ detail-grid=%@ detail-title-trunc=%@ detail-activity-trunc=%@ detail-tokens=%@ detail-date=%@ detail-dash=%@ detail-back-hit=%@ detail-back-visible=%@ detail-back-topleft=%@ detail-direct-open=%@ detail-refresh-keep=%@ detail-refresh-gone=%@ detail-esc1=%@ detail-esc2=%@ workbench-keyable=%@ show-makes-key=%@ detail-barrier=%@ detail-barrier-restore=%@\n",
+            [result appendFormat:@"M9 UI self-test: detail-fullwidth=%@ detail-grid=%@ detail-title-trunc=%@ detail-activity-trunc=%@ detail-tokens=%@ detail-date=%@ detail-dash=%@ detail-back-hit=%@ detail-back-visible=%@ detail-back-topleft=%@ detail-direct-open=%@ detail-refresh-keep=%@ detail-refresh-gone=%@ detail-esc1=%@ detail-esc2=%@ workbench-keyable=%@ show-makes-key=%@ detail-barrier=%@ detail-barrier-restore=%@ detail-mutex-open=%@ detail-mutex-restored=%@\n",
                 m9FullWidth ? @"OK" : @"FAIL",
                 m9GridOK ? @"OK" : @"FAIL",
                 m9TitleTruncOK ? @"OK" : @"FAIL",
@@ -6479,7 +6956,9 @@ int main(int argc, const char *argv[]) {
                 m9Keyable ? @"OK" : @"FAIL",
                 m9ShowMakesKey ? @"OK" : @"FAIL",
                 m9BarrierOpen ? @"OK" : @"FAIL",
-                m9BarrierRestored ? @"OK" : @"FAIL"];
+                m9BarrierRestored ? @"OK" : @"FAIL",
+                m9MutexOpen ? @"OK" : @"FAIL",
+                m9MutexRestored ? @"OK" : @"FAIL"];
             [result appendFormat:@"M10 UI self-test: task-scroll=%@ header-fixed=%@ scrollable=%@ first-row=%@ last-row-inset=%@ width-follow=%@\n",
                 m10ScrollStruct ? @"OK" : @"FAIL",
                 m10HeaderFixed ? @"OK" : @"FAIL",
@@ -6656,24 +7135,211 @@ int main(int argc, const char *argv[]) {
                 noEventIsIdle ? @"OK" : @"FAIL"];
             fputs(m2line.UTF8String, stdout);
 
-            // 任务路由：Codex/Kimi 使用已验证的本机 URL scheme；未知 Agent 降级为应用唤起。
+            // 任务路由：Codex 线程深链;Kimi 按 sourceKind 分流(desktop 深链 / CLI 降级);未知 Agent 降级为应用唤起。
             CPTask *routeTask = CPTestTask(@"thread-123", CPStatusWorking, 1);
+            routeTask.sourceKind = @"codex";
             CPAgent *routeCodex = CPTestAgent(@"codex", @[routeTask]);
             CPAgent *routeKimi = CPTestAgent(@"kimi", @[routeTask]);
             CPAgent *routeUnknown = CPTestAgent(@"unknown", @[routeTask]);
             BOOL codexRouteOK = [CPDeepLinkForAgentTask(routeCodex, routeTask).absoluteString
                                  isEqualToString:@"codex://threads/thread-123"];
-            BOOL kimiRouteOK = [CPDeepLinkForAgentTask(routeKimi, routeTask).absoluteString
-                                isEqualToString:@"kimi-work://chat/thread-123"];
+            // Kimi Code CLI 无安全精确 resume:必须明确返回 nil(降级唤起客户端),不伪造成功。
+            routeTask.sourceKind = @"kimi-cli";
+            BOOL kimiCLIRouteOK = CPDeepLinkForAgentTask(routeKimi, routeTask) == nil;
+            // Kimi desktop daimon:本机注册了 kimi:// scheme 才给深链,否则 nil 走唤起降级。
+            CPTask *routeDesktopTask = CPTestTask(@"kimi-desktop-u1", CPStatusWorking, 1);
+            routeDesktopTask.sourceKind = @"kimi-desktop";
+            CPAgent *routeKimiDesktop = CPTestAgent(@"kimi", @[routeDesktopTask]);
+            BOOL kimiSchemeRegistered = [NSWorkspace.sharedWorkspace URLForApplicationToOpenURL:[NSURL URLWithString:@"kimi://"]] != nil;
+            NSURL *desktopLink = CPDeepLinkForAgentTask(routeKimiDesktop, routeDesktopTask);
+            BOOL kimiDesktopRouteOK = kimiSchemeRegistered
+                ? [desktopLink.absoluteString isEqualToString:@"kimi://chat/u1"]
+                : desktopLink == nil;
             BOOL unknownRouteOK = CPDeepLinkForAgentTask(routeUnknown, routeTask) == nil;
             routeKimi.placeholder = YES;
             BOOL placeholderRouteOK = CPDeepLinkForAgentTask(routeKimi, routeTask) == nil;
-            BOOL taskRoutingOK = codexRouteOK && kimiRouteOK && unknownRouteOK && placeholderRouteOK;
+            BOOL taskRoutingOK = codexRouteOK && kimiCLIRouteOK && kimiDesktopRouteOK && unknownRouteOK && placeholderRouteOK;
             NSString *routingLine = [NSString stringWithFormat:
-                @"Task routing self-test: codex-thread=%@ kimi-chat=%@ unknown-fallback=%@ placeholder-fallback=%@\n",
-                codexRouteOK ? @"OK" : @"FAIL", kimiRouteOK ? @"OK" : @"FAIL",
+                @"Task routing self-test: codex-thread=%@ kimi-cli-fallback=%@ kimi-desktop-link=%@ unknown-fallback=%@ placeholder-fallback=%@\n",
+                codexRouteOK ? @"OK" : @"FAIL", kimiCLIRouteOK ? @"OK" : @"FAIL", kimiDesktopRouteOK ? @"OK" : @"FAIL",
                 unknownRouteOK ? @"OK" : @"FAIL", placeholderRouteOK ? @"OK" : @"FAIL"];
             fputs(routingLine.UTF8String, stdout);
+
+            // K: Kimi 真实接入 —— 全部用 /tmp 隔离 fixture,CP_KIMI_CLI_ROOT / CP_KIMI_DESKTOP_ROOT 覆盖数据根,
+            // 绝不读写真实 Kimi 数据;断言只用长度/状态/计数,输出不含用户 prompt 明文。
+            NSString *kFixture = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                [NSString stringWithFormat:@"codexpulse-kimi-fixture-%d", NSProcessInfo.processInfo.processIdentifier]];
+            NSFileManager *kfm = NSFileManager.defaultManager;
+            [kfm removeItemAtPath:kFixture error:nil];
+            NSString *kCLIRoot = [kFixture stringByAppendingPathComponent:@"cli"];
+            NSString *kDesktopRoot = [kFixture stringByAppendingPathComponent:@"desktop"];
+            long long kNowMs = (long long)(NSDate.date.timeIntervalSince1970 * 1000);
+
+            // fixture 写入 helper(仅本段使用)
+            void (^kWriteCLI)(NSString *, NSString *, NSDictionary *, NSString *) =
+                ^(NSString *root, NSString *sessionID, NSDictionary *state, NSString *wire) {
+                NSString *dir = [[root stringByAppendingPathComponent:@"wd_proj1"] stringByAppendingPathComponent:sessionID];
+                [kfm createDirectoryAtPath:[dir stringByAppendingPathComponent:@"agents/main"] withIntermediateDirectories:YES attributes:nil error:nil];
+                NSData *data = [NSJSONSerialization dataWithJSONObject:state options:0 error:nil];
+                [data writeToFile:[dir stringByAppendingPathComponent:@"state.json"] atomically:YES];
+                if (wire) [wire writeToFile:[dir stringByAppendingPathComponent:@"agents/main/wire.jsonl"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            };
+            void (^kWriteDesktop)(NSString *, NSString *, NSString *, NSString *) =
+                ^(NSString *root, NSString *uuid, NSString *context, NSString *wire) {
+                NSString *dir = [[root stringByAppendingPathComponent:@"hash1"] stringByAppendingPathComponent:uuid];
+                [kfm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+                if (context) [context writeToFile:[dir stringByAppendingPathComponent:@"context.jsonl"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                if (wire) [wire writeToFile:[dir stringByAppendingPathComponent:@"wire.jsonl"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            };
+
+            // K1: CLI v2 schema(epoch 毫秒 + cwd + id + lastTurnReason=completed)
+            kWriteCLI(kCLIRoot, @"session_a1", @{
+                @"id": @"session_a1", @"version": @2, @"archived": @NO,
+                @"cwd": @"/tmp/proj-alpha", @"createdAt": @(kNowMs - 600000), @"updatedAt": @(kNowMs - 300000),
+                @"isCustomTitle": @NO, @"lastPrompt": @"修复登录页崩溃问题", @"lastTurnReason": @"completed",
+            }, nil);
+            // K2: CLI v1 schema(ISO 时间 + workDir,无 id/archived)
+            kWriteCLI(kCLIRoot, @"session_b1", @{
+                @"title": @"New Session", @"isCustomTitle": @NO, @"lastPrompt": @"整理本周纪要",
+                @"workDir": @"/tmp/proj-beta", @"createdAt": @"2026-08-05T09:10:01.159Z", @"updatedAt": @"2026-08-05T09:11:01.159Z",
+            }, nil);
+            // K3: 归档会话不展示
+            kWriteCLI(kCLIRoot, @"session_arch", @{
+                @"id": @"session_arch", @"version": @2, @"archived": @YES, @"cwd": @"/tmp/proj-arch",
+                @"createdAt": @(kNowMs - 1000), @"updatedAt": @(kNowMs - 1000), @"lastTurnReason": @"completed",
+            }, nil);
+            // K4: 自定义标题(isCustomTitle=YES 用 title)
+            kWriteCLI(kCLIRoot, @"session_c1", @{
+                @"id": @"session_c1", @"version": @2, @"archived": @NO, @"cwd": @"/tmp/proj-gamma",
+                @"createdAt": @(kNowMs - 900000), @"updatedAt": @(kNowMs - 400000),
+                @"isCustomTitle": @YES, @"title": @"我的自定义会话名", @"lastPrompt": @"另一条 prompt",
+            }, nil);
+            // K5: 超长 lastPrompt 标题必须清洗+截断(≤59 字符),不得铺进 UI
+            NSString *kLongPrompt = [@"" stringByPaddingToLength:500 withString:@"长" startingAtIndex:0];
+            kWriteCLI(kCLIRoot, @"session_d1", @{
+                @"id": @"session_d1", @"version": @2, @"archived": @NO, @"cwd": @"/tmp/proj-delta",
+                @"createdAt": @(kNowMs - 900000), @"updatedAt": @(kNowMs - 500000),
+                @"isCustomTitle": @NO, @"lastPrompt": kLongPrompt, @"lastTurnReason": @"completed",
+            }, nil);
+            // K6: 状态映射 —— working(活跃 turn 证据 + 新鲜 updatedAt)
+            kWriteCLI(kCLIRoot, @"session_e1", @{
+                @"id": @"session_e1", @"version": @2, @"archived": @NO, @"cwd": @"/tmp/proj-eps",
+                @"createdAt": @(kNowMs - 60000), @"updatedAt": @(kNowMs - 1000),
+                @"isCustomTitle": @NO, @"lastPrompt": @"进行中的任务",
+            }, @"{\"type\":\"llm.request\",\"time\":1789000000000}\n");
+            // K7: 状态映射 —— failed(明确 error)
+            kWriteCLI(kCLIRoot, @"session_f1", @{
+                @"id": @"session_f1", @"version": @2, @"archived": @NO, @"cwd": @"/tmp/proj-zeta",
+                @"createdAt": @(kNowMs - 800000), @"updatedAt": @(kNowMs - 700000),
+                @"isCustomTitle": @NO, @"lastPrompt": @"出错任务", @"lastTurnReason": @"error",
+            }, nil);
+            // K8: 旧会话不永 working(wire 有活跃 turn 证据但全部活动时间超过阈值 → idle)
+            kWriteCLI(kCLIRoot, @"session_g1", @{
+                @"id": @"session_g1", @"version": @2, @"archived": @NO, @"cwd": @"/tmp/proj-eta",
+                @"createdAt": @(kNowMs - 10000000), @"updatedAt": @(kNowMs - 7200000),
+                @"isCustomTitle": @NO, @"lastPrompt": @"陈旧任务",
+            }, [NSString stringWithFormat:@"{\"type\":\"llm.request\",\"time\":%lld}\n", kNowMs - 7200000]);
+            // 真实陈旧会话的 wire mtime 也是旧的,fixture 显式回拨
+            [kfm setAttributes:@{NSFileModificationDate: [NSDate dateWithTimeIntervalSince1970:(kNowMs - 7200000) / 1000.0]}
+                  ofItemAtPath:[kCLIRoot stringByAppendingPathComponent:@"wd_proj1/session_g1/agents/main/wire.jsonl"] error:nil];
+            // desktop:waiting(TurnBegin + StepInterrupted 未结束) + 坏行防御 + 跨源去重样本
+            kWriteDesktop(kDesktopRoot, @"desk-1",
+                @"{\"role\": \"_system_prompt\", \"content\": \"sys\"}\n这不是合法 json 行\n{\"role\": \"user\", \"content\": \"桌面端任务标题\"}\n{\"role\": \"user\"}\n",
+                [NSString stringWithFormat:@"{\"type\": \"metadata\"}\n{\"timestamp\": %.3f, \"message\": {\"type\": \"TurnBegin\", \"payload\": {\"user_input\": \"hi\"}}}\n{\"timestamp\": %.3f, \"message\": {\"type\": \"StepInterrupted\", \"payload\": {}}}\n",
+                    (kNowMs - 3000) / 1000.0, (kNowMs - 2500) / 1000.0]);
+            // desktop:与 CLI 同一 raw session id → 去重(CLI 优先)
+            kWriteDesktop(kDesktopRoot, @"a1",
+                @"{\"role\": \"user\", \"content\": \"重复会话\"}\n",
+                @"{\"timestamp\": 1789000000.0, \"message\": {\"type\": \"TurnEnd\", \"payload\": {}}}\n");
+            // desktop:缺 wire.jsonl → 整会话跳过
+            kWriteDesktop(kDesktopRoot, @"desk-broken", @"{\"role\": \"user\", \"content\": \"x\"}\n", nil);
+
+            setenv("CP_KIMI_CLI_ROOT", kCLIRoot.UTF8String, 1);
+            setenv("CP_KIMI_DESKTOP_ROOT", kDesktopRoot.UTF8String, 1);
+            CPKimiSource *kSource = [[CPKimiSource alloc] initWithCache:CPStateCache.new];
+            CPAgent *kimiA = [kSource readAgent];
+            CPTask *(^kFind)(NSString *) = ^(NSString *taskID) {
+                for (CPTask *t in kimiA.tasks) if ([t.taskID isEqualToString:taskID]) return t;
+                return (CPTask *)nil;
+            };
+            CPTask *kA1 = kFind(@"kimi-cli-session_a1");
+            BOOL k1 = kA1 && kA1.status == CPStatusCompleted &&
+                      [kA1.projectPath isEqualToString:@"/tmp/proj-alpha"] && [kA1.projectName isEqualToString:@"proj-alpha"] &&
+                      fabs(kA1.createdAt.timeIntervalSince1970 * 1000 - (kNowMs - 600000)) < 1 &&
+                      [kA1.title isEqualToString:@"修复登录页崩溃问题"] && [kA1.sourceKind isEqualToString:@"kimi-cli"];
+            CPTask *kB1 = kFind(@"kimi-cli-session_b1");
+            BOOL k2 = kB1 && kB1.status == CPStatusIdle && // v1 无 lastTurnReason/无线 wire → idle
+                      [kB1.projectName isEqualToString:@"proj-beta"] &&
+                      fabs(kB1.updatedAt.timeIntervalSince1970 - 1785921061.159) < 1; // ISO 解析出正确 epoch
+            BOOL k3 = kFind(@"kimi-cli-session_arch") == nil;
+            CPTask *kC1 = kFind(@"kimi-cli-session_c1");
+            BOOL k4 = kC1 && [kC1.title isEqualToString:@"我的自定义会话名"];
+            CPTask *kD1 = kFind(@"kimi-cli-session_d1");
+            BOOL k5 = kD1 && kD1.title.length <= 59 && [kD1.title hasSuffix:@"…"];
+            CPTask *kE1 = kFind(@"kimi-cli-session_e1");
+            BOOL k6 = kE1 && kE1.status == CPStatusWorking && [kE1.activity containsString:@"Kimi Code CLI"];
+            CPTask *kF1 = kFind(@"kimi-cli-session_f1");
+            BOOL k7 = kF1 && kF1.status == CPStatusFailed;
+            CPTask *kG1 = kFind(@"kimi-cli-session_g1");
+            BOOL k8 = kG1 && kG1.status == CPStatusIdle;
+            CPTask *kDesk1 = kFind(@"kimi-desktop-desk-1");
+            BOOL k9 = kDesk1 && kDesk1.status == CPStatusWaiting &&
+                      [kDesk1.title isEqualToString:@"桌面端任务标题"] && // 坏行/缺字段行被跳过
+                      [kDesk1.sourceKind isEqualToString:@"kimi-desktop"];
+            BOOL k10 = kFind(@"kimi-desktop-a1") == nil && kFind(@"kimi-desktop-desk-broken") == nil; // 去重 + 缺文件跳过
+            // 排序:updatedAt 降序,最新的是 working 的 session_e1
+            BOOL k11 = kimiA.tasks.count >= 1 && kimiA.tasks.firstObject == kE1;
+            // 缓存:同一 source 再读,文件未变 → 全部命中解析缓存,不产生新解析条目
+            NSUInteger kCacheBefore = kSource.cache.entries.count;
+            [kSource readAgent];
+            BOOL k12 = kSource.cache.entries.count == kCacheBefore; // cache hit(无重新解析)
+            // mtime+size 变化 → 重新解析
+            NSString *kE1State = [[kCLIRoot stringByAppendingPathComponent:@"wd_proj1/session_e1/state.json"] copy];
+            NSMutableDictionary *kE1Dict = [[NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:kE1State] options:0 error:nil] mutableCopy];
+            kE1Dict[@"lastTurnReason"] = @"completed";
+            kE1Dict[@"updatedAt"] = @(kNowMs); // 改变大小,确保缓存失效
+            [[NSJSONSerialization dataWithJSONObject:kE1Dict options:0 error:nil] writeToFile:kE1State atomically:YES];
+            // wire 同步改为 turn 已结束(真实 completed 会话尾部即有 turn.ended)
+            [@"{\"type\":\"turn.ended\",\"reason\":\"completed\",\"time\":1789000001000}\n"
+                writeToFile:[[kCLIRoot stringByAppendingPathComponent:@"wd_proj1/session_e1/agents/main/wire.jsonl"] copy]
+                 atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            CPAgent *kimiA3 = [kSource readAgent];
+            CPTask *kE1c = nil;
+            for (CPTask *t in kimiA3.tasks) if ([t.taskID isEqualToString:@"kimi-cli-session_e1"]) kE1c = t;
+            BOOL k13 = kE1c && kE1c.status == CPStatusCompleted; // invalidate 后重解析,状态从 working 变 completed
+            // 空态:空根目录 → 零任务、非占位、idle
+            NSString *kEmptyRoot = [kFixture stringByAppendingPathComponent:@"empty"];
+            [kfm createDirectoryAtPath:kEmptyRoot withIntermediateDirectories:YES attributes:nil error:nil];
+            setenv("CP_KIMI_CLI_ROOT", kEmptyRoot.UTF8String, 1);
+            setenv("CP_KIMI_DESKTOP_ROOT", kEmptyRoot.UTF8String, 1);
+            CPAgent *kimiEmpty = [[[CPKimiSource alloc] initWithCache:CPStateCache.new] readAgent];
+            BOOL k14 = kimiEmpty && kimiEmpty.tasks.count == 0 && !kimiEmpty.placeholder && kimiEmpty.status == CPStatusIdle;
+            // 上限 50 + 降序:独立 root 造 55 个会话
+            NSString *kCapRoot = [kFixture stringByAppendingPathComponent:@"cap"];
+            for (int i = 0; i < 55; i++) {
+                kWriteCLI(kCapRoot, [NSString stringWithFormat:@"session_cap%02d", i], @{
+                    @"id": [NSString stringWithFormat:@"session_cap%02d", i], @"version": @2, @"archived": @NO,
+                    @"cwd": @"/tmp/proj-cap", @"createdAt": @(kNowMs - 100000 + i * 1000), @"updatedAt": @(kNowMs - 100000 + i * 1000),
+                    @"isCustomTitle": @NO, @"lastPrompt": @"cap", @"lastTurnReason": @"completed",
+                }, nil);
+            }
+            setenv("CP_KIMI_CLI_ROOT", kCapRoot.UTF8String, 1);
+            CPAgent *kimiCap = [[[CPKimiSource alloc] initWithCache:CPStateCache.new] readAgent];
+            BOOL k15 = kimiCap.tasks.count == 50 &&
+                       [kimiCap.tasks.firstObject.taskID isEqualToString:@"kimi-cli-session_cap54"] &&
+                       [kimiCap.tasks.lastObject.taskID isEqualToString:@"kimi-cli-session_cap05"];
+            unsetenv("CP_KIMI_CLI_ROOT");
+            unsetenv("CP_KIMI_DESKTOP_ROOT");
+            [kfm removeItemAtPath:kFixture error:nil];
+
+            BOOL kimiOK = k1 && k2 && k3 && k4 && k5 && k6 && k7 && k8 && k9 && k10 && k11 && k12 && k13 && k14 && k15;
+            NSString *kLine = [NSString stringWithFormat:
+                @"Kimi self-test: cli-v2=%@ cli-v1=%@ archived-filter=%@ custom-title=%@ title-truncate=%@ status-working=%@ status-failed=%@ stale-not-working=%@ desktop-waiting=%@ dedupe-skip=%@ sort-desc=%@ cache-hit=%@ cache-invalidate=%@ empty-state=%@ cap50=%@\n",
+                k1 ? @"OK" : @"FAIL", k2 ? @"OK" : @"FAIL", k3 ? @"OK" : @"FAIL", k4 ? @"OK" : @"FAIL",
+                k5 ? @"OK" : @"FAIL", k6 ? @"OK" : @"FAIL", k7 ? @"OK" : @"FAIL", k8 ? @"OK" : @"FAIL",
+                k9 ? @"OK" : @"FAIL", k10 ? @"OK" : @"FAIL", k11 ? @"OK" : @"FAIL", k12 ? @"OK" : @"FAIL",
+                k13 ? @"OK" : @"FAIL", k14 ? @"OK" : @"FAIL", k15 ? @"OK" : @"FAIL"];
+            fputs(kLine.UTF8String, stdout);
 
             // M6: CPCleanTitle 脏文本清洗
             BOOL ctDirty = [CPCleanTitle((const unsigned char *)"想让你设计一个loop [11] user: <in-app-browser-context>秘密上下文</in-app-browser-context>")
@@ -6745,31 +7411,72 @@ int main(int argc, const char *argv[]) {
 
             BOOL perfOK = gateOK && sigSame && sigDiff && rollCacheHit && rollCacheInvalidate;
 
-            // 回归:占位 Agent 的示例数据必须在会话内静态,两轮 readAgents 的签名一致,
-            // 否则静态数据也会每 3s 变签名、签名跳过机制失效(曾用 NSDate.date 作 updatedAt)。
+            // 回归:Kimi 静态 fixture 两轮读取签名必须一致(替代原 placeholder 静态回归):
+            // 否则静态数据也会每 3s 变签名、签名跳过机制失效。
+            NSString *stabRoot = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                [NSString stringWithFormat:@"codexpulse-kimi-stab-%d", NSProcessInfo.processInfo.processIdentifier]];
+            NSString *stabStateDir = [[stabRoot stringByAppendingPathComponent:@"wd_s/session_stab"] stringByAppendingPathComponent:@"agents/main"];
+            [[NSFileManager defaultManager] createDirectoryAtPath:stabStateDir withIntermediateDirectories:YES attributes:nil error:nil];
+            long long stabNowMs = (long long)(NSDate.date.timeIntervalSince1970 * 1000);
+            [[NSJSONSerialization dataWithJSONObject:@{
+                @"id": @"session_stab", @"version": @2, @"archived": @NO, @"cwd": @"/tmp/proj-stab",
+                @"createdAt": @(stabNowMs - 2000), @"updatedAt": @(stabNowMs - 1000),
+                @"isCustomTitle": @NO, @"lastPrompt": @"稳定签名", @"lastTurnReason": @"completed",
+            } options:0 error:nil] writeToFile:[stabRoot stringByAppendingPathComponent:@"wd_s/session_stab/state.json"] atomically:YES];
+            setenv("CP_KIMI_CLI_ROOT", stabRoot.UTF8String, 1);
+            setenv("CP_KIMI_DESKTOP_ROOT", stabRoot.UTF8String, 1);
             CPStateReader *stabReader = CPStateReader.new;
-            NSArray<CPAgent *> *stabR1 = [stabReader readAgents];
-            NSArray<CPAgent *> *stabR2 = [stabReader readAgents];
-            CPAgent *ph1 = nil, *ph2 = nil;
-            for (CPAgent *a in stabR1) if (a.placeholder) ph1 = a;
-            for (CPAgent *a in stabR2) if (a.placeholder) ph2 = a;
-            BOOL placeholderSigStable = ph1 && ph2 &&
-                                        [CPAgentsSignature(@[ph1]) isEqualToString:CPAgentsSignature(@[ph2])];
-            perfOK = perfOK && placeholderSigStable;
+            CPAgent *stabK1 = nil, *stabK2 = nil;
+            for (CPAgent *a in [stabReader readAgents]) if ([a.agentID isEqualToString:@"kimi"]) stabK1 = a;
+            for (CPAgent *a in [stabReader readAgents]) if ([a.agentID isEqualToString:@"kimi"]) stabK2 = a;
+            BOOL kimiSigStable = stabK1 && stabK2 && stabK1.tasks.count == 1 &&
+                                 [CPAgentsSignature(@[stabK1]) isEqualToString:CPAgentsSignature(@[stabK2])];
+            unsetenv("CP_KIMI_CLI_ROOT");
+            unsetenv("CP_KIMI_DESKTOP_ROOT");
+            [[NSFileManager defaultManager] removeItemAtPath:stabRoot error:nil];
+            perfOK = perfOK && kimiSigStable;
             NSString *perfLine = [NSString stringWithFormat:
-                @"Perf self-test: refresh-gate=%@ signature-same=%@ signature-diff=%@ rollout-cache-hit=%@ rollout-cache-invalidate=%@ placeholder-signature-stable=%@\n",
+                @"Perf self-test: refresh-gate=%@ signature-same=%@ signature-diff=%@ rollout-cache-hit=%@ rollout-cache-invalidate=%@ kimi-signature-stable=%@\n",
                 gateOK ? @"OK" : @"FAIL", sigSame ? @"OK" : @"FAIL", sigDiff ? @"OK" : @"FAIL",
                 rollCacheHit ? @"OK" : @"FAIL", rollCacheInvalidate ? @"OK" : @"FAIL",
-                placeholderSigStable ? @"OK" : @"FAIL"];
+                kimiSigStable ? @"OK" : @"FAIL"];
             fputs(perfLine.UTF8String, stdout);
-            return (taskCount > 0 && internalThreadsFiltered && m2 && taskRoutingOK && m6 && perfOK) ? 0 : 2;
+            return (taskCount > 0 && internalThreadsFiltered && m2 && taskRoutingOK && m6 && kimiOK && perfOK) ? 0 : 2;
+        }
+        if (argc > 1 && strcmp(argv[1], "--kimi-probe") == 0) {
+            // 只读真实验证:报告检测到的 CLI/desktop 会话数,以及当前监督会话(cwd=本仓库 的最新非归档 CLI 会话)是否被识别。
+            // 只打印 session id 与计数;title 只打印截断前 20 字,不打印 prompt 明文。
+            unsetenv("CP_KIMI_CLI_ROOT");
+            unsetenv("CP_KIMI_DESKTOP_ROOT");
+            CPKimiSource *probeSource = [[CPKimiSource alloc] initWithCache:CPStateCache.new];
+            CPAgent *probeKimi = [probeSource readAgent];
+            NSString *probeCwd = NSFileManager.defaultManager.currentDirectoryPath;
+            CPTask *probeCurrent = nil;
+            for (CPTask *t in probeKimi.tasks) {
+                if (![t.sourceKind isEqualToString:@"kimi-cli"]) continue;
+                if (![t.projectPath isEqualToString:probeCwd]) continue;
+                if (!probeCurrent || [t.updatedAt compare:probeCurrent.updatedAt] == NSOrderedDescending) probeCurrent = t;
+            }
+            NSString *probeTitle = probeCurrent.title.length > 20 ? [probeCurrent.title substringToIndex:20] : (probeCurrent.title ?: @"");
+            NSMutableString *probeReport = [NSMutableString stringWithFormat:
+                @"Kimi probe: cli-sessions=%ld desktop-sessions=%ld tasks-shown=%lu current-session=%@\n",
+                (long)probeSource.lastCLICount, (long)probeSource.lastDesktopCount, (unsigned long)probeKimi.tasks.count,
+                probeCurrent ? @"RECOGNIZED" : @"MISSING"];
+            if (probeCurrent) {
+                [probeReport appendFormat:@"  current: id=%@ status=%@ title-prefix=%@\n",
+                 probeCurrent.taskID, CPStatusTitle(probeCurrent.status), probeTitle];
+            }
+            fputs(probeReport.UTF8String, stdout);
+            [probeReport writeToFile:@"/tmp/kimi-probe.txt" atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            return probeCurrent ? 0 : 4;
         }
         if (CPAnotherInstanceIsRunning()) return 0;
         NSApplication *app = NSApplication.sharedApplication;
         AppDelegate *delegate = AppDelegate.new;
         delegate.hudVisualTest = argc > 1 && strcmp(argv[1], "--visual-test-hud") == 0;
         delegate.detailVisualTest = argc > 1 && strcmp(argv[1], "--visual-test-detail") == 0;
-        CPRunningSelfTests = delegate.detailVisualTest;
+        delegate.kimiVisualTest = argc > 1 && strcmp(argv[1], "--visual-test-kimi") == 0;
+        CPRunningSelfTests = delegate.detailVisualTest || delegate.kimiVisualTest;
         app.delegate = delegate;
         [app run];
     }
