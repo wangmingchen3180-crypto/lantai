@@ -1194,27 +1194,48 @@ static CPRolloutState *CPReadRolloutState(NSString *path) {
 #pragma mark - Agent Source 边界
 
 // 通用解析缓存:按 path+mtime+size 复用解析结果,文件未变不重复读盘/解析。
-// state.json 小文件与 wire/context 有界尾部都走这里;上限兜底防无限增长。
+// state.json 小文件与 wire/context 有界尾部都走这里。
+// 容量必须有界 LRU(默认 512):本机 CLI 会话即 ~150(state+wire ~300 条目),旧实现超过 64 就
+// removeAllObjects 会造成每 3 秒缓存抖动、全量重读 wire;LRU 只逐出最久未用条目,热条目稳定命中。
 @interface CPStateCache : NSObject
 @property (nonatomic) NSMutableDictionary<NSString *, NSDictionary *> *entries; // path → {mtime,size,value}
+@property (nonatomic) NSMutableArray<NSString *> *recency; // LRU 队列:队首最久未用
+@property (nonatomic) NSUInteger capacity;                 // 默认 512,测试可调小验证逐出
 - (id)objectForPath:(NSString *)path parser:(id (^)(NSString *path))parser;
 @end
 
 @implementation CPStateCache
 
+- (instancetype)init {
+    self = [super init];
+    if (!self) return nil;
+    self.capacity = 512;
+    return self;
+}
+
 - (id)objectForPath:(NSString *)path parser:(id (^)(NSString *path))parser {
     if (!path.length || !parser) return nil;
     if (!self.entries) self.entries = NSMutableDictionary.dictionary;
+    if (!self.recency) self.recency = NSMutableArray.array;
     NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
     NSDate *mtime = attrs[NSFileModificationDate] ?: NSDate.distantPast;
     NSNumber *size = attrs[NSFileSize] ?: @0;
     NSDictionary *cached = self.entries[path];
     if (cached && [cached[@"mtime"] isEqual:mtime] && [cached[@"size"] isEqual:size]) {
+        [self.recency removeObject:path]; // 命中:提到队尾(最近使用)
+        [self.recency addObject:path];
         id value = cached[@"value"];
         return [value isKindOfClass:NSNull.class] ? nil : value;
     }
     id value = parser(path) ?: NSNull.null;
-    if (self.entries.count > 64) [self.entries removeAllObjects];
+    if (!cached) {
+        [self.recency addObject:path];
+        while (self.recency.count > MAX(self.capacity, (NSUInteger)1)) { // 逐出最久未用,绝不清空全表
+            NSString *victim = self.recency.firstObject;
+            [self.recency removeObjectAtIndex:0];
+            [self.entries removeObjectForKey:victim];
+        }
+    }
     self.entries[path] = @{@"mtime": mtime, @"size": size, @"value": value};
     return [value isKindOfClass:NSNull.class] ? nil : value;
 }
@@ -1508,7 +1529,7 @@ static CPKimiWireState *CPKimiParseWireTail(NSString *text, BOOL desktopFormat) 
 }
 
 // Kimi 状态映射(保守可解释):
-// 未解决的用户输入/中断 → waiting;活跃 turn 证据 + 最近 15 分钟内有活动(state 更新或 wire 写入)→ working;
+// 未解决的用户输入/中断 → waiting;活跃 turn 证据 + 最近 15 分钟内有活动(state updatedAt 或 wire 事件)→ working;
 // 活跃 turn 但活动已旧 → idle(旧会话不得仅因最近修改永远 working);
 // 明确 completed → completed,error/failed → failed,cancelled/interrupted 与无证据 → idle。
 static CPStatus CPKimiStatus(NSString *stateReason, CPKimiWireState *wire, NSDate *activityAt, NSDate *now) {
@@ -1521,13 +1542,12 @@ static CPStatus CPKimiStatus(NSString *stateReason, CPKimiWireState *wire, NSDat
     return CPStatusIdle; // cancelled / interrupted / 无证据
 }
 
-// 会话最近活动时刻:state updatedAt、wire 尾部事件时间、wire 文件 mtime 三者取最新。
-// (turn 进行中 state.json 不刷新,wire 文件却持续写入,单看 updatedAt 会把活跃长回合误判成陈旧。)
-static NSDate *CPKimiActivityAt(NSDate *updatedAt, CPKimiWireState *wire, NSString *wirePath) {
+// 会话最近活动时刻:max(state updatedAt, wire 尾部 lastEventAt)。
+// turn 进行中 state.json 不刷新,长回合(>15 分钟)靠 wire 尾部事件的 lastEventAt 保活,不会误判 idle;
+// 不用 wire 文件 mtime——仅被外部触碰而内容未变的旧会话不得因此显得活跃。
+static NSDate *CPKimiActivityAt(NSDate *updatedAt, CPKimiWireState *wire) {
     NSDate *latest = updatedAt;
     if (wire.lastEventAt && (!latest || [wire.lastEventAt compare:latest] == NSOrderedDescending)) latest = wire.lastEventAt;
-    NSDate *wireMtime = [[NSFileManager defaultManager] attributesOfItemAtPath:wirePath error:nil][NSFileModificationDate];
-    if (wireMtime && (!latest || [wireMtime compare:latest] == NSOrderedDescending)) latest = wireMtime;
     return latest;
 }
 
@@ -1586,9 +1606,18 @@ static NSString *CPKimiCleanTitle(NSString *raw) {
     return agent;
 }
 
+// wire 候选预筛上限:state.json 小文件全部解析(便宜且缓存),wire 尾部只读活跃度最高的前 N 个会话。
+// 展示上限 50,留 30 余量;排名靠后的会话即使状态有偏差也会在 cap 50 时被裁掉,不影响 UI。
+static const NSInteger CPKimiWireCandidateLimit = 80;
+
 // A) Kimi Code CLI:~/.kimi-code/sessions/<workspace>/<session>/state.json(小文件全量解析,按 mtime+size 缓存)。
+// 两遍式:第一遍只解析 state.json(归档过滤/计数/标题/时间);第二遍按 max(updatedAt, wire mtime) 元数据
+// 预筛出活跃候选,只有候选才读 wire 尾部做状态映射——避免每轮刷新对几百个会话全量 stat+读 wire。
 - (NSArray<CPTask *> *)readCLITasksIntoRawIDs:(NSMutableSet<NSString *> *)rawIDs {
     NSMutableArray<CPTask *> *tasks = NSMutableArray.array;
+    NSMutableArray<NSString *> *wirePaths = NSMutableArray.array;   // 与 tasks 平行;无 wire 为 @""
+    NSMutableArray<NSDate *> *activityHints = NSMutableArray.array; // max(updatedAt, wire mtime),预筛排序用
+    NSMutableArray<NSString *> *reasons = NSMutableArray.array;
     self.lastCLICount = 0;
     NSString *root = CPKimiCLIRoot();
     NSFileManager *fm = NSFileManager.defaultManager;
@@ -1632,19 +1661,45 @@ static NSString *CPKimiCleanTitle(NSString *raw) {
                                                                                    : (lastPrompt.length ? lastPrompt : title);
             task.title = CPKimiCleanTitle(seed);
 
-            // 活跃 turn 证据只读 wire 有界尾部(64KB,缓存),不全量读。
             NSString *wirePath = [sessionPath stringByAppendingPathComponent:@"agents/main/wire.jsonl"];
-            CPKimiWireState *wire = [fm fileExistsAtPath:wirePath]
-                ? [self.cache objectForPath:wirePath parser:^id(NSString *p) {
-                      return CPKimiParseWireTail(CPReadFileTail(p, 65536), NO);
-                  }]
-                : CPKimiWireState.new;
-            wire = wire ?: CPKimiWireState.new;
-            NSString *reason = [state[@"lastTurnReason"] isKindOfClass:NSString.class] ? state[@"lastTurnReason"] : nil;
-            task.status = CPKimiStatus(reason, wire, CPKimiActivityAt(task.updatedAt, wire, wirePath), NSDate.date);
-            task.activity = CPKimiActivity(@"Kimi Code CLI", task.status);
+            BOOL hasWire = [fm fileExistsAtPath:wirePath];
+            NSDate *hint = task.updatedAt;
+            if (hasWire) {
+                NSDate *wireMtime = [fm attributesOfItemAtPath:wirePath error:nil][NSFileModificationDate];
+                if (wireMtime && [wireMtime compare:hint] == NSOrderedDescending) hint = wireMtime;
+            }
             [tasks addObject:task];
+            [wirePaths addObject:hasWire ? wirePath : @""];
+            [activityHints addObject:hint];
+            NSString *reason = [state[@"lastTurnReason"] isKindOfClass:NSString.class] ? state[@"lastTurnReason"] : @"";
+            [reasons addObject:reason];
         }
+    }
+
+    // 第二遍:按活跃度 hint 降序,前 CPKimiWireCandidateLimit 个候选才读 wire 有界尾部(64KB,缓存)。
+    NSMutableArray<NSNumber *> *order = NSMutableArray.array;
+    for (NSInteger i = 0; i < (NSInteger)tasks.count; i++) [order addObject:@(i)];
+    [order sortUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) {
+        return [activityHints[b.unsignedIntegerValue] compare:activityHints[a.unsignedIntegerValue]];
+    }];
+    NSMutableIndexSet *candidates = NSMutableIndexSet.indexSet;
+    for (NSInteger i = 0; i < (NSInteger)order.count && i < CPKimiWireCandidateLimit; i++) {
+        [candidates addIndex:order[i].unsignedIntegerValue];
+    }
+    NSDate *now = NSDate.date;
+    for (NSUInteger i = 0; i < tasks.count; i++) {
+        CPTask *task = tasks[i];
+        CPKimiWireState *wire = CPKimiWireState.new;
+        if ([candidates containsIndex:i] && [wirePaths[i] length]) {
+            wire = [self.cache objectForPath:wirePaths[i] parser:^id(NSString *p) {
+                return CPKimiParseWireTail(CPReadFileTail(p, 65536), NO);
+            }] ?: CPKimiWireState.new;
+            // 活跃会话的展示时间用真实活动时刻:长回合 state.updatedAt 不刷新,按它排序会被埋到列表底部。
+            NSDate *activityAt = CPKimiActivityAt(task.updatedAt, wire);
+            if (activityAt) task.updatedAt = activityAt;
+        }
+        task.status = CPKimiStatus(reasons[i], wire, CPKimiActivityAt(task.updatedAt, wire), now);
+        task.activity = CPKimiActivity(@"Kimi Code CLI", task.status);
     }
     return tasks;
 }
@@ -1673,24 +1728,26 @@ static NSString *CPKimiCleanTitle(NSString *raw) {
             }] ?: CPKimiWireState.new;
 
             // context.jsonl 头部:取第一条 role=="user" 的消息做标题种子;坏行/缺字段跳过。
-            NSString *firstUser = nil;
-            NSFileHandle *handle = [NSFileHandle fileHandleForReadingAtPath:contextPath];
-            NSData *headData = nil;
-            @try {
-                headData = [handle readDataOfLength:262144];
-                [handle closeFile];
-            } @catch (__unused NSException *exception) {}
-            NSString *head = headData ? [[NSString alloc] initWithData:headData encoding:NSUTF8StringEncoding] : nil;
-            for (NSString *line in [head componentsSeparatedByString:@"\n"]) {
-                if (!line.length) continue;
-                NSDictionary *entry = [NSJSONSerialization JSONObjectWithData:[line dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
-                if (![entry isKindOfClass:NSDictionary.class]) continue;
-                if (![entry[@"role"] isEqualToString:@"user"]) continue;
-                if ([entry[@"content"] isKindOfClass:NSString.class] && [entry[@"content"] length]) {
-                    firstUser = entry[@"content"];
-                    break;
+            // 与 state/wire 一样纳入 path+mtime+size 缓存,文件未变不重复读 256KB/逐行解析。
+            NSString *firstUser = [self.cache objectForPath:contextPath parser:^id(NSString *p) {
+                NSFileHandle *handle = [NSFileHandle fileHandleForReadingAtPath:p];
+                NSData *headData = nil;
+                @try {
+                    headData = [handle readDataOfLength:262144];
+                    [handle closeFile];
+                } @catch (__unused NSException *exception) {}
+                NSString *head = headData ? [[NSString alloc] initWithData:headData encoding:NSUTF8StringEncoding] : nil;
+                for (NSString *line in [head componentsSeparatedByString:@"\n"]) {
+                    if (!line.length) continue;
+                    NSDictionary *entry = [NSJSONSerialization JSONObjectWithData:[line dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+                    if (![entry isKindOfClass:NSDictionary.class]) continue;
+                    if (![entry[@"role"] isEqualToString:@"user"]) continue;
+                    if ([entry[@"content"] isKindOfClass:NSString.class] && [entry[@"content"] length]) {
+                        return entry[@"content"];
+                    }
                 }
-            }
+                return nil;
+            }];
 
             CPTask *task = CPTask.new;
             task.taskID = [NSString stringWithFormat:@"kimi-desktop-%@", uuidDir];
@@ -1702,7 +1759,7 @@ static NSString *CPKimiCleanTitle(NSString *raw) {
             task.createdAt = attrs[NSFileCreationDate] ?: NSDate.date;
             task.updatedAt = wire.lastEventAt ?: (attrs[NSFileModificationDate] ?: task.createdAt);
             task.title = CPKimiCleanTitle(firstUser.length ? firstUser : wire.firstUserInput);
-            task.status = CPKimiStatus(nil, wire, CPKimiActivityAt(task.updatedAt, wire, wirePath), NSDate.date);
+            task.status = CPKimiStatus(nil, wire, CPKimiActivityAt(task.updatedAt, wire), NSDate.date);
             task.activity = CPKimiActivity(@"Kimi 桌面", task.status);
             [tasks addObject:task];
         }
@@ -7242,6 +7299,22 @@ int main(int argc, const char *argv[]) {
             // 真实陈旧会话的 wire mtime 也是旧的,fixture 显式回拨
             [kfm setAttributes:@{NSFileModificationDate: [NSDate dateWithTimeIntervalSince1970:(kNowMs - 7200000) / 1000.0]}
                   ofItemAtPath:[kCLIRoot stringByAppendingPathComponent:@"wd_proj1/session_g1/agents/main/wire.jsonl"] error:nil];
+            // K18: 长回合 freshness —— state.updatedAt 已 2 小时前,但 wire 尾部事件 10 分钟前
+            // (freshness = max(updatedAt, wire.lastEventAt),长回合不得误判 idle);wire 文件 mtime 回拨排除 mtime 干扰
+            kWriteCLI(kCLIRoot, @"session_h1", @{
+                @"id": @"session_h1", @"version": @2, @"archived": @NO, @"cwd": @"/tmp/proj-theta",
+                @"createdAt": @(kNowMs - 10000000), @"updatedAt": @(kNowMs - 7200000),
+                @"isCustomTitle": @NO, @"lastPrompt": @"长回合任务",
+            }, [NSString stringWithFormat:@"{\"type\":\"llm.request\",\"time\":%lld}\n", kNowMs - 600000]);
+            [kfm setAttributes:@{NSFileModificationDate: [NSDate dateWithTimeIntervalSince1970:(kNowMs - 7200000) / 1000.0]}
+                  ofItemAtPath:[kCLIRoot stringByAppendingPathComponent:@"wd_proj1/session_h1/agents/main/wire.jsonl"] error:nil];
+            // K19: 仅被触碰的陈旧会话 —— updatedAt 与 wire 事件都 2 小时前,仅 wire mtime 新鲜(刚写入)
+            // → 必须 idle(mtime 不得计入活跃度)
+            kWriteCLI(kCLIRoot, @"session_i1", @{
+                @"id": @"session_i1", @"version": @2, @"archived": @NO, @"cwd": @"/tmp/proj-iota",
+                @"createdAt": @(kNowMs - 10000000), @"updatedAt": @(kNowMs - 7200000),
+                @"isCustomTitle": @NO, @"lastPrompt": @"被触碰的陈旧任务",
+            }, [NSString stringWithFormat:@"{\"type\":\"llm.request\",\"time\":%lld}\n", kNowMs - 7200000]);
             // desktop:waiting(TurnBegin + StepInterrupted 未结束) + 坏行防御 + 跨源去重样本
             kWriteDesktop(kDesktopRoot, @"desk-1",
                 @"{\"role\": \"_system_prompt\", \"content\": \"sys\"}\n这不是合法 json 行\n{\"role\": \"user\", \"content\": \"桌面端任务标题\"}\n{\"role\": \"user\"}\n",
@@ -7282,6 +7355,10 @@ int main(int argc, const char *argv[]) {
             BOOL k7 = kF1 && kF1.status == CPStatusFailed;
             CPTask *kG1 = kFind(@"kimi-cli-session_g1");
             BOOL k8 = kG1 && kG1.status == CPStatusIdle;
+            CPTask *kH1 = kFind(@"kimi-cli-session_h1");
+            BOOL k18 = kH1 && kH1.status == CPStatusWorking; // 长回合:wire 事件 10 分钟前保活(mtime 已回拨)
+            CPTask *kI1 = kFind(@"kimi-cli-session_i1");
+            BOOL k19 = kI1 && kI1.status == CPStatusIdle; // 仅 mtime 新鲜的陈旧会话不得误活
             CPTask *kDesk1 = kFind(@"kimi-desktop-desk-1");
             BOOL k9 = kDesk1 && kDesk1.status == CPStatusWaiting &&
                       [kDesk1.title isEqualToString:@"桌面端任务标题"] && // 坏行/缺字段行被跳过
@@ -7328,17 +7405,73 @@ int main(int argc, const char *argv[]) {
             BOOL k15 = kimiCap.tasks.count == 50 &&
                        [kimiCap.tasks.firstObject.taskID isEqualToString:@"kimi-cli-session_cap54"] &&
                        [kimiCap.tasks.lastObject.taskID isEqualToString:@"kimi-cli-session_cap05"];
+            // K16: 缓存容量与连续刷新稳定性 —— 150 个会话(超过旧 64 上限)连续 3 轮 readAgent,
+            // 缓存条目数必须 >64 且逐轮稳定(旧实现 removeAllObjects 会每轮抖动全量重读);
+            // 第 2/3 轮(全缓存命中)耗时应远小于首轮。
+            NSString *kLruRoot = [kFixture stringByAppendingPathComponent:@"lru"];
+            for (int i = 0; i < 150; i++) {
+                kWriteCLI(kLruRoot, [NSString stringWithFormat:@"session_lru%03d", i], @{
+                    @"id": [NSString stringWithFormat:@"session_lru%03d", i], @"version": @2, @"archived": @NO,
+                    @"cwd": @"/tmp/proj-lru", @"createdAt": @(kNowMs - 200000 + i * 1000), @"updatedAt": @(kNowMs - 200000 + i * 1000),
+                    @"isCustomTitle": @NO, @"lastPrompt": @"lru", @"lastTurnReason": @"completed",
+                }, nil);
+            }
+            setenv("CP_KIMI_CLI_ROOT", kLruRoot.UTF8String, 1);
+            setenv("CP_KIMI_DESKTOP_ROOT", kEmptyRoot.UTF8String, 1);
+            CPKimiSource *kLruSource = [[CPKimiSource alloc] initWithCache:CPStateCache.new];
+            NSTimeInterval kLruFirst = NSDate.date.timeIntervalSince1970;
+            [kLruSource readAgent];
+            kLruFirst = NSDate.date.timeIntervalSince1970 - kLruFirst;
+            NSUInteger kLruCount1 = kLruSource.cache.entries.count;
+            NSTimeInterval kLruSecond = NSDate.date.timeIntervalSince1970;
+            [kLruSource readAgent];
+            kLruSecond = NSDate.date.timeIntervalSince1970 - kLruSecond;
+            NSUInteger kLruCount2 = kLruSource.cache.entries.count;
+            [kLruSource readAgent];
+            NSUInteger kLruCount3 = kLruSource.cache.entries.count;
+            BOOL k16 = kLruCount1 > 64 && kLruCount1 == kLruCount2 && kLruCount2 == kLruCount3 && // 稳定命中,无抖动
+                       kLruSecond < 1.0 && kLruSecond <= kLruFirst; // 连续刷新:命中轮便宜
+            // K16b: LRU 逐出语义 —— 小容量缓存超容量只逐出最久未用,绝不清空全表
+            CPStateCache *kTiny = CPStateCache.new;
+            kTiny.capacity = 4;
+            __block NSInteger kParseCount = 0;
+            NSString *kTinyDir = [kFixture stringByAppendingPathComponent:@"tiny"];
+            [kfm createDirectoryAtPath:kTinyDir withIntermediateDirectories:YES attributes:nil error:nil];
+            for (int i = 0; i < 6; i++) {
+                NSString *fp = [kTinyDir stringByAppendingPathComponent:[NSString stringWithFormat:@"f%d.json", i]];
+                [@"{}" writeToFile:fp atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                [kTiny objectForPath:fp parser:^id(NSString *p) { kParseCount++; return @""; }];
+            }
+            NSString *kTinyNewest = [kTinyDir stringByAppendingPathComponent:@"f5.json"];
+            NSString *kTinyOldest = [kTinyDir stringByAppendingPathComponent:@"f0.json"];
+            NSInteger kParseBefore = kParseCount;
+            [kTiny objectForPath:kTinyNewest parser:^id(NSString *p) { kParseCount++; return @""; }]; // 命中,不重解析
+            BOOL k16b = kTiny.entries.count == 4 && kTiny.entries[kTinyOldest] == nil && // 最久未用被逐出
+                        kTiny.entries[kTinyNewest] != nil && kParseCount == kParseBefore; // 热条目稳定命中
+            k16 = k16 && k16b;
+            // K17: desktop context 头部纳入 path+mtime+size 缓存 —— 内容变化(大小不同)后标题随之更新
+            setenv("CP_KIMI_CLI_ROOT", kCLIRoot.UTF8String, 1);
+            setenv("CP_KIMI_DESKTOP_ROOT", kDesktopRoot.UTF8String, 1);
+            NSString *kDeskCtx = [kDesktopRoot stringByAppendingPathComponent:@"hash1/desk-1/context.jsonl"];
+            [@"{\"role\": \"_system_prompt\", \"content\": \"sys\"}\n{\"role\": \"user\", \"content\": \"桌面端改后标题!!\"}\n"
+                writeToFile:kDeskCtx atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            CPAgent *kimiA4 = [kSource readAgent];
+            CPTask *kDesk1b = nil;
+            for (CPTask *t in kimiA4.tasks) if ([t.taskID isEqualToString:@"kimi-desktop-desk-1"]) kDesk1b = t;
+            BOOL k17 = kDesk1b && [kDesk1b.title isEqualToString:@"桌面端改后标题!!"]; // invalidate 后重解析
             unsetenv("CP_KIMI_CLI_ROOT");
             unsetenv("CP_KIMI_DESKTOP_ROOT");
             [kfm removeItemAtPath:kFixture error:nil];
 
-            BOOL kimiOK = k1 && k2 && k3 && k4 && k5 && k6 && k7 && k8 && k9 && k10 && k11 && k12 && k13 && k14 && k15;
+            BOOL kimiOK = k1 && k2 && k3 && k4 && k5 && k6 && k7 && k8 && k9 && k10 && k11 && k12 && k13 && k14 && k15 &&
+                          k16 && k17 && k18 && k19;
             NSString *kLine = [NSString stringWithFormat:
-                @"Kimi self-test: cli-v2=%@ cli-v1=%@ archived-filter=%@ custom-title=%@ title-truncate=%@ status-working=%@ status-failed=%@ stale-not-working=%@ desktop-waiting=%@ dedupe-skip=%@ sort-desc=%@ cache-hit=%@ cache-invalidate=%@ empty-state=%@ cap50=%@\n",
+                @"Kimi self-test: cli-v2=%@ cli-v1=%@ archived-filter=%@ custom-title=%@ title-truncate=%@ status-working=%@ status-failed=%@ stale-not-working=%@ desktop-waiting=%@ dedupe-skip=%@ sort-desc=%@ cache-hit=%@ cache-invalidate=%@ empty-state=%@ cap50=%@ lru-stable=%@ desktop-context-cache=%@ long-turn-working=%@ touched-stale-idle=%@\n",
                 k1 ? @"OK" : @"FAIL", k2 ? @"OK" : @"FAIL", k3 ? @"OK" : @"FAIL", k4 ? @"OK" : @"FAIL",
                 k5 ? @"OK" : @"FAIL", k6 ? @"OK" : @"FAIL", k7 ? @"OK" : @"FAIL", k8 ? @"OK" : @"FAIL",
                 k9 ? @"OK" : @"FAIL", k10 ? @"OK" : @"FAIL", k11 ? @"OK" : @"FAIL", k12 ? @"OK" : @"FAIL",
-                k13 ? @"OK" : @"FAIL", k14 ? @"OK" : @"FAIL", k15 ? @"OK" : @"FAIL"];
+                k13 ? @"OK" : @"FAIL", k14 ? @"OK" : @"FAIL", k15 ? @"OK" : @"FAIL", k16 ? @"OK" : @"FAIL",
+                k17 ? @"OK" : @"FAIL", k18 ? @"OK" : @"FAIL", k19 ? @"OK" : @"FAIL"];
             fputs(kLine.UTF8String, stdout);
 
             // M6: CPCleanTitle 脏文本清洗
