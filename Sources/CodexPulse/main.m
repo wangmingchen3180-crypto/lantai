@@ -1197,10 +1197,13 @@ static CPRolloutState *CPReadRolloutState(NSString *path) {
 // state.json 小文件与 wire/context 有界尾部都走这里。
 // 容量必须有界 LRU(默认 1024):本机 CLI 会话 ~414(state+wire 候选 ~500 条目)+ desktop + Codex rollout,
 // 512 会只剩个位数余量,新增会话即触发顺序淘汰;1024 留出约一倍增长空间,仍有界防无限增长。
+// 命中路径 O(1):条目带单调 accessTick,命中只更新 tick;不用 recency 数组
+// (removeObject+addObject 是 O(n),600 条连续扫描即 O(n²),刷新期 CPU 抖动)。
+// 仅新增且超容量时才扫描一次选最小 tick 逐出——逐出很罕见,均摊成本可忽略。
 @interface CPStateCache : NSObject
-@property (nonatomic) NSMutableDictionary<NSString *, NSDictionary *> *entries; // path → {mtime,size,value}
-@property (nonatomic) NSMutableArray<NSString *> *recency; // LRU 队列:队首最久未用
-@property (nonatomic) NSUInteger capacity;                 // 默认 1024,测试可调小验证逐出
+@property (nonatomic) NSMutableDictionary<NSString *, NSDictionary *> *entries; // path → {mtime,size,value,tick}
+@property (nonatomic) uint64_t tick;     // 单调访问序号
+@property (nonatomic) NSUInteger capacity; // 默认 1024,测试可调小验证逐出
 - (id)objectForPath:(NSString *)path parser:(id (^)(NSString *path))parser;
 @end
 
@@ -1216,27 +1219,30 @@ static CPRolloutState *CPReadRolloutState(NSString *path) {
 - (id)objectForPath:(NSString *)path parser:(id (^)(NSString *path))parser {
     if (!path.length || !parser) return nil;
     if (!self.entries) self.entries = NSMutableDictionary.dictionary;
-    if (!self.recency) self.recency = NSMutableArray.array;
     NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
     NSDate *mtime = attrs[NSFileModificationDate] ?: NSDate.distantPast;
     NSNumber *size = attrs[NSFileSize] ?: @0;
     NSDictionary *cached = self.entries[path];
+    self.tick++;
     if (cached && [cached[@"mtime"] isEqual:mtime] && [cached[@"size"] isEqual:size]) {
-        [self.recency removeObject:path]; // 命中:提到队尾(最近使用)
-        [self.recency addObject:path];
+        // O(1) 命中:只重写 accessTick,不搬动任何队列
+        self.entries[path] = @{@"mtime": cached[@"mtime"], @"size": cached[@"size"],
+                               @"value": cached[@"value"], @"tick": @(self.tick)};
         id value = cached[@"value"];
         return [value isKindOfClass:NSNull.class] ? nil : value;
     }
     id value = parser(path) ?: NSNull.null;
-    if (!cached) {
-        [self.recency addObject:path];
-        while (self.recency.count > MAX(self.capacity, (NSUInteger)1)) { // 逐出最久未用,绝不清空全表
-            NSString *victim = self.recency.firstObject;
-            [self.recency removeObjectAtIndex:0];
-            [self.entries removeObjectForKey:victim];
+    if (!cached && self.entries.count >= MAX(self.capacity, (NSUInteger)1)) {
+        // 超容量才扫描一次,逐出 accessTick 最小(最久未用)的条目;绝不清空全表
+        NSString *victim = nil;
+        uint64_t oldest = UINT64_MAX;
+        for (NSString *key in self.entries) {
+            uint64_t t = [self.entries[key][@"tick"] unsignedLongLongValue];
+            if (t < oldest) { oldest = t; victim = key; }
         }
+        if (victim) [self.entries removeObjectForKey:victim];
     }
-    self.entries[path] = @{@"mtime": mtime, @"size": size, @"value": value};
+    self.entries[path] = @{@"mtime": mtime, @"size": size, @"value": value, @"tick": @(self.tick)};
     return [value isKindOfClass:NSNull.class] ? nil : value;
 }
 
@@ -7420,9 +7426,13 @@ int main(int argc, const char *argv[]) {
             CPKimiSource *kLruSource = [[CPKimiSource alloc] initWithCache:CPStateCache.new];
             [kLruSource readAgent];
             NSUInteger kLruCount1 = kLruSource.cache.entries.count;
+            NSTimeInterval kLruSecond = NSDate.date.timeIntervalSince1970;
             [kLruSource readAgent];
+            kLruSecond = NSDate.date.timeIntervalSince1970 - kLruSecond;
             NSUInteger kLruCount2 = kLruSource.cache.entries.count;
+            NSTimeInterval kLruThird = NSDate.date.timeIntervalSince1970;
             [kLruSource readAgent];
+            kLruThird = NSDate.date.timeIntervalSince1970 - kLruThird;
             NSUInteger kLruCount3 = kLruSource.cache.entries.count;
             // 命中证明用解析计数而非墙钟(命中路径的 LRU 队列维护本身有 O(n) 开销,时长不可比):
             // 同一 CPStateCache 对 600 个 state 文件走两轮 objectForPath,解析器必须只被调用 600 次。
@@ -7437,7 +7447,9 @@ int main(int argc, const char *argv[]) {
             }
             BOOL k16 = kLruCount1 > 512 && kLruCount1 == 600 && // 600 state 全部入缓存(无 wire 文件),跨过 512 边界
                        kLruCount1 == kLruCount2 && kLruCount2 == kLruCount3 && // 稳定命中,无抖动
-                       kHitParses == 600 && kHitCache.entries.count == 600; // 第二轮零重解析,容量不抖动
+                       kHitParses == 600 && kHitCache.entries.count == 600 && // 第二轮零重解析,容量不抖动
+                       kLruSecond < 0.5 && kLruThird < 0.5; // 耗时只做宽松上限(同进程连续 refresh 实测)
+            fprintf(stdout, "K16 timing: second=%.4fs third=%.4fs\n", kLruSecond, kLruThird);
             // K16b: LRU 逐出语义 —— 小容量缓存超容量只逐出最久未用,绝不清空全表
             CPStateCache *kTiny = CPStateCache.new;
             kTiny.capacity = 4;
