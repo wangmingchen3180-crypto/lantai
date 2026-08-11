@@ -1195,12 +1195,12 @@ static CPRolloutState *CPReadRolloutState(NSString *path) {
 
 // 通用解析缓存:按 path+mtime+size 复用解析结果,文件未变不重复读盘/解析。
 // state.json 小文件与 wire/context 有界尾部都走这里。
-// 容量必须有界 LRU(默认 512):本机 CLI 会话即 ~150(state+wire ~300 条目),旧实现超过 64 就
-// removeAllObjects 会造成每 3 秒缓存抖动、全量重读 wire;LRU 只逐出最久未用条目,热条目稳定命中。
+// 容量必须有界 LRU(默认 1024):本机 CLI 会话 ~414(state+wire 候选 ~500 条目)+ desktop + Codex rollout,
+// 512 会只剩个位数余量,新增会话即触发顺序淘汰;1024 留出约一倍增长空间,仍有界防无限增长。
 @interface CPStateCache : NSObject
 @property (nonatomic) NSMutableDictionary<NSString *, NSDictionary *> *entries; // path → {mtime,size,value}
 @property (nonatomic) NSMutableArray<NSString *> *recency; // LRU 队列:队首最久未用
-@property (nonatomic) NSUInteger capacity;                 // 默认 512,测试可调小验证逐出
+@property (nonatomic) NSUInteger capacity;                 // 默认 1024,测试可调小验证逐出
 - (id)objectForPath:(NSString *)path parser:(id (^)(NSString *path))parser;
 @end
 
@@ -1209,7 +1209,7 @@ static CPRolloutState *CPReadRolloutState(NSString *path) {
 - (instancetype)init {
     self = [super init];
     if (!self) return nil;
-    self.capacity = 512;
+    self.capacity = 1024;
     return self;
 }
 
@@ -7405,32 +7405,39 @@ int main(int argc, const char *argv[]) {
             BOOL k15 = kimiCap.tasks.count == 50 &&
                        [kimiCap.tasks.firstObject.taskID isEqualToString:@"kimi-cli-session_cap54"] &&
                        [kimiCap.tasks.lastObject.taskID isEqualToString:@"kimi-cli-session_cap05"];
-            // K16: 缓存容量与连续刷新稳定性 —— 150 个会话(超过旧 64 上限)连续 3 轮 readAgent,
-            // 缓存条目数必须 >64 且逐轮稳定(旧实现 removeAllObjects 会每轮抖动全量重读);
-            // 第 2/3 轮(全缓存命中)耗时应远小于首轮。
+            // K16: 缓存容量与连续刷新稳定性 —— 600 个会话(跨过 512 旧边界)连续 3 轮 readAgent,
+            // 缓存条目数必须 >512 且逐轮稳定(容量不足会顺序淘汰/抖动重读)。
             NSString *kLruRoot = [kFixture stringByAppendingPathComponent:@"lru"];
-            for (int i = 0; i < 150; i++) {
+            for (int i = 0; i < 600; i++) {
                 kWriteCLI(kLruRoot, [NSString stringWithFormat:@"session_lru%03d", i], @{
                     @"id": [NSString stringWithFormat:@"session_lru%03d", i], @"version": @2, @"archived": @NO,
-                    @"cwd": @"/tmp/proj-lru", @"createdAt": @(kNowMs - 200000 + i * 1000), @"updatedAt": @(kNowMs - 200000 + i * 1000),
+                    @"cwd": @"/tmp/proj-lru", @"createdAt": @(kNowMs - 700000 + i * 1000), @"updatedAt": @(kNowMs - 700000 + i * 1000),
                     @"isCustomTitle": @NO, @"lastPrompt": @"lru", @"lastTurnReason": @"completed",
                 }, nil);
             }
             setenv("CP_KIMI_CLI_ROOT", kLruRoot.UTF8String, 1);
             setenv("CP_KIMI_DESKTOP_ROOT", kEmptyRoot.UTF8String, 1);
             CPKimiSource *kLruSource = [[CPKimiSource alloc] initWithCache:CPStateCache.new];
-            NSTimeInterval kLruFirst = NSDate.date.timeIntervalSince1970;
             [kLruSource readAgent];
-            kLruFirst = NSDate.date.timeIntervalSince1970 - kLruFirst;
             NSUInteger kLruCount1 = kLruSource.cache.entries.count;
-            NSTimeInterval kLruSecond = NSDate.date.timeIntervalSince1970;
             [kLruSource readAgent];
-            kLruSecond = NSDate.date.timeIntervalSince1970 - kLruSecond;
             NSUInteger kLruCount2 = kLruSource.cache.entries.count;
             [kLruSource readAgent];
             NSUInteger kLruCount3 = kLruSource.cache.entries.count;
-            BOOL k16 = kLruCount1 > 64 && kLruCount1 == kLruCount2 && kLruCount2 == kLruCount3 && // 稳定命中,无抖动
-                       kLruSecond < 1.0 && kLruSecond <= kLruFirst; // 连续刷新:命中轮便宜
+            // 命中证明用解析计数而非墙钟(命中路径的 LRU 队列维护本身有 O(n) 开销,时长不可比):
+            // 同一 CPStateCache 对 600 个 state 文件走两轮 objectForPath,解析器必须只被调用 600 次。
+            CPStateCache *kHitCache = CPStateCache.new;
+            __block NSInteger kHitParses = 0;
+            for (int round = 0; round < 2; round++) {
+                for (int i = 0; i < 600; i++) {
+                    NSString *sp = [kLruRoot stringByAppendingPathComponent:
+                        [NSString stringWithFormat:@"wd_proj1/session_lru%03d/state.json", i]];
+                    [kHitCache objectForPath:sp parser:^id(NSString *p) { kHitParses++; return @""; }];
+                }
+            }
+            BOOL k16 = kLruCount1 > 512 && kLruCount1 == 600 && // 600 state 全部入缓存(无 wire 文件),跨过 512 边界
+                       kLruCount1 == kLruCount2 && kLruCount2 == kLruCount3 && // 稳定命中,无抖动
+                       kHitParses == 600 && kHitCache.entries.count == 600; // 第二轮零重解析,容量不抖动
             // K16b: LRU 逐出语义 —— 小容量缓存超容量只逐出最久未用,绝不清空全表
             CPStateCache *kTiny = CPStateCache.new;
             kTiny.capacity = 4;
