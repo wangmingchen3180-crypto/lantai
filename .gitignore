@@ -13,3 +13,6 @@ DerivedData/
 # Xcode user state
 *.xcuserstate
 xcuserdata/
+
+# User-level Agent Skills are installed once under ~/.agents/skills and linked here locally.
+.agents/skills/

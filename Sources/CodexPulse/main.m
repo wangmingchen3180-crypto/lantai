@@ -202,7 +202,7 @@ static NSString *CPFormatDateCN(NSDate *date) {
 @property NSString *projectPath;
 @property NSString *projectName;
 @property NSString *rolloutPath;
-@property NSString *sourceKind; // 任务来源:"codex" / "kimi-cli" / "kimi-desktop"(未来 "claude" 等),路由按它分流
+@property NSString *sourceKind; // 任务来源:"codex" / "kimi-client" / "kimi-cli"(未来 "claude" 等),路由按它分流
 @property NSString *activity;
 @property NSDate *createdAt;
 @property NSDate *updatedAt;
@@ -750,6 +750,7 @@ static NSArray<NSString *> *CPBundleIDsForAgent(NSString *agentID) {
         bundleMap = @{
             @"codex": @[@"com.openai.codex", @"com.openai.chat"],
             @"kimi": @[@"com.moonshot.kimi", @"com.moonshot.kimichat"],
+            @"kimi-cli": @[@"com.moonshot.kimi", @"com.moonshot.kimichat"],
             @"claude": @[@"com.anthropic.claudefordesktop", @"com.anthropic.claude"],
             @"terminal": @[@"com.apple.Terminal"],
             @"vscode": @[@"com.microsoft.VSCode"],
@@ -772,7 +773,7 @@ static NSImage *CPAppIconForAgent(NSString *agentID, CGFloat side) {
 }
 
 // 返回可精确定位任务的 Agent 深链。未知/占位 Agent 返回 nil，由调用方降级为仅唤起应用。
-// Kimi:desktop daimon 会话在本机注册了 kimi:// scheme 时返回 kimi:// 深链;
+// Kimi App 客户端会话使用它自身注册的 kimi-work://chat/<conversation-id>;
 // Kimi Code CLI 会话无安全精确的 resume 入口,明确返回 nil(降级唤起 Kimi 客户端,不伪造成功)。
 static NSURL *CPDeepLinkForAgentTask(CPAgent *agent, CPTask *task) {
     if (!agent || !task || !task.taskID.length || agent.placeholder) return nil;
@@ -783,15 +784,17 @@ static NSURL *CPDeepLinkForAgentTask(CPAgent *agent, CPTask *task) {
         return [NSURL URLWithString:[NSString stringWithFormat:@"codex://threads/%@", escapedID]];
     }
     if ([agentID isEqualToString:@"kimi"]) {
-        if (![task.sourceKind isEqualToString:@"kimi-desktop"]) return nil;
+        if (![task.sourceKind isEqualToString:@"kimi-client"] &&
+            ![task.sourceKind isEqualToString:@"kimi-desktop"]) return nil;
         NSString *rawID = task.taskID;
-        NSString *prefix = @"kimi-desktop-";
-        if ([rawID hasPrefix:prefix]) rawID = [rawID substringFromIndex:prefix.length];
+        for (NSString *prefix in @[@"kimi-client-", @"kimi-desktop-"]) {
+            if ([rawID hasPrefix:prefix]) { rawID = [rawID substringFromIndex:prefix.length]; break; }
+        }
         NSString *escapedID = [rawID stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLPathAllowedCharacterSet];
         if (!escapedID.length) return nil;
-        NSURL *probe = [NSURL URLWithString:@"kimi://"];
-        if (!probe || ![NSWorkspace.sharedWorkspace URLForApplicationToOpenURL:probe]) return nil; // 未注册 kimi:// 不试深链
-        return [NSURL URLWithString:[NSString stringWithFormat:@"kimi://chat/%@", escapedID]];
+        NSURL *probe = [NSURL URLWithString:@"kimi-work://"];
+        if (!probe || ![NSWorkspace.sharedWorkspace URLForApplicationToOpenURL:probe]) return nil; // 未注册客户端协议不试深链
+        return [NSURL URLWithString:[NSString stringWithFormat:@"kimi-work://chat/%@", escapedID]];
     }
     return nil;
 }
@@ -1248,6 +1251,57 @@ static CPRolloutState *CPReadRolloutState(NSString *path) {
 
 @end
 
+// 应用内 Agent 注册表:内置适配器与用户启用状态分离。开源用户只需在“添加 Agent”
+// 里选择已安装的客户端;提供新 harness 时只需新增 CPAgentSource 并在此目录注册。
+static NSString * const CPEnabledAgentProvidersKey = @"agents.enabledProviders.v1";
+static NSString * const CPAgentSourcesChangedNotification = @"CPAgentSourcesChanged";
+
+static NSArray<NSDictionary *> *CPAgentProviderCatalog(void) {
+    static NSArray<NSDictionary *> *catalog;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        catalog = @[
+            @{ @"id": @"codex", @"name": @"Codex", @"detail": @"Codex Desktop 本地任务" },
+            @{ @"id": @"kimi", @"name": @"Kimi", @"detail": @"Kimi App 客户端任务" },
+            @{ @"id": @"kimi-cli", @"name": @"Kimi CLI", @"detail": @"Kimi Code 终端会话（可选）" },
+        ];
+    });
+    return catalog;
+}
+
+static NSArray<NSString *> *CPEnabledAgentProviderIDs(void) {
+    NSArray *stored = [NSUserDefaults.standardUserDefaults arrayForKey:CPEnabledAgentProvidersKey];
+    if (![stored isKindOfClass:NSArray.class]) return @[@"codex", @"kimi"];
+    NSMutableArray<NSString *> *valid = NSMutableArray.array;
+    NSSet *known = [NSSet setWithArray:[CPAgentProviderCatalog() valueForKey:@"id"]];
+    for (id item in stored) if ([item isKindOfClass:NSString.class] && [known containsObject:item]) [valid addObject:item];
+    return valid;
+}
+
+static BOOL CPAgentProviderIsDetected(NSString *providerID) {
+    NSString *home = NSHomeDirectory();
+    if ([providerID isEqualToString:@"codex"]) {
+        return [NSFileManager.defaultManager fileExistsAtPath:[home stringByAppendingPathComponent:@".codex/state_5.sqlite"]];
+    }
+    if ([providerID isEqualToString:@"kimi"]) {
+        NSString *db = [home stringByAppendingPathComponent:@"Library/Application Support/kimi-desktop/daimon-share/daimon/agents/main/sessions/hosted-logical/conversations.sqlite"];
+        return [NSFileManager.defaultManager fileExistsAtPath:db] ||
+               [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:@"com.moonshot.kimichat"] != nil;
+    }
+    if ([providerID isEqualToString:@"kimi-cli"]) {
+        return [NSFileManager.defaultManager fileExistsAtPath:[home stringByAppendingPathComponent:@".kimi-code/sessions"]];
+    }
+    return NO;
+}
+
+static void CPEnableAgentProvider(NSString *providerID) {
+    if (!providerID.length) return;
+    NSMutableArray<NSString *> *enabled = [CPEnabledAgentProviderIDs() mutableCopy];
+    if (![enabled containsObject:providerID]) [enabled addObject:providerID];
+    [NSUserDefaults.standardUserDefaults setObject:enabled forKey:CPEnabledAgentProvidersKey];
+    [NSNotificationCenter.defaultCenter postNotificationName:CPAgentSourcesChangedNotification object:providerID];
+}
+
 // Agent 数据源边界:每个 harness(Codex / Kimi / 未来 Claude)实现一个 source,
 // 统一输出 CPAgent/CPTask;CPStateReader 只负责按注册数组聚合,不理解任何来源细节。
 @protocol CPAgentSource <NSObject>
@@ -1399,7 +1453,22 @@ static CPStatus CPOverallStatusForTasks(NSArray<CPTask *> *tasks) {
 
 #pragma mark - Kimi Source
 
-// Kimi 数据根:默认真实 ~/ 路径;测试用 CP_KIMI_CLI_ROOT / CP_KIMI_DESKTOP_ROOT 覆盖到 /tmp 隔离 fixture。
+// Kimi 数据根:生产主源是 Kimi App 自己的 conversations.sqlite;
+// CLI 是独立的可选 Agent,旧 daimon-share/sessions 仅保留为兼容解析与回归 fixture。
+static NSString *CPKimiClientDatabasePath(void) {
+    NSString *override = NSProcessInfo.processInfo.environment[@"CP_KIMI_CLIENT_DB"];
+    if (override.length) return override;
+    return [NSHomeDirectory() stringByAppendingPathComponent:
+        @"Library/Application Support/kimi-desktop/daimon-share/daimon/agents/main/sessions/hosted-logical/conversations.sqlite"];
+}
+
+static NSString *CPKimiClientStatusPath(void) {
+    NSString *override = NSProcessInfo.processInfo.environment[@"CP_KIMI_CLIENT_STATUS"];
+    if (override.length) return override;
+    return [NSHomeDirectory() stringByAppendingPathComponent:
+        @"Library/Application Support/kimi-desktop/kimi-agent/conversation-statuses.json"];
+}
+
 static NSString *CPKimiCLIRoot(void) {
     NSString *override = NSProcessInfo.processInfo.environment[@"CP_KIMI_CLI_ROOT"];
     if (override.length) return override;
@@ -1575,9 +1644,11 @@ static NSString *CPKimiCleanTitle(NSString *raw) {
 
 @interface CPKimiSource : NSObject <CPAgentSource>
 @property (nonatomic) CPStateCache *cache;
+@property (nonatomic) NSInteger lastClientCount;  // Kimi App conversations.sqlite 会话数
 @property (nonatomic) NSInteger lastCLICount;     // 最近一次读取到的非归档 CLI 会话数(probe 用)
 @property (nonatomic) NSInteger lastDesktopCount; // 最近一次读取到的 desktop 会话数(probe 用)
 - (instancetype)initWithCache:(CPStateCache *)cache;
+- (NSArray<CPTask *> *)readCLITasksIntoRawIDs:(NSMutableSet<NSString *> *)rawIDs;
 @end
 
 @implementation CPKimiSource
@@ -1598,11 +1669,18 @@ static NSString *CPKimiCleanTitle(NSString *raw) {
     agent.placeholder = NO; // 真实数据源:目录不存在/无会话就是真空态,不再用示例占位
     agent.tasks = NSMutableArray.array;
 
-    NSMutableSet<NSString *> *cliRawIDs = NSMutableSet.set;
-    NSArray<CPTask *> *cliTasks = [self readCLITasksIntoRawIDs:cliRawIDs];
-    NSArray<CPTask *> *desktopTasks = [self readDesktopTasksExcludingRawIDs:cliRawIDs];
-    [agent.tasks addObjectsFromArray:cliTasks];
-    [agent.tasks addObjectsFromArray:desktopTasks];
+    // 回归 fixture 保留旧 CLI/desktop 混合路径;真实应用中 Kimi 只读客户端本地索引,
+    // 不再把数百个 CLI session 冒充成用户的 Kimi App 对话。
+    BOOL legacyFixture = NSProcessInfo.processInfo.environment[@"CP_KIMI_CLIENT_DB"] == nil &&
+        (NSProcessInfo.processInfo.environment[@"CP_KIMI_CLI_ROOT"] != nil ||
+         NSProcessInfo.processInfo.environment[@"CP_KIMI_DESKTOP_ROOT"] != nil);
+    if (legacyFixture) {
+        NSMutableSet<NSString *> *cliRawIDs = NSMutableSet.set;
+        [agent.tasks addObjectsFromArray:[self readCLITasksIntoRawIDs:cliRawIDs]];
+        [agent.tasks addObjectsFromArray:[self readDesktopTasksExcludingRawIDs:cliRawIDs]];
+    } else {
+        [agent.tasks addObjectsFromArray:[self readClientTasks]];
+    }
     [agent.tasks sortUsingComparator:^NSComparisonResult(CPTask *a, CPTask *b) {
         return [b.updatedAt compare:a.updatedAt]; // 非归档会话按 updatedAt 降序
     }];
@@ -1610,6 +1688,81 @@ static NSString *CPKimiCleanTitle(NSString *raw) {
 
     agent.status = CPOverallStatusForTasks(agent.tasks);
     return agent;
+}
+
+// Kimi App 3.x 的权威本地索引:
+// .../hosted-logical/conversations.sqlite 提供标题、conversation id、workspace、时间与 wire 路径;
+// conversation-statuses.json 以 conversation_key 为 key 提供 running/completed。两者都只读。
+- (NSArray<CPTask *> *)readClientTasks {
+    NSMutableArray<CPTask *> *tasks = NSMutableArray.array;
+    self.lastClientCount = 0;
+    NSString *dbPath = CPKimiClientDatabasePath();
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(dbPath.UTF8String, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK) {
+        if (db) sqlite3_close(db);
+        return tasks;
+    }
+    sqlite3_busy_timeout(db, 150);
+
+    NSDictionary *statusMap = [self.cache objectForPath:CPKimiClientStatusPath() parser:^id(NSString *statusPath) {
+        NSData *data = [NSData dataWithContentsOfFile:statusPath];
+        id parsed = data.length ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        return [parsed isKindOfClass:NSDictionary.class] ? parsed : @{};
+    }] ?: @{};
+
+    const char *sql =
+        "SELECT conversation_key, conversation_id, title, COALESCE(workspace_path,''), "
+        "created_at_ms, updated_at_ms, COALESCE(kernel_records_path,'') "
+        "FROM conversations ORDER BY updated_at_ms DESC LIMIT 50";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            NSString *(^textAt)(int) = ^NSString *(int column) {
+                const unsigned char *value = sqlite3_column_text(stmt, column);
+                return value ? [NSString stringWithUTF8String:(const char *)value] : @"";
+            };
+            NSString *conversationKey = textAt(0);
+            NSString *conversationID = textAt(1);
+            if (!conversationID.length) continue;
+            NSString *wirePath = textAt(6);
+            CPKimiWireState *wire = wirePath.length ? [self.cache objectForPath:wirePath parser:^id(NSString *p) {
+                return CPKimiParseWireTail(CPReadFileTail(p, 65536), NO);
+            }] : nil;
+            wire = wire ?: CPKimiWireState.new;
+
+            CPTask *task = CPTask.new;
+            task.taskID = [NSString stringWithFormat:@"kimi-client-%@", conversationID];
+            task.sourceKind = @"kimi-client";
+            task.title = CPKimiCleanTitle(textAt(2));
+            task.projectPath = textAt(3);
+            task.projectName = task.projectPath.lastPathComponent.length ? task.projectPath.lastPathComponent : @"Kimi";
+            task.rolloutPath = wirePath;
+            task.createdAt = CPDateFromMillis(sqlite3_column_int64(stmt, 4)) ?: NSDate.date;
+            task.updatedAt = CPDateFromMillis(sqlite3_column_int64(stmt, 5)) ?: task.createdAt;
+            NSDate *activityAt = CPKimiActivityAt(task.updatedAt, wire);
+            if (activityAt) task.updatedAt = activityAt;
+
+            NSString *clientState = [statusMap[conversationKey] isKindOfClass:NSString.class]
+                ? [statusMap[conversationKey] lowercaseString] : @"";
+            if (wire.attentionPending || [clientState isEqualToString:@"waiting"] || [clientState isEqualToString:@"attention"]) {
+                task.status = CPStatusWaiting;
+            } else if ([clientState isEqualToString:@"running"]) {
+                task.status = CPStatusWorking;
+            } else if ([clientState isEqualToString:@"failed"] || [clientState isEqualToString:@"error"]) {
+                task.status = CPStatusFailed;
+            } else if ([clientState isEqualToString:@"completed"]) {
+                task.status = CPStatusCompleted;
+            } else {
+                task.status = CPKimiStatus(nil, wire, activityAt, NSDate.date);
+            }
+            task.activity = CPKimiActivity(@"Kimi App", task.status);
+            [tasks addObject:task];
+            self.lastClientCount += 1;
+        }
+    }
+    if (stmt) sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return tasks;
 }
 
 // wire 候选预筛上限:state.json 小文件全部解析(便宜且缓存),wire 尾部只读活跃度最高的前 N 个会话。
@@ -1775,6 +1928,37 @@ static const NSInteger CPKimiWireCandidateLimit = 80;
 
 @end
 
+#pragma mark - Optional Kimi CLI Source
+
+// CLI 与 Kimi App 是两个产品面:只有用户在“添加 Agent”中显式启用时才展示。
+@interface CPKimiCLISource : NSObject <CPAgentSource>
+@property (nonatomic) CPKimiSource *parser;
+- (instancetype)initWithCache:(CPStateCache *)cache;
+@end
+
+@implementation CPKimiCLISource
+- (instancetype)initWithCache:(CPStateCache *)cache {
+    self = [super init];
+    if (!self) return nil;
+    self.parser = [[CPKimiSource alloc] initWithCache:cache];
+    return self;
+}
+- (CPAgent *)readAgent {
+    CPAgent *agent = CPAgent.new;
+    agent.agentID = @"kimi-cli";
+    agent.name = @"Kimi CLI";
+    agent.iconName = @"terminal";
+    agent.color = CPMuted();
+    agent.placeholder = NO;
+    NSMutableSet<NSString *> *rawIDs = NSMutableSet.set;
+    agent.tasks = [[self.parser readCLITasksIntoRawIDs:rawIDs] mutableCopy];
+    [agent.tasks sortUsingComparator:^NSComparisonResult(CPTask *a, CPTask *b) { return [b.updatedAt compare:a.updatedAt]; }];
+    while (agent.tasks.count > 50) [agent.tasks removeLastObject];
+    agent.status = CPOverallStatusForTasks(agent.tasks);
+    return agent;
+}
+@end
+
 #pragma mark - State Reader 聚合
 
 @implementation CPStateReader
@@ -1783,9 +1967,18 @@ static const NSInteger CPKimiWireCandidateLimit = 80;
     self = [super init];
     if (!self) return nil;
     self.cache = CPStateCache.new;
-    // 注册数组即扩展点:未来 Claude 接入只需新增 CPHarnessSource 实现并加到这里。
-    self.sources = @[[[CPCodexSource alloc] initWithCache:self.cache],
-                     [[CPKimiSource alloc] initWithCache:self.cache]];
+    // 注册表即扩展点:适配器内置,用户的启用选择由“添加 Agent”持久化。
+    NSMutableArray<id<CPAgentSource>> *configured = NSMutableArray.array;
+    for (NSString *providerID in CPEnabledAgentProviderIDs()) {
+        if ([providerID isEqualToString:@"codex"]) {
+            [configured addObject:[[CPCodexSource alloc] initWithCache:self.cache]];
+        } else if ([providerID isEqualToString:@"kimi"]) {
+            [configured addObject:[[CPKimiSource alloc] initWithCache:self.cache]];
+        } else if ([providerID isEqualToString:@"kimi-cli"]) {
+            [configured addObject:[[CPKimiCLISource alloc] initWithCache:self.cache]];
+        }
+    }
+    self.sources = configured;
     return self;
 }
 
@@ -3505,11 +3698,49 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
 }
 
 - (void)addAgent:(id)sender {
+    (void)sender;
+    NSSet<NSString *> *enabled = [NSSet setWithArray:CPEnabledAgentProviderIDs()];
+    NSMutableArray<NSDictionary *> *available = NSMutableArray.array;
+    for (NSDictionary *provider in CPAgentProviderCatalog()) {
+        if (![enabled containsObject:provider[@"id"]]) [available addObject:provider];
+    }
+
     NSAlert *alert = [[NSAlert alloc] init];
-    alert.messageText = @"添加新 Agent";
-    alert.informativeText = @"未来将支持读取本地配置文件添加更多 Agent。";
-    [alert addButtonWithTitle:@"好"];
-    [alert runModal];
+    alert.messageText = @"添加 Agent";
+    alert.informativeText = available.count
+        ? @"选择一个本机 Agent 数据源。Codex Pulse 只读取任务索引和运行状态。"
+        : @"所有内置 Agent 均已添加。";
+    if (!available.count) {
+        [alert addButtonWithTitle:@"好"];
+        alert.window.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+        [alert runModal];
+        return;
+    }
+
+    NSPopUpButton *picker = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(0, 0, 320, 30) pullsDown:NO];
+    [picker removeAllItems];
+    for (NSDictionary *provider in available) {
+        BOOL detected = CPAgentProviderIsDetected(provider[@"id"]);
+        NSString *title = [NSString stringWithFormat:@"%@  ·  %@", provider[@"name"], detected ? @"已检测" : @"未检测"];
+        [picker addItemWithTitle:title];
+        picker.lastItem.representedObject = provider[@"id"];
+    }
+    NSTextField *hint = CPLabel(@"添加后会立即出现在工作台；未检测到数据时保持空态。", 11, NSFontWeightRegular, CPMuted());
+    hint.maximumNumberOfLines = 2;
+    hint.preferredMaxLayoutWidth = 320;
+    NSStackView *accessory = [NSStackView stackViewWithViews:@[picker, hint]];
+    accessory.orientation = NSUserInterfaceLayoutOrientationVertical;
+    accessory.alignment = NSLayoutAttributeLeading;
+    accessory.spacing = 8;
+    accessory.frame = NSMakeRect(0, 0, 320, 58);
+    alert.accessoryView = accessory;
+    [alert addButtonWithTitle:@"添加"];
+    [alert addButtonWithTitle:@"取消"];
+    alert.window.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+    if ([alert runModal] == NSAlertFirstButtonReturn) {
+        NSString *providerID = picker.selectedItem.representedObject;
+        CPEnableAgentProvider(providerID);
+    }
 }
 
 - (void)togglePin:(id)sender {
@@ -5271,6 +5502,10 @@ static NSString *CPAgentsSignature(NSArray<CPAgent *> *agents) {
                                            selector:@selector(taskReviewed:)
                                                name:@"CPTaskReviewed"
                                              object:nil];
+    [NSNotificationCenter.defaultCenter addObserver:self
+                                           selector:@selector(agentSourcesChanged:)
+                                               name:CPAgentSourcesChangedNotification
+                                             object:nil];
 
     [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent *(NSEvent *event) {
         if (event.keyCode == 53 && weakSelf.card.isVisible) {
@@ -5373,6 +5608,16 @@ static NSString *CPAgentsSignature(NSArray<CPAgent *> *agents) {
     // HUD 自身已监听此通知；这里只同步悬浮球角标和菜单栏提示。
     [self.dock renderWithAgents:self.agents selectedAgent:self.card.selectedAgent];
     [self updateStatusBar];
+}
+
+- (void)agentSourcesChanged:(NSNotification *)note {
+    (void)note;
+    // 注册表变更后重建 reader;在途旧读取依靠 generation 自动丢弃,
+    // pending 轮会用新配置立即同步,无需重启应用。
+    self.reader = CPStateReader.new;
+    self.lastAppliedSignature = nil;
+    self.refreshGeneration += 1;
+    [self refresh:nil];
 }
 
 - (void)dockModeChanged:(NSNotification *)note {
@@ -7209,14 +7454,14 @@ int main(int argc, const char *argv[]) {
             // Kimi Code CLI 无安全精确 resume:必须明确返回 nil(降级唤起客户端),不伪造成功。
             routeTask.sourceKind = @"kimi-cli";
             BOOL kimiCLIRouteOK = CPDeepLinkForAgentTask(routeKimi, routeTask) == nil;
-            // Kimi desktop daimon:本机注册了 kimi:// scheme 才给深链,否则 nil 走唤起降级。
-            CPTask *routeDesktopTask = CPTestTask(@"kimi-desktop-u1", CPStatusWorking, 1);
-            routeDesktopTask.sourceKind = @"kimi-desktop";
+            // Kimi App client:本机注册了 kimi-work:// scheme 才给深链,否则 nil 走唤起降级。
+            CPTask *routeDesktopTask = CPTestTask(@"kimi-client-u1", CPStatusWorking, 1);
+            routeDesktopTask.sourceKind = @"kimi-client";
             CPAgent *routeKimiDesktop = CPTestAgent(@"kimi", @[routeDesktopTask]);
-            BOOL kimiSchemeRegistered = [NSWorkspace.sharedWorkspace URLForApplicationToOpenURL:[NSURL URLWithString:@"kimi://"]] != nil;
+            BOOL kimiSchemeRegistered = [NSWorkspace.sharedWorkspace URLForApplicationToOpenURL:[NSURL URLWithString:@"kimi-work://"]] != nil;
             NSURL *desktopLink = CPDeepLinkForAgentTask(routeKimiDesktop, routeDesktopTask);
             BOOL kimiDesktopRouteOK = kimiSchemeRegistered
-                ? [desktopLink.absoluteString isEqualToString:@"kimi://chat/u1"]
+                ? [desktopLink.absoluteString isEqualToString:@"kimi-work://chat/u1"]
                 : desktopLink == nil;
             BOOL unknownRouteOK = CPDeepLinkForAgentTask(routeUnknown, routeTask) == nil;
             routeKimi.placeholder = YES;
@@ -7237,6 +7482,65 @@ int main(int argc, const char *argv[]) {
             NSString *kCLIRoot = [kFixture stringByAppendingPathComponent:@"cli"];
             NSString *kDesktopRoot = [kFixture stringByAppendingPathComponent:@"desktop"];
             long long kNowMs = (long long)(NSDate.date.timeIntervalSince1970 * 1000);
+
+            // K0: Kimi App 客户端权威索引 fixture。只构造 readClientTasks 查询所需的最小 schema,
+            // 验证 conversation_key 状态映射、conversation_id 路由、workspace 与 wire 活动时间。
+            NSString *kClientRoot = [kFixture stringByAppendingPathComponent:@"client"];
+            [kfm createDirectoryAtPath:kClientRoot withIntermediateDirectories:YES attributes:nil error:nil];
+            NSString *kClientDB = [kClientRoot stringByAppendingPathComponent:@"conversations.sqlite"];
+            NSString *kClientStatus = [kClientRoot stringByAppendingPathComponent:@"conversation-statuses.json"];
+            NSString *kClientWire1 = [kClientRoot stringByAppendingPathComponent:@"wire-1.jsonl"];
+            NSString *kClientWire2 = [kClientRoot stringByAppendingPathComponent:@"wire-2.jsonl"];
+            [[NSString stringWithFormat:@"{\"type\":\"llm.request\",\"time\":%lld}\n", kNowMs - 500]
+                writeToFile:kClientWire1 atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            [[NSString stringWithFormat:@"{\"type\":\"turn.ended\",\"reason\":\"completed\",\"time\":%lld}\n", kNowMs - 5000]
+                writeToFile:kClientWire2 atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            sqlite3 *kClientHandle = NULL;
+            sqlite3_open(kClientDB.UTF8String, &kClientHandle);
+            sqlite3_exec(kClientHandle,
+                "CREATE TABLE conversations (conversation_key TEXT, conversation_id TEXT, title TEXT, workspace_path TEXT, created_at_ms INTEGER, updated_at_ms INTEGER, kernel_records_path TEXT)",
+                NULL, NULL, NULL);
+            sqlite3_stmt *kClientInsert = NULL;
+            sqlite3_prepare_v2(kClientHandle, "INSERT INTO conversations VALUES (?,?,?,?,?,?,?)", -1, &kClientInsert, NULL);
+            void (^kInsertClient)(NSString *, NSString *, NSString *, NSString *, long long, NSString *) =
+                ^(NSString *key, NSString *cid, NSString *title, NSString *workspace, long long updated, NSString *wirePath) {
+                    sqlite3_reset(kClientInsert);
+                    sqlite3_clear_bindings(kClientInsert);
+                    sqlite3_bind_text(kClientInsert, 1, key.UTF8String, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(kClientInsert, 2, cid.UTF8String, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(kClientInsert, 3, title.UTF8String, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(kClientInsert, 4, workspace.UTF8String, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_int64(kClientInsert, 5, updated - 10000);
+                    sqlite3_bind_int64(kClientInsert, 6, updated);
+                    sqlite3_bind_text(kClientInsert, 7, wirePath.UTF8String, -1, SQLITE_TRANSIENT);
+                    sqlite3_step(kClientInsert);
+                };
+            kInsertClient(@"client-key-1", @"client-id-1", @"Kimi 客户端运行中", @"/tmp/client-project", kNowMs - 1000, kClientWire1);
+            kInsertClient(@"client-key-2", @"client-id-2", @"Kimi 客户端已完成", @"", kNowMs - 6000, kClientWire2);
+            sqlite3_finalize(kClientInsert);
+            sqlite3_close(kClientHandle);
+            [@"{\"client-key-1\":\"running\",\"client-key-2\":\"completed\"}"
+                writeToFile:kClientStatus atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            setenv("CP_KIMI_CLIENT_DB", kClientDB.UTF8String, 1);
+            setenv("CP_KIMI_CLIENT_STATUS", kClientStatus.UTF8String, 1);
+            CPKimiSource *kClientSource = [[CPKimiSource alloc] initWithCache:CPStateCache.new];
+            CPAgent *kClientAgent = [kClientSource readAgent];
+            CPTask *kClientRunning = nil, *kClientCompleted = nil;
+            for (CPTask *t in kClientAgent.tasks) {
+                if ([t.taskID isEqualToString:@"kimi-client-client-id-1"]) kClientRunning = t;
+                if ([t.taskID isEqualToString:@"kimi-client-client-id-2"]) kClientCompleted = t;
+            }
+            BOOL kClientOK = kClientAgent.tasks.count == 2 && kClientSource.lastClientCount == 2 &&
+                kClientRunning.status == CPStatusWorking && kClientCompleted.status == CPStatusCompleted &&
+                [kClientRunning.projectName isEqualToString:@"client-project"] &&
+                [kClientCompleted.projectName isEqualToString:@"Kimi"] &&
+                [kClientRunning.sourceKind isEqualToString:@"kimi-client"];
+            printf("Kimi client self-test: sqlite-index=%s status-map=%s source-split=%s\n",
+                   kClientAgent.tasks.count == 2 ? "OK" : "FAIL",
+                   (kClientRunning.status == CPStatusWorking && kClientCompleted.status == CPStatusCompleted) ? "OK" : "FAIL",
+                   kClientOK ? "OK" : "FAIL");
+            unsetenv("CP_KIMI_CLIENT_DB");
+            unsetenv("CP_KIMI_CLIENT_STATUS");
 
             // fixture 写入 helper(仅本段使用)
             void (^kWriteCLI)(NSString *, NSString *, NSDictionary *, NSString *) =
@@ -7482,7 +7786,7 @@ int main(int argc, const char *argv[]) {
             unsetenv("CP_KIMI_DESKTOP_ROOT");
             [kfm removeItemAtPath:kFixture error:nil];
 
-            BOOL kimiOK = k1 && k2 && k3 && k4 && k5 && k6 && k7 && k8 && k9 && k10 && k11 && k12 && k13 && k14 && k15 &&
+            BOOL kimiOK = kClientOK && k1 && k2 && k3 && k4 && k5 && k6 && k7 && k8 && k9 && k10 && k11 && k12 && k13 && k14 && k15 &&
                           k16 && k17 && k18 && k19;
             NSString *kLine = [NSString stringWithFormat:
                 @"Kimi self-test: cli-v2=%@ cli-v1=%@ archived-filter=%@ custom-title=%@ title-truncate=%@ status-working=%@ status-failed=%@ stale-not-working=%@ desktop-waiting=%@ dedupe-skip=%@ sort-desc=%@ cache-hit=%@ cache-invalidate=%@ empty-state=%@ cap50=%@ lru-stable=%@ desktop-context-cache=%@ long-turn-working=%@ touched-stale-idle=%@\n",
@@ -7596,31 +7900,29 @@ int main(int argc, const char *argv[]) {
             return (taskCount > 0 && internalThreadsFiltered && m2 && taskRoutingOK && m6 && kimiOK && perfOK) ? 0 : 2;
         }
         if (argc > 1 && strcmp(argv[1], "--kimi-probe") == 0) {
-            // 只读真实验证:报告检测到的 CLI/desktop 会话数,以及当前监督会话(cwd=本仓库 的最新非归档 CLI 会话)是否被识别。
-            // 只打印 session id 与计数;title 只打印截断前 20 字,不打印 prompt 明文。
+            // 只读真实验证:Kimi App conversations.sqlite + 客户端状态是否被识别。
+            // 仅打印计数和状态,不打印会话标题、prompt 或记录正文。
             unsetenv("CP_KIMI_CLI_ROOT");
             unsetenv("CP_KIMI_DESKTOP_ROOT");
+            unsetenv("CP_KIMI_CLIENT_DB");
+            unsetenv("CP_KIMI_CLIENT_STATUS");
             CPKimiSource *probeSource = [[CPKimiSource alloc] initWithCache:CPStateCache.new];
             CPAgent *probeKimi = [probeSource readAgent];
-            NSString *probeCwd = NSFileManager.defaultManager.currentDirectoryPath;
-            CPTask *probeCurrent = nil;
+            NSInteger workingCount = 0, completedCount = 0, waitingCount = 0, failedCount = 0;
             for (CPTask *t in probeKimi.tasks) {
-                if (![t.sourceKind isEqualToString:@"kimi-cli"]) continue;
-                if (![t.projectPath isEqualToString:probeCwd]) continue;
-                if (!probeCurrent || [t.updatedAt compare:probeCurrent.updatedAt] == NSOrderedDescending) probeCurrent = t;
+                if (![t.sourceKind isEqualToString:@"kimi-client"]) continue;
+                if (t.status == CPStatusWorking) workingCount++;
+                else if (t.status == CPStatusCompleted) completedCount++;
+                else if (t.status == CPStatusWaiting) waitingCount++;
+                else if (t.status == CPStatusFailed) failedCount++;
             }
-            NSString *probeTitle = probeCurrent.title.length > 20 ? [probeCurrent.title substringToIndex:20] : (probeCurrent.title ?: @"");
             NSMutableString *probeReport = [NSMutableString stringWithFormat:
-                @"Kimi probe: cli-sessions=%ld desktop-sessions=%ld tasks-shown=%lu current-session=%@\n",
-                (long)probeSource.lastCLICount, (long)probeSource.lastDesktopCount, (unsigned long)probeKimi.tasks.count,
-                probeCurrent ? @"RECOGNIZED" : @"MISSING"];
-            if (probeCurrent) {
-                [probeReport appendFormat:@"  current: id=%@ status=%@ title-prefix=%@\n",
-                 probeCurrent.taskID, CPStatusTitle(probeCurrent.status), probeTitle];
-            }
+                @"Kimi client probe: indexed=%ld shown=%lu working=%ld completed=%ld waiting=%ld failed=%ld\n",
+                (long)probeSource.lastClientCount, (unsigned long)probeKimi.tasks.count,
+                (long)workingCount, (long)completedCount, (long)waitingCount, (long)failedCount];
             fputs(probeReport.UTF8String, stdout);
             [probeReport writeToFile:@"/tmp/kimi-probe.txt" atomically:YES encoding:NSUTF8StringEncoding error:nil];
-            return probeCurrent ? 0 : 4;
+            return probeSource.lastClientCount > 0 ? 0 : 4;
         }
         if (CPAnotherInstanceIsRunning()) return 0;
         NSApplication *app = NSApplication.sharedApplication;

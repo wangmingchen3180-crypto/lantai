@@ -1,6 +1,6 @@
 # Codex Pulse
 
-Codex Pulse 是一个为 Codex Desktop 设计的原生 macOS 菜单栏小窗。它以只读方式观察本机 Codex 状态库，展示最近任务、工作状态、最近活动和项目入口。
+Codex Pulse 是一个原生 macOS 本地 Agent 工作台。它以只读方式观察本机 Codex Desktop 和 Kimi App 的任务索引，统一展示最近任务、工作状态、最近活动和原应用入口。
 
 ## 当前能力
 
@@ -13,11 +13,18 @@ Codex Pulse 是一个为 Codex Desktop 设计的原生 macOS 菜单栏小窗。�
 - 展示当前任务、项目、持续时间、Token 数和近期任务
 - 两秒自动刷新
 - 一键打开 Codex 或在 Finder 中显示项目
+- 内置“添加 Agent”流程：扫描本机适配器、显示检测状态、持久化启用选择并立即刷新，不需要让 Agent 修改源码
+- Kimi 默认读取电脑 Kimi App 的 `conversations.sqlite` 及运行状态；Kimi Code CLI 是独立、默认隐藏的可选 Agent
+- 点击 Kimi 客户端任务使用 `kimi-work://chat/<conversation-id>` 返回原会话（客户端未注册深链时降级为唤起应用）
 - 工作台底部常驻待办栏：可收起/展开，支持新增、完成/恢复、行内编辑、删除与滚动，本地 SQLite 持久化（`~/Library/Application Support/Codex Pulse/todos.sqlite`），独立于 Agent，计数不进入任何提醒聚合
 - Agent 与任务的完成态统一显示为「已就绪」（底层仍保留完成事件语义）
-- 只读访问 `~/.codex/state_5.sqlite` 与 `~/.codex/logs_2.sqlite`
+- 只读访问 Codex 与 Kimi 的本地索引，不读取、写入或上传登录令牌
 
 状态是根据 Codex 本地事件推断的。由于官方 Codex Desktop 尚未提供稳定的外部活动线程附着接口，应用不会尝试中断或控制现有任务。
+
+Agent 适配器的边界、内置注册流程和新提供方接入规则见 [docs/AGENT_ADAPTERS.md](docs/AGENT_ADAPTERS.md)。
+
+项目知识沉淀使用 [Project Cairn](https://github.com/iBlinkQ/project-cairn)：Skill 安装在用户级 `~/.agents/skills/project-cairn`，本地项目可在 `.agents/skills/project-cairn` 建立软链；个人绝对路径不提交到开源仓库。
 
 ## 构建
 
