@@ -1,0 +1,18 @@
+#import <Cocoa/Cocoa.h>
+#import <QuartzCore/QuartzCore.h>
+#import <sqlite3.h>
+
+#import "CPModels.h"
+#import "CPStatusEngine.h"
+#import "CPReviewStore.h"
+#import "CPStateCache.h"
+#import "CPAgentSources.h"
+#import "CPTodoStore.h"
+#import "CPRouting.h"
+#import "CPRefreshPipeline.h"
+#import "CPControls.h"
+#import "CPWorkbenchController.h"
+#import "CPHUDController.h"
+#import "CPDockController.h"
+#import "CPAppDelegate.h"
+#import "CPSelfTests.h"

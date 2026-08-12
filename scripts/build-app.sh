@@ -9,11 +9,18 @@ cd "$ROOT_DIR"
 mkdir -p "$ROOT_DIR/work/build"
 export CLANG_MODULE_CACHE_PATH="$ROOT_DIR/work/module-cache"
 mkdir -p "$CLANG_MODULE_CACHE_PATH"
+
+SRC_DIR="$ROOT_DIR/Sources/CodexPulse"
+# Compile all Objective-C sources (exclude headers).
+typeset -a SRC_FILES
+SRC_FILES=("$SRC_DIR"/*.m)
+
 clang -fobjc-arc -fmodules -O2 \
+  -I "$SRC_DIR" \
   -framework Cocoa \
   -framework QuartzCore \
   -lsqlite3 \
-  "$ROOT_DIR/Sources/CodexPulse/main.m" \
+  "${SRC_FILES[@]}" \
   -o "$ROOT_DIR/work/build/CodexPulse"
 
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
