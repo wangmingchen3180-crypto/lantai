@@ -2171,6 +2171,14 @@ static const NSInteger CPKimiWireCandidateLimit = 80;
 
 #pragma mark - Workbench Card
 
+// 工作台任务行按钮:稳定携带 agentID+taskID。点击时按 ID 在当前数据里重解析,
+// 刷新重排后不会因旧数组索引错位打开错误任务;任务已消失则静默忽略。
+@interface CPWorkbenchTaskRowButton : CPHoverButton
+@property NSString *agentID;
+@property NSString *taskID;
+@end
+@implementation CPWorkbenchTaskRowButton @end
+
 @interface CPDraggableHeaderView : NSView
 @property BOOL draggingWindow;
 @property NSPoint dragStartMouse;
@@ -3334,17 +3342,18 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     return row;
 }
 
-- (NSButton *)taskRow:(CPTask *)task index:(NSInteger)index {
-    NSButton *row = [CPHoverButton buttonWithTitle:@"" target:self action:@selector(taskClicked:)];
+- (NSButton *)taskRow:(CPTask *)task agentID:(NSString *)agentID {
+    CPWorkbenchTaskRowButton *row = [CPWorkbenchTaskRowButton buttonWithTitle:@"" target:self action:@selector(taskClicked:)];
     row.bordered = NO;
     [row setButtonType:NSButtonTypeMomentaryChange];
     row.wantsLayer = YES;
     row.layer.cornerRadius = 10.0;
     row.layer.borderWidth = 0.0;
-    ((CPHoverButton *)row).cpBaseBackground = NSColor.clearColor;
-    ((CPHoverButton *)row).cpHoverWash = 0.04; // 对照原型 .task:hover
-    ((CPHoverButton *)row).cpPressedWash = 0.07;
-    row.tag = index;
+    row.cpBaseBackground = NSColor.clearColor;
+    row.cpHoverWash = 0.04; // 对照原型 .task:hover
+    row.cpPressedWash = 0.07;
+    row.agentID = agentID;
+    row.taskID = task.taskID;
     row.toolTip = [NSString stringWithFormat:@"查看任务详情：%@", task.title];
     row.accessibilityLabel = [NSString stringWithFormat:@"%@，查看任务详情", task.title];
     row.translatesAutoresizingMaskIntoConstraints = NO;
@@ -3465,9 +3474,8 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
         self.selectedTask = nil;
         [self closeDetailDrawer];
     } else {
-        NSInteger idx = 0;
         for (CPTask *task in tasks) {
-            NSButton *taskRowBtn = [self taskRow:task index:idx++];
+            NSButton *taskRowBtn = [self taskRow:task agentID:self.selectedAgent.agentID];
             [self.taskStack addArrangedSubview:taskRowBtn];
             [taskRowBtn.widthAnchor constraintEqualToAnchor:self.taskStack.widthAnchor].active = YES;
         }
@@ -3684,22 +3692,31 @@ static NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     }
 }
 
-- (void)taskClicked:(NSButton *)sender {
-    NSInteger idx = sender.tag;
-    if (idx >= 0 && idx < (NSInteger)self.selectedAgent.tasks.count) {
-        self.selectedTask = self.selectedAgent.tasks[(NSUInteger)idx];
-        [self renderDetail];
-        [self showDetailDrawer];
-        // 只有真正打开任务详情才记录已查看；render/选择 Agent/刷新均不写 defaults。
-        if (self.selectedTask.status == CPStatusCompleted ||
-            self.selectedTask.status == CPStatusAttention ||
-            self.selectedTask.status == CPStatusFailed ||
-            self.selectedTask.status == CPStatusWaiting) {
-            [self.reviewStore markTaskReviewed:self.selectedTask agentID:self.selectedAgent.agentID];
-            [[NSNotificationCenter defaultCenter] postNotificationName:@"CPTaskReviewed" object:nil];
-            // 立即刷新工作台 Agent 灯；任务对象按 taskID 保留，详情抽屉不会关闭。
-            [self renderAgents:self.agents];
-        }
+- (void)taskClicked:(CPWorkbenchTaskRowButton *)sender {
+    if (![sender isKindOfClass:CPWorkbenchTaskRowButton.class] || !sender.taskID.length) return;
+    CPAgent *agent = nil;
+    for (CPAgent *a in self.agents) {
+        if ([a.agentID isEqualToString:sender.agentID]) { agent = a; break; }
+    }
+    if (!agent) return;
+    CPTask *task = nil;
+    for (CPTask *t in agent.tasks) {
+        if ([t.taskID isEqualToString:sender.taskID]) { task = t; break; }
+    }
+    if (!task) return; // 任务已在刷新中消失:不做动作,不伪造已查看
+    self.selectedAgent = agent;
+    self.selectedTask = task;
+    [self renderDetail];
+    [self showDetailDrawer];
+    // 只有真正打开任务详情才记录已查看；render/选择 Agent/刷新均不写 defaults。
+    if (self.selectedTask.status == CPStatusCompleted ||
+        self.selectedTask.status == CPStatusAttention ||
+        self.selectedTask.status == CPStatusFailed ||
+        self.selectedTask.status == CPStatusWaiting) {
+        [self.reviewStore markTaskReviewed:self.selectedTask agentID:self.selectedAgent.agentID];
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"CPTaskReviewed" object:nil];
+        // 立即刷新工作台 Agent 灯；任务对象按 taskID 保留，详情抽屉不会关闭。
+        [self renderAgents:self.agents];
     }
 }
 
@@ -5414,8 +5431,9 @@ static NSString *CPAgentsSignature(NSArray<CPAgent *> *agents) {
         [self showCard];
         CPAgent *a = self.card.selectedAgent;
         if (a.tasks.count) {
-            NSButton *fake = NSButton.new;
-            fake.tag = 0;
+            CPWorkbenchTaskRowButton *fake = [CPWorkbenchTaskRowButton buttonWithTitle:@"" target:nil action:nil];
+            fake.agentID = a.agentID;
+            fake.taskID = a.tasks.firstObject.taskID;
             [self.card taskClicked:fake];
         }
     }
@@ -5433,8 +5451,9 @@ static NSString *CPAgentsSignature(NSArray<CPAgent *> *agents) {
             // CP_VISUAL_TEST_KIMI_LIST=1 时只停在选择 Kimi 后的任务列表(列表截图),不打开详情抽屉。
             BOOL listOnly = NSProcessInfo.processInfo.environment[@"CP_VISUAL_TEST_KIMI_LIST"] != nil;
             if (!listOnly && self.card.selectedAgent.tasks.count) {
-                NSButton *fakeTask = NSButton.new;
-                fakeTask.tag = 0;
+                CPWorkbenchTaskRowButton *fakeTask = [CPWorkbenchTaskRowButton buttonWithTitle:@"" target:nil action:nil];
+                fakeTask.agentID = self.card.selectedAgent.agentID;
+                fakeTask.taskID = self.card.selectedAgent.tasks.firstObject.taskID;
                 [self.card taskClicked:fakeTask];
             }
         }
@@ -5711,8 +5730,9 @@ int main(int argc, const char *argv[]) {
                 (void)note;
                 [bugDock renderWithAgents:@[attentionAgentUI] selectedAgent:attentionAgentUI];
             }];
-            NSButton *attentionRow = NSButton.new;
-            attentionRow.tag = 0;
+            CPWorkbenchTaskRowButton *attentionRow = [CPWorkbenchTaskRowButton buttonWithTitle:@"" target:nil action:nil];
+            attentionRow.agentID = attentionAgentUI.agentID;
+            attentionRow.taskID = attentionTaskUI.taskID;
             [bugCard taskClicked:attentionRow];
             BOOL attentionBadgeClearsOnOpen = attentionBadgeInitiallyVisible && bugDock.badgeView.hidden &&
                                               [bugStore isTaskReviewed:attentionTaskUI agentID:attentionAgentUI.agentID];
@@ -5966,12 +5986,23 @@ int main(int argc, const char *argv[]) {
             BOOL renderDoesNotMark = ![card2.reviewStore isTaskReviewed:workAgent.tasks[1] agentID:@"w-agent"] &&
                                      ![card2.reviewStore isTaskReviewed:workAgent.tasks[0] agentID:@"w-agent"];
 
-            NSButton *fakeRow = NSButton.new;
-            fakeRow.tag = 1; // completed task w2
+            CPWorkbenchTaskRowButton *fakeRow = [CPWorkbenchTaskRowButton buttonWithTitle:@"" target:nil action:nil];
+            fakeRow.agentID = @"w-agent";
+            fakeRow.taskID = @"w2"; // completed task w2
             [card2 taskClicked:fakeRow];
             BOOL drawerShownOnClick = !card2.rightColumn.hidden &&
                                       card2.rightColumn.superview == card2.middleColumn;
             BOOL reviewMarkedOnOpen = [card2.reviewStore isTaskReviewed:workAgent.tasks[1] agentID:@"w-agent"];
+
+            // ghost: 点击时 taskID 已不在当前数据 → 不动作、不伪造已查看、不改选中
+            CPTask *keptTask = card2.selectedTask;
+            CPWorkbenchTaskRowButton *ghostRow = [CPWorkbenchTaskRowButton buttonWithTitle:@"" target:nil action:nil];
+            ghostRow.agentID = @"w-agent";
+            ghostRow.taskID = @"ghost-gone";
+            [card2 taskClicked:ghostRow];
+            BOOL m3GhostOK = card2.selectedTask == keptTask &&
+                             !card2.rightColumn.hidden &&
+                             ![card2.reviewStore isTaskReviewed:CPTestTask(@"ghost-gone", CPStatusCompleted, 1) agentID:@"w-agent"];
 
             [card2.window orderFrontRegardless];
             [card2 handleEscape];
@@ -5982,7 +6013,7 @@ int main(int argc, const char *argv[]) {
             [m3Defaults synchronize];
 
             BOOL m3ui = drawerInitiallyHidden && renderDoesNotMark && drawerShownOnClick &&
-                        reviewMarkedOnOpen && firstEscDrawerOnly && secondEscClosesWorkbench;
+                        reviewMarkedOnOpen && m3GhostOK && firstEscDrawerOnly && secondEscClosesWorkbench;
 
             // M3 entries: every entry shows-and-fronts, never toggles closed
             CPWorkbenchCardController *card3 = CPWorkbenchCardController.new;
@@ -6008,8 +6039,9 @@ int main(int argc, const char *argv[]) {
             CPAgent *m4Agent = CPTestAgent(@"m4-agent", @[CPTestTask(@"m4t1", CPStatusWorking, 1),
                                                           CPTestTask(@"m4t2", CPStatusCompleted, 2)]);
             [card4 renderAgents:@[m4Agent]];
-            NSButton *m4Row = NSButton.new;
-            m4Row.tag = 1;
+            CPWorkbenchTaskRowButton *m4Row = [CPWorkbenchTaskRowButton buttonWithTitle:@"" target:nil action:nil];
+            m4Row.agentID = @"m4-agent";
+            m4Row.taskID = @"m4t2";
             [card4 taskClicked:m4Row]; // open detail drawer for completed task
             CPAgent *m4AgentNew = CPTestAgent(@"m4-agent", @[CPTestTask(@"m4t1", CPStatusWorking, 3),
                                                              CPTestTask(@"m4t2", CPStatusCompleted, 4)]);
@@ -6027,8 +6059,9 @@ int main(int argc, const char *argv[]) {
                                  card4.rightColumn.hidden;
 
             [card4 renderAgents:@[m4AgentNew]]; // reselect m4-agent
-            NSButton *m4Row0 = NSButton.new;
-            m4Row0.tag = 0;
+            CPWorkbenchTaskRowButton *m4Row0 = [CPWorkbenchTaskRowButton buttonWithTitle:@"" target:nil action:nil];
+            m4Row0.agentID = @"m4-agent";
+            m4Row0.taskID = @"m4t1";
             [card4 taskClicked:m4Row0]; // open m4t1 detail
             CPAgent *m4AgentShrunk = CPTestAgent(@"m4-agent", @[CPTestTask(@"m4t2", CPStatusCompleted, 4)]);
             [card4 renderAgents:@[m4AgentShrunk]]; // selected task disappears
@@ -6522,8 +6555,9 @@ int main(int argc, const char *argv[]) {
             bigTask.activity = [@"" stringByPaddingToLength:300 withString:@"正在执行构建脚本并验证输出产物 " startingAtIndex:0];
             CPAgent *agent9 = CPTestAgent(@"m9-agent", @[bigTask]);
             [card9 renderAgents:@[agent9]];
-            NSButton *row9 = NSButton.new;
-            row9.tag = 0;
+            CPWorkbenchTaskRowButton *row9 = [CPWorkbenchTaskRowButton buttonWithTitle:@"" target:nil action:nil];
+            row9.agentID = @"m9-agent";
+            row9.taskID = @"m9-t1";
             [card9 taskClicked:row9];
             [card9.window orderFrontRegardless];
             [card9.card layoutSubtreeIfNeeded];
@@ -6646,8 +6680,9 @@ int main(int argc, const char *argv[]) {
 
             // Esc 两阶段
             [card9 renderAgents:@[agent9]];
-            NSButton *row9b = NSButton.new;
-            row9b.tag = 0;
+            CPWorkbenchTaskRowButton *row9b = [CPWorkbenchTaskRowButton buttonWithTitle:@"" target:nil action:nil];
+            row9b.agentID = @"m9-agent";
+            row9b.taskID = @"m9-t1";
             [card9 taskClicked:row9b];
             [card9.window orderFrontRegardless];
             [card9 handleEscape];
@@ -6665,8 +6700,9 @@ int main(int argc, const char *argv[]) {
 
             // 详情打开时点击不得穿透到下层任务列表(命中被详情容器吞掉);关闭后下层恢复可点。
             [card9 renderAgents:@[agent9]];
-            NSButton *row9c = NSButton.new;
-            row9c.tag = 0;
+            CPWorkbenchTaskRowButton *row9c = [CPWorkbenchTaskRowButton buttonWithTitle:@"" target:nil action:nil];
+            row9c.agentID = @"m9-agent";
+            row9c.taskID = @"m9-t1";
             [card9 taskClicked:row9c];
             [card9.card layoutSubtreeIfNeeded];
             NSPoint midPt = NSMakePoint(NSMidX(card9.middleColumn.bounds), NSMidY(card9.middleColumn.bounds));
@@ -7229,11 +7265,12 @@ int main(int argc, const char *argv[]) {
             [result appendFormat:@"Bugfix UI self-test: agent-dot-column=%@ attention-badge-clears=%@\n",
                 agentStatusDotsAligned ? @"OK" : @"FAIL",
                 attentionBadgeClearsOnOpen ? @"OK" : @"FAIL"];
-            [result appendFormat:@"M3 UI self-test: drawer-init-hidden=%@ render-no-mark=%@ drawer-on-click=%@ review-on-open=%@ esc-drawer=%@ esc-workbench=%@\n",
+            [result appendFormat:@"M3 UI self-test: drawer-init-hidden=%@ render-no-mark=%@ drawer-on-click=%@ review-on-open=%@ stale-row=%@ esc-drawer=%@ esc-workbench=%@\n",
                 drawerInitiallyHidden ? @"OK" : @"FAIL",
                 renderDoesNotMark ? @"OK" : @"FAIL",
                 drawerShownOnClick ? @"OK" : @"FAIL",
                 reviewMarkedOnOpen ? @"OK" : @"FAIL",
+                m3GhostOK ? @"OK" : @"FAIL",
                 firstEscDrawerOnly ? @"OK" : @"FAIL",
                 secondEscClosesWorkbench ? @"OK" : @"FAIL"];
             [result appendFormat:@"M3 entries self-test: reshow-visible=%@ reshow-centered=%@ reshow-fixed-size=%@\n",
