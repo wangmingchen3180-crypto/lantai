@@ -4580,6 +4580,7 @@ static const CGFloat CPBarWorkbenchWidth = 82.0;
 
 static const CGFloat CPHUDContentWidth = 400.0;
 static const CGFloat CPHUDContentHeight = 244.0;
+static const CGFloat CPHUDTaskAreaHeight = 116.0; // 任务区固定高度:恰好露出约 2 张卡,其余滚动
 static const CGFloat CPHUDInset = 14.0;
 static const CGFloat CPHUDCollapsedWidth = 6.0;
 static const CGFloat CPHUDCollapsedHeight = 72.0;
@@ -4608,6 +4609,14 @@ static const CGFloat CPHUDHandleVisualHeight = 44.0;
 @property (weak) CPHUDWindowController *hud;
 @end
 
+// HUD 任务卡按钮:点击指向 taskCardClicked:(直达所属 Agent),稳定携带 taskID。
+// 点击时按 taskID 在当前数据里重新解析任务对象,刷新/重建后不会因旧指针或索引错位打开错误任务。
+@interface CPHUDTaskCardButton : CPHoverButton
+@property NSString *taskID;
+@end
+
+@implementation CPHUDTaskCardButton @end
+
 @interface CPHUDWindowController : NSObject
 @property NSPanel *window;
 @property NSView *shadowCarrier;
@@ -4627,10 +4636,13 @@ static const CGFloat CPHUDHandleVisualHeight = 44.0;
 @property CPReviewStore *reviewStore;
 @property NSStackView *agentList;
 @property NSStackView *taskList;
+@property NSScrollView *taskScrollView;
+// 任务卡打开入口(安全注入点):默认走 CPOpenAgentTask 深链/唤起;自测注入假实现,绝不真的打开 Codex/Kimi。
+@property (copy) BOOL (^taskOpener)(CPAgent *agent, CPTask *task);
 @property NSTextField *agentNameLabel;
 @property NSTextField *agentStatusLabel;
 @property NSTextField *agentUpdatedLabel;
-@property NSView *bottomBar;      // 底行:左侧「另有 N 个活动」汇总,右侧图例「?」钮
+@property NSView *bottomBar;      // 底行:左侧任务数量/滑动提示,右侧图例「?」钮
 @property NSTextField *moreLabel;
 @property NSButton *legendButton;
 @property NSPanel *legendPanel;
@@ -4777,14 +4789,29 @@ static const CGFloat CPHUDAgentRail = 64.0;
     [container addSubview:agentUpdated];
     self.agentUpdatedLabel = agentUpdated;
 
-    self.taskList = [NSStackView stackViewWithViews:@[]];
+    // 任务区域 NSScrollView 化:默认可见约 2 张卡,超出部分触控板/滚轮纵向滑动浏览;
+    // overlay scroller 自动隐藏,滚动事件由滚动区消费,不会误触背景「打开工作台」。
+    NSScrollView *taskScroll = [[NSScrollView alloc] initWithFrame:NSZeroRect];
+    taskScroll.translatesAutoresizingMaskIntoConstraints = NO;
+    taskScroll.drawsBackground = NO;
+    taskScroll.borderType = NSNoBorder;
+    taskScroll.hasVerticalScroller = YES;
+    taskScroll.hasHorizontalScroller = NO;
+    taskScroll.scrollerStyle = NSScrollerStyleOverlay;
+    taskScroll.scrollerKnobStyle = NSScrollerKnobStyleDark;
+    taskScroll.autohidesScrollers = YES;
+    taskScroll.horizontalScrollElasticity = NSScrollElasticityNone;
+    self.taskScrollView = taskScroll;
+    [container addSubview:taskScroll];
+
+    self.taskList = [CPFlippedStackView stackViewWithViews:@[]]; // 翻转:首个任务在顶部,滚动回顶即 origin 0
     self.taskList.orientation = NSUserInterfaceLayoutOrientationVertical;
     self.taskList.spacing = 8;
     self.taskList.alignment = NSLayoutAttributeLeading;
     self.taskList.translatesAutoresizingMaskIntoConstraints = NO;
-    [container addSubview:self.taskList];
+    taskScroll.documentView = self.taskList;
 
-    // 底行(单行,不拉长 HUD 高度):左侧「另有 N 个活动」汇总,右侧 14x14 图例「?」小圆钮。
+    // 底行(单行,不拉长 HUD 高度):左侧任务数量/滑动提示,右侧 14x14 图例「?」小圆钮。
     NSView *bottomBar = [[NSView alloc] initWithFrame:NSZeroRect];
     bottomBar.translatesAutoresizingMaskIntoConstraints = NO;
     [container addSubview:bottomBar];
@@ -4839,10 +4866,17 @@ static const CGFloat CPHUDAgentRail = 64.0;
         [agentUpdated.centerYAnchor constraintEqualToAnchor:agentStatus.centerYAnchor],
         [agentUpdated.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-18],
 
-        [self.taskList.leadingAnchor constraintEqualToAnchor:agentName.leadingAnchor],
-        [self.taskList.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-18],
-        [self.taskList.topAnchor constraintEqualToAnchor:agentStatus.bottomAnchor constant:16],
-        [self.taskList.bottomAnchor constraintLessThanOrEqualToAnchor:bottomBar.topAnchor constant:-8],
+        [self.taskScrollView.leadingAnchor constraintEqualToAnchor:agentName.leadingAnchor],
+        [self.taskScrollView.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-18],
+        [self.taskScrollView.topAnchor constraintEqualToAnchor:agentStatus.bottomAnchor constant:16],
+        // 固定约 2 张卡高度(2×54+8),HUD 外框尺寸不变;更多任务在区内滚动。
+        [self.taskScrollView.heightAnchor constraintEqualToConstant:CPHUDTaskAreaHeight],
+        [self.taskScrollView.bottomAnchor constraintLessThanOrEqualToAnchor:bottomBar.topAnchor constant:-8],
+
+        // documentView 宽度跟随 clip view,任务卡横向 fill 不溢出;高度由 stack 内容驱动。
+        [self.taskList.leadingAnchor constraintEqualToAnchor:taskScroll.contentView.leadingAnchor],
+        [self.taskList.topAnchor constraintEqualToAnchor:taskScroll.contentView.topAnchor],
+        [self.taskList.widthAnchor constraintEqualToAnchor:taskScroll.contentView.widthAnchor],
 
         [bottomBar.leadingAnchor constraintEqualToAnchor:agentName.leadingAnchor],
         [bottomBar.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-18],
@@ -5083,7 +5117,7 @@ static const CGFloat CPHUDAgentRail = 64.0;
         [v removeFromSuperview];
     }
 
-    // 右侧只渲染当前选中 Agent 的真实任务，最多 2 张高可读任务卡。
+    // 右侧只渲染当前选中 Agent 的真实任务,全部建卡,任务区内纵向滚动浏览。
     NSArray<CPTask *> *displayTasks = agent.tasks;
     if (displayTasks.count == 0) {
         NSTextField *empty = [NSTextField labelWithString:@"当前没有任务"];
@@ -5092,15 +5126,46 @@ static const CGFloat CPHUDAgentRail = 64.0;
         [self.taskList addArrangedSubview:empty];
         self.moreLabel.stringValue = @"";
     } else {
-        for (NSUInteger i = 0; i < displayTasks.count && i < 2; i++) {
-            NSButton *card = [self taskCard:displayTasks[i]];
+        for (CPTask *task in displayTasks) {
+            NSButton *card = [self taskCard:task];
             [self.taskList addArrangedSubview:card];
             [card.widthAnchor constraintEqualToAnchor:self.taskList.widthAnchor].active = YES;
         }
-        // 超过 2 张未显示时,摘要进底行左侧而不是占任务卡列表。
+        // 超过默认可见的约 2 张时,底行给轻量滑动提示,不再截断任务列表。
         self.moreLabel.stringValue = displayTasks.count > 2
-            ? [NSString stringWithFormat:@"另有 %lu 个活动", (unsigned long)(displayTasks.count - 2)]
+            ? [NSString stringWithFormat:@"共 %lu 个活动 · 可滚动查看", (unsigned long)displayTasks.count]
             : @"";
+    }
+    // Agent 切换/数据刷新重建内容后回到列表顶部,避免错位。
+    [self.taskScrollView.contentView scrollToPoint:NSZeroPoint];
+    [self.taskScrollView reflectScrolledClipView:self.taskScrollView.contentView];
+}
+
+// 任务卡点击:直达所属 Agent 的对应任务。
+// 路由顺序:Codex/kimi-client 走 CPDeepLinkForAgentTask 精确深链;kimi-cli 等无精确深链的来源
+// 由 CPOpenAgentTask 降级为至少唤起所属 Agent 应用;只有连所属应用都打不开时才回退工作台。
+// 按卡片携带的 taskID 在当前选中 Agent 的任务里重新解析,刷新后不会错位打开错误任务。
+- (void)taskCardClicked:(CPHUDTaskCardButton *)sender {
+    CPAgent *agent = self.selectedAgent ?: self.agents.firstObject;
+    if (!agent || !sender.taskID.length) return;
+    CPTask *task = nil;
+    for (CPTask *t in agent.tasks) {
+        if ([t.taskID isEqualToString:sender.taskID]) { task = t; break; }
+    }
+    if (!task) return; // 任务已在刷新中消失:不做动作,不伪造已查看
+    BOOL opened = self.taskOpener ? self.taskOpener(agent, task) : CPOpenAgentTask(agent, task);
+    if (!opened) {
+        // 无法打开所属 Agent:回退打开工作台,已查看标记交给工作台打开详情的原有逻辑。
+        [self hudClicked:sender];
+        return;
+    }
+    // 成功打开所属 Agent:这条提醒视为已查看,角标经 CPTaskReviewed 立即更新。
+    if (task.status == CPStatusCompleted ||
+        task.status == CPStatusAttention ||
+        task.status == CPStatusFailed ||
+        task.status == CPStatusWaiting) {
+        [self.reviewStore markTaskReviewed:task agentID:agent.agentID];
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"CPTaskReviewed" object:nil];
     }
 }
 
@@ -5187,9 +5252,10 @@ static const CGFloat CPHUDAgentRail = 64.0;
     else [self showLegend];
 }
 
-// 任务卡:标题(截断) + 一行真实活动/状态,点击打开工作台。
+// 任务卡:标题(截断) + 一行真实活动/状态,点击直达所属 Agent 的对应任务(见 taskCardClicked:)。
 - (NSButton *)taskCard:(CPTask *)task {
-    NSButton *card = [CPHoverButton buttonWithTitle:@"" target:self action:@selector(hudClicked:)];
+    CPHUDTaskCardButton *card = [CPHUDTaskCardButton buttonWithTitle:@"" target:self action:@selector(taskCardClicked:)];
+    card.taskID = task.taskID;
     card.bordered = NO;
     [card setButtonType:NSButtonTypeMomentaryChange];
     card.wantsLayer = YES;
@@ -6163,8 +6229,8 @@ int main(int argc, const char *argv[]) {
                                                          CPTestTask(@"m5", CPStatusWorking, 5)]);
             CPHUDWindowController *hud5 = CPHUDWindowController.new;
             [hud5 updateWithAgents:@[manyAgent] selectedAgent:manyAgent];
-            BOOL taskCapOK = hud5.taskList.arrangedSubviews.count == 2 && // HUD 最多 2 张任务卡
-                             [hud5.moreLabel.stringValue isEqualToString:@"另有 3 个活动"]; // 摘要进底行
+            BOOL taskCapOK = hud5.taskList.arrangedSubviews.count == 5 && // 全部任务建卡,滚动浏览不设上限
+                             [hud5.moreLabel.stringValue isEqualToString:@"共 5 个活动 · 可滚动查看"]; // 轻量滑动提示进底行
             BOOL titleTruncates = cleanTruncates;
             if (taskCapOK) {
                 NSView *row = hud5.taskList.arrangedSubviews.firstObject;
@@ -6443,8 +6509,8 @@ int main(int argc, const char *argv[]) {
             CPAgent *hudAgentB = CPTestAgent(@"m8-b", @[CPTestTask(@"b-only", CPStatusFailed, 95)]);
             [hud8 updateWithAgents:@[hudAgentA, hudAgentB] selectedAgent:hudAgentA];
 
-            BOOL hudCapOK = hud8.taskList.arrangedSubviews.count == 2; // 最多 2 张任务卡,摘要在底行
-            BOOL hudSummaryOK = [hud8.moreLabel.stringValue isEqualToString:@"另有 1 个活动"];
+            BOOL hudCapOK = hud8.taskList.arrangedSubviews.count == 3; // 全部任务建卡,滑动提示在底行
+            BOOL hudSummaryOK = [hud8.moreLabel.stringValue isEqualToString:@"共 3 个活动 · 可滚动查看"];
             BOOL hudMinFontOK = YES;
             BOOL hudNoPathOK = YES;
             BOOL hudTitleTruncOK = NO;
@@ -7123,6 +7189,117 @@ int main(int argc, const char *argv[]) {
             BOOL perfUI = perfSkipOK && rippleNoRestart && rippleRestartsOnChange &&
                           hudPausedWhenCollapsed && hudResumesOnExpand && hudRepausesOnCollapse;
 
+            // M13: HUD 任务卡直达所属 Agent(独立 action/按 taskID 重解析/已查看标记/降级) + 任务区滚动
+            NSString *m13Suite = [NSString stringWithFormat:@"com.codexpulse.hudtasktest.%d", NSProcessInfo.processInfo.processIdentifier];
+            NSUserDefaults *m13Defaults = [[NSUserDefaults alloc] initWithSuiteName:m13Suite];
+            [m13Defaults removePersistentDomainForName:m13Suite];
+            CPReviewStore *m13Store = [[CPReviewStore alloc] initWithDefaults:m13Defaults];
+
+            CPHUDWindowController *hud13 = CPHUDWindowController.new;
+            hud13.reviewStore = m13Store;
+            CPTask *m13Done = CPTestTask(@"c1", CPStatusCompleted, 100);
+            CPTask *m13Working = CPTestTask(@"k1", CPStatusWorking, 90);
+            CPTask *m13Failed = CPTestTask(@"f1", CPStatusFailed, 80);
+            CPAgent *m13Codex = CPTestAgent(@"codex", @[m13Done, m13Working, m13Failed,
+                                                        CPTestTask(@"w1", CPStatusWaiting, 70)]);
+            CPAgent *m13Other = CPTestAgent(@"kimi", @[CPTestTask(@"u1", CPStatusWorking, 60)]);
+            [hud13 updateWithAgents:@[m13Codex, m13Other] selectedAgent:m13Codex];
+
+            // 1) 任务卡 action 不再是 hudClicked:,且稳定携带 taskID。
+            NSView *cardV13 = hud13.taskList.arrangedSubviews.firstObject;
+            BOOL m13ActionOK = [cardV13 isKindOfClass:CPHUDTaskCardButton.class] &&
+                               ((NSButton *)cardV13).action == @selector(taskCardClicked:) &&
+                               ((NSButton *)cardV13).action != @selector(hudClicked:) &&
+                               ((NSButton *)cardV13).target == hud13 &&
+                               [((CPHUDTaskCardButton *)cardV13).taskID isEqualToString:@"c1"];
+
+            // 2) 注入假 opener(绝不真的打开 Codex/Kimi),断言解析到正确 agent/task;
+            //    completed/attention/failed/waiting 成功打开后标记已查看并广播 CPTaskReviewed。
+            __block NSInteger m13OpenerCalls = 0;
+            __block CPAgent *m13OpenedAgent = nil;
+            __block CPTask *m13OpenedTask = nil;
+            __block BOOL m13OpenResult = YES;
+            hud13.taskOpener = ^BOOL(CPAgent *agent, CPTask *task) {
+                m13OpenerCalls++;
+                m13OpenedAgent = agent;
+                m13OpenedTask = task;
+                return m13OpenResult;
+            };
+            __block NSInteger m13ReviewedNotes = 0;
+            id m13Token = [NSNotificationCenter.defaultCenter addObserverForName:@"CPTaskReviewed"
+                                                                          object:nil queue:nil
+                                                                      usingBlock:^(NSNotification *n) { m13ReviewedNotes++; }];
+            __block BOOL m13WorkbenchFired = NO;
+            hud13.onClicked = ^{ m13WorkbenchFired = YES; };
+
+            [hud13 taskCardClicked:(CPHUDTaskCardButton *)cardV13]; // completed → 打开成功
+            BOOL m13ResolveOK = m13OpenerCalls == 1 &&
+                                m13OpenedAgent == m13Codex &&
+                                [m13OpenedTask.taskID isEqualToString:@"c1"];
+            BOOL m13ReviewMarked = [m13Store isTaskReviewed:m13Done agentID:@"codex"] && m13ReviewedNotes == 1;
+
+            // working 状态成功打开不标记已查看(不属于提醒类)。
+            CPHUDTaskCardButton *workingCard = (CPHUDTaskCardButton *)hud13.taskList.arrangedSubviews[1];
+            [hud13 taskCardClicked:workingCard];
+            BOOL m13WorkingNotMarked = m13OpenerCalls == 2 &&
+                                       [m13OpenedTask.taskID isEqualToString:@"k1"] &&
+                                       ![m13Store isTaskReviewed:m13Working agentID:@"codex"] &&
+                                       m13ReviewedNotes == 1;
+
+            // 3) 打不开所属 Agent 时回退工作台,且不提前伪造已查看。
+            m13OpenResult = NO;
+            CPHUDTaskCardButton *failedCard = (CPHUDTaskCardButton *)hud13.taskList.arrangedSubviews[2];
+            [hud13 taskCardClicked:failedCard];
+            BOOL m13FallbackOK = m13OpenerCalls == 3 && m13WorkbenchFired &&
+                                 ![m13Store isTaskReviewed:m13Failed agentID:@"codex"] &&
+                                 m13ReviewedNotes == 1;
+
+            // 4) 卡片携带的 taskID 已不在当前数据(刷新后旧卡):不动作、不伪造。
+            m13WorkbenchFired = NO;
+            CPHUDTaskCardButton *ghostCard = [CPHUDTaskCardButton buttonWithTitle:@"" target:hud13 action:@selector(taskCardClicked:)];
+            ghostCard.taskID = @"ghost";
+            [hud13 taskCardClicked:ghostCard];
+            BOOL m13StaleOK = m13OpenerCalls == 3 && !m13WorkbenchFired && m13ReviewedNotes == 1;
+            [NSNotificationCenter.defaultCenter removeObserver:m13Token];
+
+            // 5) 任务区为原生 NSScrollView:全部任务可达、overlay scroller、翻转 stack、内容超出可视高度。
+            [hud13.window orderFrontRegardless];
+            [hud13.visualView layoutSubtreeIfNeeded];
+            BOOL m13ScrollStruct = hud13.taskScrollView.documentView == hud13.taskList &&
+                                   hud13.taskScrollView.hasVerticalScroller &&
+                                   !hud13.taskScrollView.hasHorizontalScroller &&
+                                   hud13.taskScrollView.autohidesScrollers &&
+                                   hud13.taskScrollView.scrollerStyle == NSScrollerStyleOverlay &&
+                                   !hud13.taskScrollView.drawsBackground &&
+                                   [hud13.taskList isFlipped];
+            CGFloat m13ContentH = [hud13.taskList fittingSize].height;
+            CGFloat m13ClipH = hud13.taskScrollView.contentView.bounds.size.height;
+            BOOL m13Scrollable = hud13.taskList.arrangedSubviews.count == 4 &&
+                                 m13ContentH > m13ClipH &&
+                                 fabs(m13ClipH - CPHUDTaskAreaHeight) <= 1.0; // 默认露出约 2 张卡
+            // 滚到底部后重建内容(刷新/切换 Agent)必须回到顶部。
+            [hud13.taskScrollView.contentView scrollToPoint:NSMakePoint(0, m13ContentH)];
+            [hud13 updateWithAgents:@[m13Codex, m13Other] selectedAgent:m13Codex];
+            [hud13.visualView layoutSubtreeIfNeeded];
+            BOOL m13BackToTop = fabs(hud13.taskScrollView.contentView.bounds.origin.y) <= 0.5;
+            [hud13.window orderOut:nil];
+
+            // 6) 空任务状态仍正常。
+            CPAgent *m13Empty = CPTestAgent(@"m13-empty", @[]);
+            [hud13 updateWithAgents:@[m13Empty] selectedAgent:m13Empty];
+            NSView *m13EmptyV = hud13.taskList.arrangedSubviews.firstObject;
+            BOOL m13EmptyOK = hud13.taskList.arrangedSubviews.count == 1 &&
+                              [m13EmptyV isKindOfClass:NSTextField.class] &&
+                              [((NSTextField *)m13EmptyV).stringValue isEqualToString:@"当前没有任务"] &&
+                              hud13.moreLabel.stringValue.length == 0;
+
+            [m13Defaults removePersistentDomainForName:m13Suite];
+            [m13Defaults synchronize];
+
+            BOOL m13ui = m13ActionOK && m13ResolveOK && m13ReviewMarked && m13WorkingNotMarked &&
+                         m13FallbackOK && m13StaleOK && m13ScrollStruct && m13Scrollable &&
+                         m13BackToTop && m13EmptyOK;
+
             BOOL passed = centered && draggableHeader && labeledWorkbench && onlyRealAgents && labeledAgent && buttonReceivesClick &&
                           agentStatusDotsAligned && attentionBadgeClearsOnOpen &&
                           cardMasksToBounds && shadowCarrierNoMasks && cardIsChildOfShadowCarrier && windowHasWorkbenchInset &&
@@ -7130,7 +7307,7 @@ int main(int argc, const char *argv[]) {
                           hudCollapsed6x72 && hudCollapsedOnMainScreen && hudExpandedSizeOK && hudExpandedOnMainScreen &&
                           shadowCarrierScales && handleAnchoredTopRight && contentNotSizable && hudClickViewIsBackgroundView &&
                           hudVisualFrameExact && hudExpandedHandleHidden && m2ui && m3ui && m3entries && m4ui && m5ui && m7ui && m8ui && m9ui && m10ui &&
-                          hoverResidualOK && hoverMotionOK && todoUI && perfUI;
+                          hoverResidualOK && hoverMotionOK && todoUI && perfUI && m13ui;
             NSMutableString *result = [NSMutableString stringWithFormat:
                 @"Codex Pulse UI self-test: center=%@ drag=%@ workbench-label=%@ real-agents=%@ agent-label=%@ button-hit=%@ "
                 @"card-mask=%@ carrier-mask=%@ card-child=%@ win-inset=%@ card-520x402=%@ two-column=%@ right-overlay=%@ "
@@ -7328,6 +7505,17 @@ int main(int argc, const char *argv[]) {
                 hudPausedWhenCollapsed ? @"OK" : @"FAIL",
                 hudResumesOnExpand ? @"OK" : @"FAIL",
                 hudRepausesOnCollapse ? @"OK" : @"FAIL"];
+            [result appendFormat:@"M13 UI self-test(HUD 任务直达+滚动): card-action=%@ resolve=%@ review-marked=%@ working-not-marked=%@ workbench-fallback=%@ stale-card=%@ scroll-struct=%@ scrollable=%@ back-to-top=%@ empty=%@\n",
+                m13ActionOK ? @"OK" : @"FAIL",
+                m13ResolveOK ? @"OK" : @"FAIL",
+                m13ReviewMarked ? @"OK" : @"FAIL",
+                m13WorkingNotMarked ? @"OK" : @"FAIL",
+                m13FallbackOK ? @"OK" : @"FAIL",
+                m13StaleOK ? @"OK" : @"FAIL",
+                m13ScrollStruct ? @"OK" : @"FAIL",
+                m13Scrollable ? @"OK" : @"FAIL",
+                m13BackToTop ? @"OK" : @"FAIL",
+                m13EmptyOK ? @"OK" : @"FAIL"];
             if (!centered) {
                 [result appendFormat:@"  diagnostic: testVisible=%@ cardFrame=%@ hasScreen=%@\n",
                  NSStringFromRect(testVisible), NSStringFromRect(cardFrame), hasScreen ? @"YES" : @"NO"];
