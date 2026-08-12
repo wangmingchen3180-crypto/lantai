@@ -1,5 +1,6 @@
 #import "CPSelfTests.h"
 #import "CodexPulse.h"
+#import "CPAppDelegate.h"
 #import <sqlite3.h>
 #import <string.h>
 

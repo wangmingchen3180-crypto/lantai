@@ -1,0 +1,4 @@
+{"role": "_system_prompt", "content": "sys"}
+这不是合法 json 行
+{"role": "user", "content": "桌面端任务标题"}
+{"role": "user"}
