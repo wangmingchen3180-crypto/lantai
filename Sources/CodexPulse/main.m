@@ -5306,109 +5306,6 @@ static const CGFloat CPHUDAgentRail = 64.0;
 
 @end
 
-#pragma mark - Menu Popover
-
-@interface CPMenuPopoverController : NSViewController
-@property (nonatomic) NSArray<CPAgent *> *agents;
-@end
-
-@implementation CPMenuPopoverController
-
-- (void)loadView {
-    NSVisualEffectView *root = [[NSVisualEffectView alloc] initWithFrame:NSMakeRect(0, 0, 300, 320)];
-    root.material = NSVisualEffectMaterialPopover;
-    root.blendingMode = NSVisualEffectBlendingModeBehindWindow;
-    self.view = root;
-
-    NSStackView *stack = [NSStackView stackViewWithViews:@[]];
-    stack.orientation = NSUserInterfaceLayoutOrientationVertical;
-    stack.spacing = 12;
-    stack.edgeInsets = NSEdgeInsetsMake(16, 16, 16, 16);
-    stack.translatesAutoresizingMaskIntoConstraints = NO;
-    [root addSubview:stack];
-    [NSLayoutConstraint activateConstraints:@[
-        [stack.leadingAnchor constraintEqualToAnchor:root.leadingAnchor],
-        [stack.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
-        [stack.topAnchor constraintEqualToAnchor:root.topAnchor],
-        [stack.bottomAnchor constraintLessThanOrEqualToAnchor:root.bottomAnchor]
-    ]];
-
-    NSTextField *title = CPLabel(@"Codex Pulse", 18, NSFontWeightSemibold, CPFg());
-    title.font = [NSFont systemFontOfSize:18 weight:NSFontWeightSemibold];
-    [stack addArrangedSubview:title];
-}
-
-- (void)setAgents:(NSArray<CPAgent *> *)agents {
-    _agents = agents;
-    [self render];
-}
-
-- (void)render {
-    NSStackView *stack = (NSStackView *)self.view.subviews.firstObject;
-    while (stack.arrangedSubviews.count > 1) {
-        NSView *v = stack.arrangedSubviews.lastObject;
-        [stack removeArrangedSubview:v];
-        [v removeFromSuperview];
-    }
-
-    NSMutableArray<CPTask *> *attentionTasks = NSMutableArray.array;
-    for (CPAgent *a in self.agents) {
-        for (CPTask *t in a.tasks) {
-            if (t.status == CPStatusAttention || t.status == CPStatusFailed) {
-                [attentionTasks addObject:t];
-            }
-        }
-    }
-
-    NSTextField *section = CPLabel(@"需要关注", 10, NSFontWeightSemibold, CPMuted());
-    [stack addArrangedSubview:section];
-
-    if (!attentionTasks.count) {
-        [stack addArrangedSubview:CPLabel(@"当前没有需要关注的任务。", 12, NSFontWeightRegular, CPMuted())];
-    } else {
-        for (CPTask *t in attentionTasks) {
-            NSStackView *row = [NSStackView stackViewWithViews:@[
-                [self dotView:t.status],
-                [self taskText:t]
-            ]];
-            row.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-            row.alignment = NSLayoutAttributeTop;
-            row.spacing = 8;
-            [stack addArrangedSubview:row];
-        }
-    }
-
-    NSButton *open = [NSButton buttonWithTitle:@"打开工作台" target:self action:@selector(openWorkbench:)];
-    open.bezelStyle = NSBezelStyleRounded;
-    open.keyEquivalent = @"\r";
-    [stack addArrangedSubview:open];
-}
-
-- (NSImageView *)dotView:(CPStatus)status {
-    NSImageView *v = [[NSImageView alloc] initWithFrame:NSMakeRect(0, 0, 7, 7)];
-    v.image = CPStatusDot(7, status);
-    v.translatesAutoresizingMaskIntoConstraints = NO;
-    [v.widthAnchor constraintEqualToConstant:7].active = YES;
-    [v.heightAnchor constraintEqualToConstant:7].active = YES;
-    return v;
-}
-
-- (NSStackView *)taskText:(CPTask *)task {
-    NSTextField *title = CPLabel(task.title, 12, NSFontWeightMedium, CPFg());
-    title.lineBreakMode = NSLineBreakByTruncatingTail;
-    NSTextField *meta = CPLabel([NSString stringWithFormat:@"%@ · %@", task.projectName, CPStatusTitle(task.status)], 11, NSFontWeightRegular, CPMuted());
-    NSStackView *s = [NSStackView stackViewWithViews:@[title, meta]];
-    s.orientation = NSUserInterfaceLayoutOrientationVertical;
-    s.spacing = 1;
-    return s;
-}
-
-- (void)openWorkbench:(id)sender {
-    [[NSNotificationCenter defaultCenter] postNotificationName:@"CPOpenWorkbench" object:nil];
-}
-
-@end
-
 #pragma mark - Refresh Pipeline (性能:后台读取 + 合并 + 签名跳过)
 
 // 可见数据签名:逐 agent/task 拼接会影响界面的字段(id/状态/更新时间/tokens/标题/活动)。
@@ -5453,10 +5350,8 @@ static NSString *CPAgentsSignature(NSArray<CPAgent *> *agents) {
 
 #pragma mark - App Delegate
 
-@interface AppDelegate : NSObject <NSApplicationDelegate, NSPopoverDelegate>
+@interface AppDelegate : NSObject <NSApplicationDelegate>
 @property NSStatusItem *statusItem;
-@property NSPopover *popover;
-@property CPMenuPopoverController *popoverController;
 @property CPStateReader *reader;
 @property NSTimer *timer;
 @property CPDockWindowController *dock;
@@ -5488,18 +5383,7 @@ static NSString *CPAgentsSignature(NSArray<CPAgent *> *agents) {
 
     self.statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSSquareStatusItemLength];
     self.statusItem.button.image = [NSImage imageWithSystemSymbolName:@"sparkles" accessibilityDescription:@"Codex Pulse"];
-    self.statusItem.button.target = self;
-    self.statusItem.button.action = @selector(togglePopover:);
     self.statusItem.menu = [self statusMenu];
-
-    self.popoverController = CPMenuPopoverController.new;
-    self.popoverController.agents = self.agents;
-
-    self.popover = NSPopover.new;
-    self.popover.behavior = NSPopoverBehaviorTransient;
-    self.popover.contentSize = NSMakeSize(300, 320);
-    self.popover.contentViewController = self.popoverController;
-    self.popover.delegate = self;
 
     __weak typeof(self) weakSelf = self;
     self.dock = CPDockWindowController.new;
@@ -5598,17 +5482,12 @@ static NSString *CPAgentsSignature(NSArray<CPAgent *> *agents) {
 }
 
 - (void)openWorkbenchFromMenu:(id)sender {
-    [self.popover close];
+    (void)sender;
     [self showCard];
 }
 
-- (void)togglePopover:(id)sender {
-    if (self.popover.shown) [self.popover close];
-    else [self.popover showRelativeToRect:self.statusItem.button.bounds ofView:self.statusItem.button preferredEdge:NSRectEdgeMinY];
-}
-
 - (void)openWorkbench:(NSNotification *)note {
-    [self.popover close];
+    (void)note;
     [self showCard];
 }
 
@@ -5653,7 +5532,6 @@ static NSString *CPAgentsSignature(NSArray<CPAgent *> *agents) {
     self.lastAppliedSignature = sig;
     self.appliedRefreshCount += 1;
     self.agents = agents;
-    self.popoverController.agents = agents;
     [self.card renderAgents:agents];
     [self.dock renderWithAgents:agents selectedAgent:self.card.selectedAgent];
     [self.hud updateWithAgents:agents selectedAgent:self.card.selectedAgent];
@@ -5705,10 +5583,6 @@ static NSString *CPAgentsSignature(NSArray<CPAgent *> *agents) {
     self.statusItem.button.toolTip = attention
         ? [NSString stringWithFormat:@"Codex Pulse · %ld 个任务需关注", (long)attention]
         : [NSString stringWithFormat:@"Codex Pulse · %@", CPStatusTitle(overall)];
-}
-
-- (void)popoverWillShow:(NSNotification *)notification {
-    self.popoverController.agents = self.agents;
 }
 
 @end
