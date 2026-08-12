@@ -897,7 +897,7 @@ static void CPGrandfatherCompletedReviewsIfNeeded(NSUserDefaults *defaults, CPRe
 @property (nonatomic) BOOL reduceMotion;
 @property (nonatomic) BOOL animationsPaused; // HUD 收起/不可见时暂停 8 层无限涟漪(可见性驱动降载)
 @property CPDisplayStatus displayStatus;
-@property BOOL statusSelected;
+@property (nonatomic) BOOL statusSelected;
 @property CAShapeLayer *ringLayer;
 @property CAShapeLayer *innerRingLayer;
 @property NSArray<CAShapeLayer *> *rippleLayers;       // 8 层白峰(波层在图标之下)
