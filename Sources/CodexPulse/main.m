@@ -869,6 +869,24 @@ static NSInteger CPBadgeCountForAgents(NSArray<CPAgent *> *agents, CPReviewStore
     return count;
 }
 
+// 首启动豁免:新安装 defaults 为空时,历史 Completed 会全部算未读并撑爆徽标。
+// 首次拿到真实数据时把当刻 Completed 批量标为已读;Waiting/Failed/Attention 仍提醒。
+static NSString * const CPReviewGrandfatheredKey = @"CPReviewGrandfathered";
+
+static void CPGrandfatherCompletedReviewsIfNeeded(NSUserDefaults *defaults, CPReviewStore *reviewStore, NSArray<CPAgent *> *agents) {
+    if (!defaults || !reviewStore) return;
+    if ([defaults boolForKey:CPReviewGrandfatheredKey]) return;
+    for (CPAgent *a in agents) {
+        if (a.placeholder) continue;
+        for (CPTask *t in a.tasks) {
+            if (t.status == CPStatusCompleted) {
+                [reviewStore markTaskReviewed:t agentID:a.agentID];
+            }
+        }
+    }
+    [defaults setBool:YES forKey:CPReviewGrandfatheredKey];
+}
+
 // CPAgentStatusButton:HUD rail 的 Agent 状态按钮(方向 A 选中态)。
 // 选中信息完全由状态环与涟漪承载:未选中 = 状态色细环(1.5px,opacity ~0.28)+ 涟漪静止;
 // 选中 = 环变实色(opacity 1,线宽 2px)+ 8 层明暗成对涟漪常开(按状态周期);
@@ -5593,6 +5611,10 @@ static NSString *CPAgentsSignature(NSArray<CPAgent *> *agents) {
     self.lastAppliedSignature = sig;
     self.appliedRefreshCount += 1;
     self.agents = agents;
+    // 首次成功合入真实数据时豁免历史 Completed 的未读徽标(仅一次)。
+    if (self.card.reviewStore) {
+        CPGrandfatherCompletedReviewsIfNeeded(self.card.reviewStore.defaults, self.card.reviewStore, agents);
+    }
     [self.card renderAgents:agents];
     [self.dock renderWithAgents:agents selectedAgent:self.card.selectedAgent];
     [self.hud updateWithAgents:agents selectedAgent:self.card.selectedAgent];
@@ -7598,6 +7620,35 @@ int main(int argc, const char *argv[]) {
                 noEventIsIdle ? @"OK" : @"FAIL"];
             fputs(m2line.UTF8String, stdout);
 
+            // 首启动豁免历史 Completed:空 defaults + 含 completed/waiting 的 fixture →
+            // 批量标记后 badge 不含 completed,waiting 仍计;标志键写上后再次调用不重复改写。
+            NSString *gfSuite = [NSString stringWithFormat:@"com.codexpulse.grandfather.%d", NSProcessInfo.processInfo.processIdentifier];
+            NSUserDefaults *gfDefaults = [[NSUserDefaults alloc] initWithSuiteName:gfSuite];
+            [gfDefaults removePersistentDomainForName:gfSuite];
+            CPReviewStore *gfStore = [[CPReviewStore alloc] initWithDefaults:gfDefaults];
+            CPTask *gfDone = CPTestTask(@"old-done", CPStatusCompleted, 100);
+            CPTask *gfWait = CPTestTask(@"old-wait", CPStatusWaiting, 90);
+            CPTask *gfFail = CPTestTask(@"old-fail", CPStatusFailed, 80);
+            CPAgent *gfAgent = CPTestAgent(@"codex", @[gfDone, gfWait, gfFail]);
+            NSInteger gfBadgeBefore = CPBadgeCountForAgents(@[gfAgent], gfStore);
+            CPGrandfatherCompletedReviewsIfNeeded(gfDefaults, gfStore, @[gfAgent]);
+            BOOL grandfatherCompleted = gfBadgeBefore == 3 &&
+                [gfStore isTaskReviewed:gfDone agentID:@"codex"] &&
+                ![gfStore isTaskReviewed:gfWait agentID:@"codex"] &&
+                ![gfStore isTaskReviewed:gfFail agentID:@"codex"] &&
+                CPBadgeCountForAgents(@[gfAgent], gfStore) == 2 &&
+                [gfDefaults boolForKey:CPReviewGrandfatheredKey];
+            // 再次调用不得清掉 Waiting 的未读,也不得重复写入已有签名以外的副作用。
+            CPGrandfatherCompletedReviewsIfNeeded(gfDefaults, gfStore, @[gfAgent]);
+            BOOL grandfatherIdempotent = grandfatherCompleted &&
+                CPBadgeCountForAgents(@[gfAgent], gfStore) == 2 &&
+                ![gfStore isTaskReviewed:gfWait agentID:@"codex"];
+            printf("Badge grandfather self-test: grandfather-completed=%s idempotent=%s\n",
+                   grandfatherCompleted ? "OK" : "FAIL",
+                   grandfatherIdempotent ? "OK" : "FAIL");
+            [gfDefaults removePersistentDomainForName:gfSuite];
+            [gfDefaults synchronize];
+
             // 任务路由：Codex 线程深链;Kimi 按 sourceKind 分流(desktop 深链 / CLI 降级);未知 Agent 降级为应用唤起。
             CPTask *routeTask = CPTestTask(@"thread-123", CPStatusWorking, 1);
             routeTask.sourceKind = @"codex";
@@ -8085,7 +8136,7 @@ int main(int argc, const char *argv[]) {
             printf("Todo schema self-test: user-version=%s\n", todoSchemaOK ? "OK" : "FAIL");
             [[NSFileManager defaultManager] removeItemAtPath:todoSchemaPath error:nil];
 
-            return (taskCount > 0 && internalThreadsFiltered && m2 && taskRoutingOK && m6 && kimiOK && perfOK && todoSchemaOK) ? 0 : 2;
+            return (taskCount > 0 && internalThreadsFiltered && m2 && grandfatherIdempotent && taskRoutingOK && m6 && kimiOK && perfOK && todoSchemaOK) ? 0 : 2;
         }
         if (argc > 1 && strcmp(argv[1], "--kimi-probe") == 0) {
             // 只读真实验证:Kimi App conversations.sqlite + 客户端状态是否被识别。
