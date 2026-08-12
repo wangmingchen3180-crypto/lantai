@@ -15,5 +15,3 @@
 #import "CPWorkbenchController.h"
 #import "CPHUDController.h"
 #import "CPDockController.h"
-#import "CPAppDelegate.h"
-#import "CPSelfTests.h"

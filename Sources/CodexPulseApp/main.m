@@ -1,4 +1,6 @@
 #import "CodexPulse.h"
+#import "CPAppDelegate.h"
+#import "CPSelfTests.h"
 #import <string.h>
 
 int main(int argc, const char *argv[]) {
