@@ -1747,7 +1747,13 @@ static NSString *CPKimiCleanTitle(NSString *raw) {
             if (wire.attentionPending || [clientState isEqualToString:@"waiting"] || [clientState isEqualToString:@"attention"]) {
                 task.status = CPStatusWaiting;
             } else if ([clientState isEqualToString:@"running"]) {
-                task.status = CPStatusWorking;
+                // 客户端 running 也受 15 分钟新鲜度约束:App 强杀后残留 running 不得永久显示运行中。
+                BOOL fresh = activityAt && [NSDate.date timeIntervalSinceDate:activityAt] < 15 * 60;
+                if (fresh) {
+                    task.status = CPStatusWorking;
+                } else {
+                    task.status = CPKimiStatus(nil, wire, activityAt, NSDate.date);
+                }
             } else if ([clientState isEqualToString:@"failed"] || [clientState isEqualToString:@"error"]) {
                 task.status = CPStatusFailed;
             } else if ([clientState isEqualToString:@"completed"]) {
@@ -7579,28 +7585,39 @@ int main(int argc, const char *argv[]) {
                 };
             kInsertClient(@"client-key-1", @"client-id-1", @"Kimi 客户端运行中", @"/tmp/client-project", kNowMs - 1000, kClientWire1);
             kInsertClient(@"client-key-2", @"client-id-2", @"Kimi 客户端已完成", @"", kNowMs - 6000, kClientWire2);
+            // K0b: status=running 但 updatedAt/wire 活动已超过 15 分钟 → 不得强制 working
+            NSString *kClientWireStale = [kClientRoot stringByAppendingPathComponent:@"wire-stale.jsonl"];
+            [[NSString stringWithFormat:@"{\"type\":\"llm.request\",\"time\":%lld}\n", kNowMs - 7200000]
+                writeToFile:kClientWireStale atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            [kfm setAttributes:@{NSFileModificationDate: [NSDate dateWithTimeIntervalSince1970:(kNowMs - 7200000) / 1000.0]}
+                  ofItemAtPath:kClientWireStale error:nil];
+            kInsertClient(@"client-key-stale", @"client-id-stale", @"Kimi 客户端陈旧 running", @"/tmp/client-stale", kNowMs - 7200000, kClientWireStale);
             sqlite3_finalize(kClientInsert);
             sqlite3_close(kClientHandle);
-            [@"{\"client-key-1\":\"running\",\"client-key-2\":\"completed\"}"
+            [@"{\"client-key-1\":\"running\",\"client-key-2\":\"completed\",\"client-key-stale\":\"running\"}"
                 writeToFile:kClientStatus atomically:YES encoding:NSUTF8StringEncoding error:nil];
             setenv("CP_KIMI_CLIENT_DB", kClientDB.UTF8String, 1);
             setenv("CP_KIMI_CLIENT_STATUS", kClientStatus.UTF8String, 1);
             CPKimiSource *kClientSource = [[CPKimiSource alloc] initWithCache:CPStateCache.new];
             CPAgent *kClientAgent = [kClientSource readAgent];
-            CPTask *kClientRunning = nil, *kClientCompleted = nil;
+            CPTask *kClientRunning = nil, *kClientCompleted = nil, *kClientRunningStale = nil;
             for (CPTask *t in kClientAgent.tasks) {
                 if ([t.taskID isEqualToString:@"kimi-client-client-id-1"]) kClientRunning = t;
                 if ([t.taskID isEqualToString:@"kimi-client-client-id-2"]) kClientCompleted = t;
+                if ([t.taskID isEqualToString:@"kimi-client-client-id-stale"]) kClientRunningStale = t;
             }
-            BOOL kClientOK = kClientAgent.tasks.count == 2 && kClientSource.lastClientCount == 2 &&
+            BOOL kClientRunningStaleOK = kClientRunningStale && kClientRunningStale.status != CPStatusWorking;
+            BOOL kClientOK = kClientAgent.tasks.count == 3 && kClientSource.lastClientCount == 3 &&
                 kClientRunning.status == CPStatusWorking && kClientCompleted.status == CPStatusCompleted &&
+                kClientRunningStaleOK &&
                 [kClientRunning.projectName isEqualToString:@"client-project"] &&
                 [kClientCompleted.projectName isEqualToString:@"Kimi"] &&
                 [kClientRunning.sourceKind isEqualToString:@"kimi-client"];
-            printf("Kimi client self-test: sqlite-index=%s status-map=%s source-split=%s\n",
-                   kClientAgent.tasks.count == 2 ? "OK" : "FAIL",
+            printf("Kimi client self-test: sqlite-index=%s status-map=%s source-split=%s client-running-stale=%s\n",
+                   kClientAgent.tasks.count == 3 ? "OK" : "FAIL",
                    (kClientRunning.status == CPStatusWorking && kClientCompleted.status == CPStatusCompleted) ? "OK" : "FAIL",
-                   kClientOK ? "OK" : "FAIL");
+                   kClientOK ? "OK" : "FAIL",
+                   kClientRunningStaleOK ? "OK" : "FAIL");
             unsetenv("CP_KIMI_CLIENT_DB");
             unsetenv("CP_KIMI_CLIENT_STATUS");
 
