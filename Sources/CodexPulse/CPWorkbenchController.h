@@ -91,6 +91,8 @@ NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size);
 - (NSRect)targetFrameNearDockRect:(NSRect)rect edge:(NSRectEdge)edge;
 - (NSRect)targetFrameInVisibleRect:(NSRect)visible;
 - (void)showNearDockRect:(NSRect)rect edge:(NSRectEdge)edge;
+/// 屏幕参数变化后：可见工作台若不与主屏相交则重新居中。
+- (void)ensureFrameIntersectsVisibleScreen;
 - (void)close;
 - (BOOL)isVisible;
 - (void)renderAgents:(NSArray<CPAgent *> *)agents;

@@ -1,5 +1,6 @@
 #import "CPDockController.h"
 #import "CPStatusEngine.h"
+#import "CPScreenPolicy.h"
 
 #pragma mark - Dock Capsule
 
@@ -254,11 +255,17 @@ const CGFloat CPBarWorkbenchWidth = 82.0;
 }
 
 - (NSScreen *)targetScreen {
-    return NSScreen.mainScreen ?: NSScreen.screens.firstObject;
+    return CPTargetScreen();
+}
+
+- (void)reclampToVisibleScreen {
+    if (!CPTargetScreen()) return;
+    [self snapToEdge];
 }
 
 - (NSRect)initialFrame {
     NSScreen *screen = self.targetScreen;
+    if (!screen) return NSMakeRect(0, 0, CPOrbSize, CPOrbSize);
     NSRect visible = screen.visibleFrame;
     CGFloat x = NSMaxX(visible) - CPOrbSize - CPMargin;
     CGFloat y = NSMidY(visible) - CPOrbSize / 2.0;
@@ -280,6 +287,11 @@ const CGFloat CPBarWorkbenchWidth = 82.0;
     self.docked = NO;
     [self cancelUnpeek];
     NSScreen *screen = self.targetScreen;
+    if (!screen) {
+        [self renderDockAgents];
+        [self applyFrame];
+        return;
+    }
     NSRect visible = screen.visibleFrame;
     if (mode == 0) {
         self.freeX = NSMaxX(visible) - CPOrbSize - CPMargin;
@@ -295,6 +307,10 @@ const CGFloat CPBarWorkbenchWidth = 82.0;
 
 - (NSRect)barInitialFrame {
     NSScreen *screen = self.targetScreen;
+    if (!screen) {
+        NSRect rf = self.barView.frame;
+        return NSMakeRect(0, 24, rf.size.width, rf.size.height);
+    }
     NSRect visible = screen.visibleFrame;
     NSRect rf = self.barView.frame;
     CGFloat x = NSMidX(visible) - rf.size.width / 2.0;
@@ -312,6 +328,7 @@ const CGFloat CPBarWorkbenchWidth = 82.0;
 
 - (void)applyFrame {
     NSScreen *screen = self.targetScreen;
+    if (!screen) return;
     NSRect visible = screen.visibleFrame;
     CGFloat x, y, w, h;
     if (self.docked && self.mode == 0) {
@@ -361,6 +378,7 @@ const CGFloat CPBarWorkbenchWidth = 82.0;
 - (void)peek:(BOOL)show {
     if (!self.docked || self.mode != 0) return;
     NSScreen *screen = self.targetScreen;
+    if (!screen) return;
     NSRect visible = screen.visibleFrame;
     CGFloat y = self.freeY - CPOrbMargin;
     CGFloat h = CPOrbWindowSize;
@@ -500,6 +518,7 @@ const CGFloat CPBarWorkbenchWidth = 82.0;
 
 - (void)snapToEdge {
     NSScreen *screen = self.targetScreen;
+    if (!screen) return;
     NSRect visible = screen.visibleFrame;
     CGFloat w = [self currentWidth];
     CGFloat h = [self currentHeight];

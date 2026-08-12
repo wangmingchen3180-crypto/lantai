@@ -23,5 +23,6 @@
 @property NSString *lastAppliedSignature;         // 已应用数据的签名:一致则跳过全部重建
 @property NSInteger appliedRefreshCount;          // 实际执行渲染的轮次(自测断言用)
 - (void)applyAgents:(NSArray<CPAgent *> *)agents signature:(NSString *)signature;
+- (void)screenParametersChanged:(NSNotification *)note;
 @end
 

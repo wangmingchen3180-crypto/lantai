@@ -1,5 +1,6 @@
 #import "CPHUDController.h"
 #import "CPStatusEngine.h"
+#import "CPScreenPolicy.h"
 #import "CPRouting.h"
 #import "CPWorkbenchController.h"
 
@@ -90,8 +91,8 @@ const CGFloat CPHUDAgentRail = 64.0;
 }
 
 - (void)buildWindow {
-    NSScreen *screen = NSScreen.screens.firstObject ?: NSScreen.mainScreen;
-    NSRect visible = screen.visibleFrame;
+    NSScreen *screen = CPTargetScreen();
+    NSRect visible = screen ? screen.visibleFrame : NSMakeRect(0, 0, 1440, 900);
     NSRect collapsedFrame = [self collapsedFrameInVisibleRect:visible];
 
     self.window = [[NSPanel alloc] initWithContentRect:collapsedFrame
@@ -358,7 +359,16 @@ const CGFloat CPHUDAgentRail = 64.0;
 }
 
 - (NSScreen *)targetScreen {
-    return NSScreen.screens.firstObject ?: NSScreen.mainScreen;
+    return CPTargetScreen();
+}
+
+- (void)reclampCollapsedIfNeeded {
+    if (self.expanded) return;
+    NSScreen *screen = CPTargetScreen();
+    if (!screen) return;
+    [self.window setFrame:[self collapsedFrameInVisibleRect:screen.visibleFrame] display:YES];
+    [self layoutHandleToTopRightOfCarrier];
+    [self updateTracking];
 }
 
 - (NSRect)expandedFrameInVisibleRect:(NSRect)visible {
@@ -371,11 +381,15 @@ const CGFloat CPHUDAgentRail = 64.0;
 }
 
 - (NSRect)expandedFrame {
-    return [self expandedFrameInVisibleRect:self.targetScreen.visibleFrame];
+    NSScreen *screen = self.targetScreen;
+    if (!screen) return NSMakeRect(0, 0, CPHUDContentWidth + CPHUDInset * 2.0, CPHUDContentHeight + CPHUDInset * 2.0);
+    return [self expandedFrameInVisibleRect:screen.visibleFrame];
 }
 
 - (NSRect)collapsedFrame {
-    return [self collapsedFrameInVisibleRect:self.targetScreen.visibleFrame];
+    NSScreen *screen = self.targetScreen;
+    if (!screen) return NSMakeRect(0, 0, CPHUDCollapsedWidth, CPHUDCollapsedHeight);
+    return [self collapsedFrameInVisibleRect:screen.visibleFrame];
 }
 
 - (void)layoutHandleToTopRightOfCarrier {

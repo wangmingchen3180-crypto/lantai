@@ -3,6 +3,7 @@
 #import <sqlite3.h>
 
 #import "CPModels.h"
+#import "CPScreenPolicy.h"
 #import "CPStatusEngine.h"
 #import "CPReviewStore.h"
 #import "CPStateCache.h"

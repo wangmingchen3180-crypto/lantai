@@ -1,5 +1,6 @@
 #import "CPAppDelegate.h"
 #import "CPStatusEngine.h"
+#import "CPScreenPolicy.h"
 #import "CPReviewStore.h"
 #import "CPControls.h"
 
@@ -94,6 +95,10 @@
     [NSNotificationCenter.defaultCenter addObserver:self
                                            selector:@selector(agentSourcesChanged:)
                                                name:CPAgentSourcesChangedNotification
+                                             object:nil];
+    [NSNotificationCenter.defaultCenter addObserver:self
+                                           selector:@selector(screenParametersChanged:)
+                                               name:NSApplicationDidChangeScreenParametersNotification
                                              object:nil];
 
     [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent *(NSEvent *event) {
@@ -205,6 +210,15 @@
     self.lastAppliedSignature = nil;
     self.refreshGeneration += 1;
     [self refresh:nil];
+}
+
+- (void)screenParametersChanged:(NSNotification *)note {
+    (void)note;
+    // 拔显示器 / 改分辨率后把各窗口拉回主屏可见区；screens 为空时直接跳过。
+    if (!CPTargetScreen()) return;
+    [self.dock reclampToVisibleScreen];
+    [self.hud reclampCollapsedIfNeeded];
+    [self.card ensureFrameIntersectsVisibleScreen];
 }
 
 - (void)dockModeChanged:(NSNotification *)note {
