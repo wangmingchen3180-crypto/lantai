@@ -49,7 +49,7 @@ int CPRunUISelfTests(int argc, const char *argv[]) {
             // 展开状态来自用户 defaults,几何断言必须确定:统一按收起态测试。
             card.todoExpanded = NO;
             [card applyTodoExpandedState];
-            NSScreen *screen = NSScreen.screens.firstObject ?: NSScreen.mainScreen;
+            NSScreen *screen = CPTargetScreen();
             NSRect visible = screen ? screen.visibleFrame : NSZeroRect;
             BOOL hasScreen = !NSEqualRects(visible, NSZeroRect);
             NSRect testVisible = hasScreen ? visible : NSMakeRect(0, 0, 1680, 1050);
@@ -1244,7 +1244,7 @@ int CPRunUISelfTests(int argc, const char *argv[]) {
             [todoCard applyTodoExpandedState];
             // 展开时窗口 setFrame:animate:YES,先泵 runloop 等动画收尾,断言不读到中间帧。
             [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.6]];
-            NSScreen *todoScreen = todoCard.window.screen ?: NSScreen.screens.firstObject ?: NSScreen.mainScreen;
+            NSScreen *todoScreen = todoCard.window.screen ?: CPTargetScreen();
             // 与生产同一套定位契约:展开后窗口必须等于 CPCenteredRectInVisibleFrame 的结果
             // (空间不足时按 20pt 安全边距钳制,而非越出屏幕);不再用"必须绝对居中"的过时假设。
             NSRect todoExpected = todoScreen ? CPCenteredRectInVisibleFrame(todoScreen.visibleFrame,
@@ -1617,6 +1617,30 @@ int CPRunUISelfTests(int argc, const char *argv[]) {
                          m13FallbackOK && m13StaleOK && m13ScrollStruct && m13Scrollable &&
                          m13BackToTop && m13EmptyOK;
 
+            // C-4: 统一主屏策略 + 屏幕参数变化后悬浮球 reclamp（单屏可验证）。
+            NSScreen *policyScreen = CPTargetScreen();
+            BOOL screenPolicyOK = policyScreen != nil && policyScreen == NSScreen.screens.firstObject;
+            AppDelegate *screenAd = AppDelegate.new;
+            screenAd.dock = CPDockWindowController.new;
+            screenAd.card = CPWorkbenchCardController.new;
+            screenAd.hud = CPHUDWindowController.new;
+            [screenAd.dock show];
+            screenAd.dock.freeX = -5000;
+            screenAd.dock.freeY = -5000;
+            screenAd.dock.docked = NO;
+            [NSNotificationCenter.defaultCenter addObserver:screenAd
+                                                   selector:@selector(screenParametersChanged:)
+                                                       name:NSApplicationDidChangeScreenParametersNotification
+                                                     object:nil];
+            [NSNotificationCenter.defaultCenter postNotificationName:NSApplicationDidChangeScreenParametersNotification
+                                                              object:NSApp];
+            NSRect reclampVisible = policyScreen ? policyScreen.visibleFrame : NSZeroRect;
+            NSRect orbRect = NSMakeRect(screenAd.dock.freeX, screenAd.dock.freeY, CPOrbSize, CPOrbSize);
+            BOOL screenReclampOK = policyScreen != nil && NSContainsRect(reclampVisible, orbRect);
+            [NSNotificationCenter.defaultCenter removeObserver:screenAd
+                                                          name:NSApplicationDidChangeScreenParametersNotification
+                                                        object:nil];
+
             BOOL passed = centered && draggableHeader && labeledWorkbench && onlyRealAgents && labeledAgent && buttonReceivesClick &&
                           agentStatusDotsAligned && attentionBadgeClearsOnOpen &&
                           cardMasksToBounds && shadowCarrierNoMasks && cardIsChildOfShadowCarrier && windowHasWorkbenchInset &&
@@ -1624,7 +1648,8 @@ int CPRunUISelfTests(int argc, const char *argv[]) {
                           hudCollapsed6x72 && hudCollapsedOnMainScreen && hudExpandedSizeOK && hudExpandedOnMainScreen &&
                           shadowCarrierScales && handleAnchoredTopRight && contentNotSizable && hudClickViewIsBackgroundView &&
                           hudVisualFrameExact && hudExpandedHandleHidden && m2ui && m3ui && m3entries && m4ui && m5ui && m7ui && m8ui && m9ui && m10ui &&
-                          hoverResidualOK && hoverMotionOK && todoUI && perfUI && m13ui;
+                          hoverResidualOK && hoverMotionOK && todoUI && perfUI && m13ui &&
+                          screenPolicyOK && screenReclampOK;
             NSMutableString *result = [NSMutableString stringWithFormat:
                 @"Codex Pulse UI self-test: center=%@ drag=%@ workbench-label=%@ real-agents=%@ agent-label=%@ button-hit=%@ "
                 @"card-mask=%@ carrier-mask=%@ card-child=%@ win-inset=%@ card-520x402=%@ two-column=%@ right-overlay=%@ "
@@ -1835,6 +1860,9 @@ int CPRunUISelfTests(int argc, const char *argv[]) {
                 m13Scrollable ? @"OK" : @"FAIL",
                 m13BackToTop ? @"OK" : @"FAIL",
                 m13EmptyOK ? @"OK" : @"FAIL"];
+            [result appendFormat:@"C4 UI self-test(多屏): screen-policy=%@ screen-reclamp=%@\n",
+                screenPolicyOK ? @"OK" : @"FAIL",
+                screenReclampOK ? @"OK" : @"FAIL"];
             if (!centered) {
                 [result appendFormat:@"  diagnostic: testVisible=%@ cardFrame=%@ hasScreen=%@\n",
                  NSStringFromRect(testVisible), NSStringFromRect(cardFrame), hasScreen ? @"YES" : @"NO"];

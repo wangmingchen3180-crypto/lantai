@@ -72,5 +72,7 @@ FOUNDATION_EXPORT const CGFloat CPHUDAgentRail;
 
 - (void)expand;
 - (void)collapse;
+/// 屏幕参数变化后：收拢态重算贴边位置；展开态不动。
+- (void)reclampCollapsedIfNeeded;
 @end
 

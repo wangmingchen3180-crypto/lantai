@@ -1,5 +1,6 @@
 #import "CPWorkbenchController.h"
 #import "CPStatusEngine.h"
+#import "CPScreenPolicy.h"
 #import "CPAgentSources.h"
 #import "CPRouting.h"
 
@@ -601,7 +602,7 @@ NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
         frame.origin.y -= delta;
         frame.size.height += delta;
         BOOL visible = self.window.isVisible;
-        NSScreen *screen = self.window.screen ?: NSScreen.screens.firstObject ?: NSScreen.mainScreen;
+        NSScreen *screen = self.window.screen ?: CPTargetScreen();
         if (visible && screen) {
             frame = CPCenteredRectInVisibleFrame(screen.visibleFrame, frame.size);
         }
@@ -1547,8 +1548,22 @@ NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
 - (NSRect)targetFrameNearDockRect:(NSRect)rect edge:(NSRectEdge)edge {
     (void)rect;
     (void)edge;
-    NSScreen *screen = NSScreen.screens.firstObject ?: NSScreen.mainScreen;
+    NSScreen *screen = CPTargetScreen();
+    if (!screen) {
+        NSSize size = NSMakeSize(CPCardWidth + CPWorkbenchInset * 2.0, self.cardHeight + CPWorkbenchInset * 2.0);
+        return NSMakeRect(0, 0, size.width, size.height);
+    }
     return [self targetFrameInVisibleRect:screen.visibleFrame];
+}
+
+- (void)ensureFrameIntersectsVisibleScreen {
+    if (!self.window.isVisible) return;
+    NSScreen *screen = CPTargetScreen();
+    if (!screen) return;
+    NSRect visible = screen.visibleFrame;
+    if (NSIntersectsRect(self.window.frame, visible)) return;
+    NSRect target = [self targetFrameInVisibleRect:visible];
+    [self.window setFrame:target display:YES];
 }
 
 - (void)showNearDockRect:(NSRect)rect edge:(NSRectEdge)edge {

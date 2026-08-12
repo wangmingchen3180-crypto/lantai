@@ -52,6 +52,8 @@ FOUNDATION_EXPORT const CGFloat CPBarWorkbenchWidth;
 - (void)renderWithAgents:(NSArray<CPAgent *> *)agents selectedAgent:(CPAgent *)agent;
 - (NSRect)dockRect;
 - (void)setMode:(NSInteger)mode;
+/// 屏幕参数变化后：复用吸附/Y clamp，把悬浮球拉回主显示器可见区。
+- (void)reclampToVisibleScreen;
 - (void)updateOrbRipples;
 - (void)pillMouseDown:(NSEvent *)event;
 - (void)pillMouseDragged:(NSEvent *)event;
