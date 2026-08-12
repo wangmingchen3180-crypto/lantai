@@ -12,6 +12,12 @@ typedef NS_ENUM(NSInteger, CPDisplayStatus) {
     CPDisplayStatusFailed
 };
 
+// 数据源健康度:OK=正常可读;Missing=约定文件缺失或打不开(与"真的没有任务"区分)。
+typedef NS_ENUM(NSInteger, CPAgentHealth) {
+    CPAgentHealthOK = 0,
+    CPAgentHealthMissing,
+};
+
 @interface CPTask : NSObject
 @property NSString *taskID;
 @property NSString *title;
@@ -33,6 +39,7 @@ typedef NS_ENUM(NSInteger, CPDisplayStatus) {
 @property NSColor *color;
 @property BOOL placeholder;
 @property CPStatus status;
+@property CPAgentHealth health; // 缺省 CPAgentHealthOK;各 source 在数据不可用时置 Missing
 @property NSMutableArray<CPTask *> *tasks;
 @end
 

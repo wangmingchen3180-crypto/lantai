@@ -2468,7 +2468,37 @@ int CPRunSelfTests(int argc, const char *argv[]) {
             printf("Todo schema self-test: user-version=%s\n", todoSchemaOK ? "OK" : "FAIL");
             [[NSFileManager defaultManager] removeItemAtPath:todoSchemaPath error:nil];
 
-            return (taskCount > 0 && internalThreadsFiltered && m2 && grandfatherIdempotent && taskRoutingOK && m6 && kimiOK && perfOK && todoSchemaOK) ? 0 : 2;
+            // C-2: Codex state_*/logs_* glob 取最高版本 + 缺失时 health=Missing。
+            NSString *codexGlobRoot = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                [NSString stringWithFormat:@"codexpulse-codex-glob-%d", NSProcessInfo.processInfo.processIdentifier]];
+            [[NSFileManager defaultManager] removeItemAtPath:codexGlobRoot error:nil];
+            [[NSFileManager defaultManager] createDirectoryAtPath:codexGlobRoot withIntermediateDirectories:YES attributes:nil error:nil];
+            [@"" writeToFile:[codexGlobRoot stringByAppendingPathComponent:@"state_4.sqlite"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            [@"" writeToFile:[codexGlobRoot stringByAppendingPathComponent:@"state_5.sqlite"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            [@"" writeToFile:[codexGlobRoot stringByAppendingPathComponent:@"logs_1.sqlite"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            [@"" writeToFile:[codexGlobRoot stringByAppendingPathComponent:@"logs_2.sqlite"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            [@"" writeToFile:[codexGlobRoot stringByAppendingPathComponent:@"state_5.sqlite.bak"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            NSString *pickedState = CPCodexHighestVersionedSQLite(codexGlobRoot, @"state");
+            NSString *pickedLogs = CPCodexHighestVersionedSQLite(codexGlobRoot, @"logs");
+            BOOL codexGlobOK = [pickedState.lastPathComponent isEqualToString:@"state_5.sqlite"] &&
+                               [pickedLogs.lastPathComponent isEqualToString:@"logs_2.sqlite"];
+            [[NSFileManager defaultManager] removeItemAtPath:codexGlobRoot error:nil];
+
+            NSString *codexMissingRoot = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                [NSString stringWithFormat:@"codexpulse-codex-missing-%d", NSProcessInfo.processInfo.processIdentifier]];
+            [[NSFileManager defaultManager] removeItemAtPath:codexMissingRoot error:nil];
+            [[NSFileManager defaultManager] createDirectoryAtPath:codexMissingRoot withIntermediateDirectories:YES attributes:nil error:nil];
+            setenv("CP_CODEX_ROOT", codexMissingRoot.fileSystemRepresentation, 1);
+            CPAgent *codexMissingAgent = [[[CPCodexSource alloc] initWithCache:CPStateCache.new] readAgent];
+            BOOL codexHealthMissingOK = codexMissingAgent.health == CPAgentHealthMissing &&
+                                        codexMissingAgent.tasks.count == 0 &&
+                                        !codexMissingAgent.placeholder;
+            unsetenv("CP_CODEX_ROOT");
+            [[NSFileManager defaultManager] removeItemAtPath:codexMissingRoot error:nil];
+            printf("Codex health self-test: codex-glob=%s codex-health-missing=%s\n",
+                   codexGlobOK ? "OK" : "FAIL", codexHealthMissingOK ? "OK" : "FAIL");
+
+            return (taskCount > 0 && internalThreadsFiltered && m2 && grandfatherIdempotent && taskRoutingOK && m6 && kimiOK && perfOK && todoSchemaOK && codexGlobOK && codexHealthMissingOK) ? 0 : 2;
 }
 
 

@@ -125,10 +125,42 @@ NSArray<NSString *> *CPEnabledAgentProviderIDs(void) {
     return valid;
 }
 
+// Codex 数据根:默认同 ~/.codex;自测可用 CP_CODEX_ROOT 指向临时目录。
+static NSString *CPCodexRoot(void) {
+    NSString *override = NSProcessInfo.processInfo.environment[@"CP_CODEX_ROOT"];
+    if (override.length) return override;
+    return [NSHomeDirectory() stringByAppendingPathComponent:@".codex"];
+}
+
+// 枚举 `{stem}_N.sqlite`,取 N 最大者。缓存键仍是完整路径,版本升级后自然换键。
+NSString *CPCodexHighestVersionedSQLite(NSString *directory, NSString *stem) {
+    if (!directory.length || !stem.length) return nil;
+    NSArray<NSString *> *names = [NSFileManager.defaultManager contentsOfDirectoryAtPath:directory error:nil];
+    if (!names.count) return nil;
+    NSString *prefix = [stem stringByAppendingString:@"_"];
+    NSString *suffix = @".sqlite";
+    NSString *bestName = nil;
+    NSInteger bestVersion = -1;
+    NSCharacterSet *nonDigits = NSCharacterSet.decimalDigitCharacterSet.invertedSet;
+    for (NSString *name in names) {
+        if (![name hasPrefix:prefix] || ![name hasSuffix:suffix]) continue;
+        NSUInteger midLen = name.length - prefix.length - suffix.length;
+        if (midLen == 0) continue;
+        NSString *mid = [name substringWithRange:NSMakeRange(prefix.length, midLen)];
+        if ([mid rangeOfCharacterFromSet:nonDigits].location != NSNotFound) continue;
+        NSInteger version = mid.integerValue;
+        if (version > bestVersion) {
+            bestVersion = version;
+            bestName = name;
+        }
+    }
+    return bestName ? [directory stringByAppendingPathComponent:bestName] : nil;
+}
+
 BOOL CPAgentProviderIsDetected(NSString *providerID) {
     NSString *home = NSHomeDirectory();
     if ([providerID isEqualToString:@"codex"]) {
-        return [NSFileManager.defaultManager fileExistsAtPath:[home stringByAppendingPathComponent:@".codex/state_5.sqlite"]];
+        return CPCodexHighestVersionedSQLite(CPCodexRoot(), @"state") != nil;
     }
     if ([providerID isEqualToString:@"kimi"]) {
         NSString *db = [home stringByAppendingPathComponent:@"Library/Application Support/kimi-desktop/daimon-share/daimon/agents/main/sessions/hosted-logical/conversations.sqlite"];
@@ -191,22 +223,35 @@ CPStatus CPOverallStatusForTasks(NSArray<CPTask *> *tasks) {
     agent.iconName = @"terminal.fill";
     agent.color = CPAccent();
     agent.placeholder = NO;
+    agent.health = CPAgentHealthOK;
     agent.tasks = NSMutableArray.array;
 
-    NSString *home = NSHomeDirectory();
-    NSString *statePath = [home stringByAppendingPathComponent:@".codex/state_5.sqlite"];
+    NSString *codexRoot = CPCodexRoot();
+    NSString *statePath = CPCodexHighestVersionedSQLite(codexRoot, @"state");
+    if (!statePath.length) {
+        // schema 文件名升级后本机无任何 state_*.sqlite → 监控失效,不是"没任务"。
+        agent.health = CPAgentHealthMissing;
+        agent.status = CPStatusIdle;
+        return agent;
+    }
     sqlite3 *stateDB = NULL;
     if (sqlite3_open_v2(statePath.UTF8String, &stateDB, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK) {
         if (stateDB) sqlite3_close(stateDB);
+        agent.health = CPAgentHealthMissing;
         agent.status = CPStatusIdle;
         return agent;
     }
     sqlite3_busy_timeout(stateDB, 150);
 
-    NSString *logsPath = [home stringByAppendingPathComponent:@".codex/logs_2.sqlite"];
+    // logs 可选:取最高版本;缺失时仍可读 threads,活动文案走 rollout 兜底。
+    NSString *logsPath = CPCodexHighestVersionedSQLite(codexRoot, @"logs");
     sqlite3 *logsDB = NULL;
-    if (sqlite3_open_v2(logsPath.UTF8String, &logsDB, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, NULL) == SQLITE_OK) {
+    if (logsPath.length &&
+        sqlite3_open_v2(logsPath.UTF8String, &logsDB, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, NULL) == SQLITE_OK) {
         sqlite3_busy_timeout(logsDB, 150);
+    } else if (logsDB) {
+        sqlite3_close(logsDB);
+        logsDB = NULL;
     }
 
     sqlite3_stmt *stmt = NULL;

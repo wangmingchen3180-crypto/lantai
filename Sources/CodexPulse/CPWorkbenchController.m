@@ -1225,7 +1225,8 @@ NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     self.centerMeta.stringValue = [NSString stringWithFormat:@"%lu 个活动 · %ld 个需关注", (unsigned long)tasks.count, (long)attention];
 
     if (!tasks.count) {
-        [self.taskStack addArrangedSubview:CPLabel(@"暂无活动任务", 12, NSFontWeightRegular, CPMuted())];
+        NSString *emptyText = (agent.health == CPAgentHealthMissing) ? @"数据源不可用" : @"暂无活动任务";
+        [self.taskStack addArrangedSubview:CPLabel(emptyText, 12, NSFontWeightRegular, CPMuted())];
         self.selectedTask = nil;
         [self closeDetailDrawer];
     } else {

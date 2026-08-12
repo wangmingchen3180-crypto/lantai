@@ -55,3 +55,6 @@ NSDate * CPDateFromISO8601(NSString * value);
 CPRolloutState * CPReadRolloutState(NSString *path);
 
 FOUNDATION_EXPORT const char *CPCodexVisibleThreadsSQL;
+// 在 directory 中枚举 `{stem}_*.sqlite`,解析数字后缀,返回版本号最高者的完整路径;无匹配返回 nil。
+// stem 例:"state" / "logs"。供 CPCodexSource 与自测共用。
+FOUNDATION_EXPORT NSString *CPCodexHighestVersionedSQLite(NSString *directory, NSString *stem);
