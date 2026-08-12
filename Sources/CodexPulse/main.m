@@ -2054,16 +2054,37 @@ static const NSInteger CPKimiWireCandidateLimit = 80;
         return nil;
     }
     sqlite3_busy_timeout(_db, 150);
-    const char *sql =
-        "CREATE TABLE IF NOT EXISTS todos("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-        "title TEXT NOT NULL, "
-        "completed INTEGER NOT NULL DEFAULT 0, "
-        "agent_id TEXT NULL, "
-        "thread_id TEXT NULL, "
-        "created_at REAL NOT NULL, "
-        "updated_at REAL NOT NULL)";
-    sqlite3_exec(_db, sql, NULL, NULL, NULL);
+    // schema 版本:user_version=0 表示未初始化;升级走 switch 式迁移,当前仅 0→1 建表。
+    int userVersion = 0;
+    sqlite3_stmt *verStmt = NULL;
+    if (sqlite3_prepare_v2(_db, "PRAGMA user_version", -1, &verStmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(verStmt) == SQLITE_ROW) userVersion = sqlite3_column_int(verStmt, 0);
+    }
+    if (verStmt) sqlite3_finalize(verStmt);
+    switch (userVersion) {
+        case 0: {
+            const char *sql =
+                "CREATE TABLE IF NOT EXISTS todos("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "title TEXT NOT NULL, "
+                "completed INTEGER NOT NULL DEFAULT 0, "
+                "agent_id TEXT NULL, "
+                "thread_id TEXT NULL, "
+                "created_at REAL NOT NULL, "
+                "updated_at REAL NOT NULL)";
+            char *errmsg = NULL;
+            if (sqlite3_exec(_db, sql, NULL, NULL, &errmsg) != SQLITE_OK) {
+                NSLog(@"[CPTodoStore] migrate 0→1 CREATE TABLE failed: %s", errmsg ? errmsg : sqlite3_errmsg(_db));
+                if (errmsg) sqlite3_free(errmsg);
+            } else if (sqlite3_exec(_db, "PRAGMA user_version = 1", NULL, NULL, &errmsg) != SQLITE_OK) {
+                NSLog(@"[CPTodoStore] migrate 0→1 set user_version failed: %s", errmsg ? errmsg : sqlite3_errmsg(_db));
+                if (errmsg) sqlite3_free(errmsg);
+            }
+            break;
+        }
+        default:
+            break; // 已是最新或未知更高版本:保持只读兼容,将来在此加 case
+    }
     return self;
 }
 
@@ -2111,9 +2132,15 @@ static const NSInteger CPKimiWireCandidateLimit = 80;
     if (!_db) return NO;
     sqlite3_stmt *stmt = NULL;
     BOOL ok = NO;
-    if (sqlite3_prepare_v2(_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+    int rc = sqlite3_prepare_v2(_db, sql, -1, &stmt, NULL);
+    if (rc == SQLITE_OK) {
         if (bind) bind(stmt);
         ok = sqlite3_step(stmt) == SQLITE_DONE;
+        if (!ok) {
+            NSLog(@"[CPTodoStore] exec step failed: %s | sql=%s", sqlite3_errmsg(_db), sql);
+        }
+    } else {
+        NSLog(@"[CPTodoStore] exec prepare failed: %s | sql=%s", sqlite3_errmsg(_db), sql);
     }
     if (stmt) sqlite3_finalize(stmt);
     return ok;
@@ -2129,7 +2156,10 @@ static const NSInteger CPKimiWireCandidateLimit = 80;
         sqlite3_bind_double(stmt, 2, now);
         sqlite3_bind_double(stmt, 3, now);
     }];
-    if (!ok) return nil;
+    if (!ok) {
+        NSLog(@"[CPTodoStore] addTodo failed: %s", _db ? sqlite3_errmsg(_db) : "no db");
+        return nil;
+    }
     CPTodo *todo = CPTodo.new;
     todo.todoID = (NSInteger)sqlite3_last_insert_rowid(_db);
     todo.title = trimmed;
@@ -2141,30 +2171,36 @@ static const NSInteger CPKimiWireCandidateLimit = 80;
 
 - (void)setTodo:(NSInteger)todoID completed:(BOOL)completed {
     NSTimeInterval now = NSDate.date.timeIntervalSince1970;
-    [self exec:"UPDATE todos SET completed=?, updated_at=? WHERE id=?"
-         bind:^(sqlite3_stmt *stmt) {
+    BOOL ok = [self exec:"UPDATE todos SET completed=?, updated_at=? WHERE id=?"
+                    bind:^(sqlite3_stmt *stmt) {
         sqlite3_bind_int(stmt, 1, completed ? 1 : 0);
         sqlite3_bind_double(stmt, 2, now);
         sqlite3_bind_int64(stmt, 3, todoID);
     }];
+    if (!ok) NSLog(@"[CPTodoStore] setTodo(%ld) completed=%d failed: %s",
+                   (long)todoID, (int)completed, _db ? sqlite3_errmsg(_db) : "no db");
 }
 
 - (void)updateTodo:(NSInteger)todoID title:(NSString *)title {
     NSString *trimmed = [title stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     if (!trimmed.length) return;
-    [self exec:"UPDATE todos SET title=?, updated_at=? WHERE id=?"
-         bind:^(sqlite3_stmt *stmt) {
+    BOOL ok = [self exec:"UPDATE todos SET title=?, updated_at=? WHERE id=?"
+                    bind:^(sqlite3_stmt *stmt) {
         sqlite3_bind_text(stmt, 1, trimmed.UTF8String, -1, SQLITE_TRANSIENT);
         sqlite3_bind_double(stmt, 2, NSDate.date.timeIntervalSince1970);
         sqlite3_bind_int64(stmt, 3, todoID);
     }];
+    if (!ok) NSLog(@"[CPTodoStore] updateTodo(%ld) failed: %s",
+                   (long)todoID, _db ? sqlite3_errmsg(_db) : "no db");
 }
 
 - (void)deleteTodo:(NSInteger)todoID {
-    [self exec:"DELETE FROM todos WHERE id=?"
-         bind:^(sqlite3_stmt *stmt) {
+    BOOL ok = [self exec:"DELETE FROM todos WHERE id=?"
+                    bind:^(sqlite3_stmt *stmt) {
         sqlite3_bind_int64(stmt, 1, todoID);
     }];
+    if (!ok) NSLog(@"[CPTodoStore] deleteTodo(%ld) failed: %s",
+                   (long)todoID, _db ? sqlite3_errmsg(_db) : "no db");
 }
 
 @end
@@ -6827,6 +6863,19 @@ int main(int argc, const char *argv[]) {
             CPTodo *t2Persisted = todoReopen.allTodos.firstObject;
             BOOL todoPersist = todoReopen.allTodos.count == 1 && [t2Persisted.title isEqualToString:@"第二条改"];
             BOOL todoAgentNull = t2Persisted.agentID == nil && t2Persisted.threadID == nil; // 预留字段恒 NULL
+            // schema 版本:新建库经 0→1 迁移后 user_version 必须为 1
+            int todoUV = -1;
+            sqlite3 *todoVerDB = NULL;
+            if (sqlite3_open_v2(todoTestPath.UTF8String, &todoVerDB, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+                sqlite3_stmt *todoVerStmt = NULL;
+                if (sqlite3_prepare_v2(todoVerDB, "PRAGMA user_version", -1, &todoVerStmt, NULL) == SQLITE_OK &&
+                    sqlite3_step(todoVerStmt) == SQLITE_ROW) {
+                    todoUV = sqlite3_column_int(todoVerStmt, 0);
+                }
+                if (todoVerStmt) sqlite3_finalize(todoVerStmt);
+            }
+            if (todoVerDB) sqlite3_close(todoVerDB);
+            BOOL todoUserVersion = todoUV == 1;
 
             CPWorkbenchCardController *todoCard = CPWorkbenchCardController.new;
             todoCard.todoExpanded = NO;
@@ -7059,7 +7108,7 @@ int main(int argc, const char *argv[]) {
             BOOL hoverMotionOK = scrollHoverShown && scrollClearsHover && todoRowRestoreOK && rapidHoverOK;
 
             BOOL todoUI = todoAdd && todoBlankIgnored && todoComplete && todoRestore && todoEdit && todoDelete &&
-                          todoPersist && todoAgentNull && todoStrip && todoNoOverlay && todoExpand &&
+                          todoPersist && todoAgentNull && todoUserVersion && todoStrip && todoNoOverlay && todoExpand &&
                           todoAutoReposition && todoExpandNoOverlay && todoCardStyle && todoUICount && todoBadgeIsolated &&
                           todoBStyle && todoCollapsedGeo && todoChevronOK;
 
@@ -7374,7 +7423,7 @@ int main(int argc, const char *argv[]) {
                 hoverMoveCleared ? @"OK" : @"FAIL",
                 hoverHideCleared ? @"OK" : @"FAIL",
                 hoverRemoveCleared ? @"OK" : @"FAIL"];
-            [result appendFormat:@"Todo self-test: add=%@ blank-ignored=%@ complete=%@ restore=%@ edit=%@ delete=%@ persist=%@ agent-null=%@ strip=%@ no-overlay=%@ expand=%@ auto-reposition=%@ expand-no-overlay=%@ card-style=%@ ui-count=%@ badge-isolated=%@\n",
+            [result appendFormat:@"Todo self-test: add=%@ blank-ignored=%@ complete=%@ restore=%@ edit=%@ delete=%@ persist=%@ agent-null=%@ user-version=%@ strip=%@ no-overlay=%@ expand=%@ auto-reposition=%@ expand-no-overlay=%@ card-style=%@ ui-count=%@ badge-isolated=%@\n",
                 todoAdd ? @"OK" : @"FAIL",
                 todoBlankIgnored ? @"OK" : @"FAIL",
                 todoComplete ? @"OK" : @"FAIL",
@@ -7383,6 +7432,7 @@ int main(int argc, const char *argv[]) {
                 todoDelete ? @"OK" : @"FAIL",
                 todoPersist ? @"OK" : @"FAIL",
                 todoAgentNull ? @"OK" : @"FAIL",
+                todoUserVersion ? @"OK" : @"FAIL",
                 todoStrip ? @"OK" : @"FAIL",
                 todoNoOverlay ? @"OK" : @"FAIL",
                 todoExpand ? @"OK" : @"FAIL",
@@ -8013,7 +8063,29 @@ int main(int argc, const char *argv[]) {
                 rollCacheHit ? @"OK" : @"FAIL", rollCacheInvalidate ? @"OK" : @"FAIL",
                 kimiSigStable ? @"OK" : @"FAIL"];
             fputs(perfLine.UTF8String, stdout);
-            return (taskCount > 0 && internalThreadsFiltered && m2 && taskRoutingOK && m6 && kimiOK && perfOK) ? 0 : 2;
+
+            // Todo schema:新建库经 0→1 迁移后 user_version=1,写路径仍可用。
+            NSString *todoSchemaPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                [NSString stringWithFormat:@"codexpulse-todo-schema-%d.sqlite", NSProcessInfo.processInfo.processIdentifier]];
+            [[NSFileManager defaultManager] removeItemAtPath:todoSchemaPath error:nil];
+            CPTodoStore *todoSchemaStore = [[CPTodoStore alloc] initWithPath:todoSchemaPath];
+            CPTodo *todoSchemaItem = [todoSchemaStore addTodoWithTitle:@"schema-v1"];
+            int todoSchemaUV = -1;
+            sqlite3 *todoSchemaDB = NULL;
+            if (sqlite3_open_v2(todoSchemaPath.UTF8String, &todoSchemaDB, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+                sqlite3_stmt *todoSchemaStmt = NULL;
+                if (sqlite3_prepare_v2(todoSchemaDB, "PRAGMA user_version", -1, &todoSchemaStmt, NULL) == SQLITE_OK &&
+                    sqlite3_step(todoSchemaStmt) == SQLITE_ROW) {
+                    todoSchemaUV = sqlite3_column_int(todoSchemaStmt, 0);
+                }
+                if (todoSchemaStmt) sqlite3_finalize(todoSchemaStmt);
+            }
+            if (todoSchemaDB) sqlite3_close(todoSchemaDB);
+            BOOL todoSchemaOK = todoSchemaStore && todoSchemaItem && todoSchemaUV == 1;
+            printf("Todo schema self-test: user-version=%s\n", todoSchemaOK ? "OK" : "FAIL");
+            [[NSFileManager defaultManager] removeItemAtPath:todoSchemaPath error:nil];
+
+            return (taskCount > 0 && internalThreadsFiltered && m2 && taskRoutingOK && m6 && kimiOK && perfOK && todoSchemaOK) ? 0 : 2;
         }
         if (argc > 1 && strcmp(argv[1], "--kimi-probe") == 0) {
             // 只读真实验证:Kimi App conversations.sqlite + 客户端状态是否被识别。
