@@ -533,7 +533,8 @@ const CGFloat CPHUDAgentRail = 64.0;
     // 右侧只渲染当前选中 Agent 的真实任务,全部建卡,任务区内纵向滚动浏览。
     NSArray<CPTask *> *displayTasks = agent.tasks;
     if (displayTasks.count == 0) {
-        NSTextField *empty = [NSTextField labelWithString:@"当前没有任务"];
+        NSString *emptyText = (agent.health == CPAgentHealthMissing) ? @"数据源不可用" : @"当前没有任务";
+        NSTextField *empty = [NSTextField labelWithString:emptyText];
         empty.font = [NSFont systemFontOfSize:12 weight:NSFontWeightRegular];
         empty.textColor = CPMuted();
         [self.taskList addArrangedSubview:empty];
