@@ -4,6 +4,7 @@
 #import "CPReviewStore.h"
 #import "CPControls.h"
 #import "CPDemoSource.h"
+#import "CPScreenshots.h"
 
 #pragma mark - App Delegate
 
@@ -75,6 +76,8 @@
             }
         }
     }
+
+    if (self.shotOutputDir.length) CPCaptureScreenshots(self, self.shotOutputDir);
 
     [self updateStatusBar];
 

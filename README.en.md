@@ -6,6 +6,8 @@ A light in your menu bar that tells you whether your local AI agents are done, a
 
 [中文](README.md) · [Download](https://github.com/wangmingchen3180-crypto/lantai/releases) · [MIT](LICENSE) · macOS 14+
 
+![Lantai workbench](docs/images/workbench.png)
+
 ## The problem
 
 You have Codex Desktop and Kimi open at the same time. You kick off a few tasks and go do something else. Ten minutes later you start wondering: are they finished? Is one of them stuck waiting for me to approve something?
@@ -30,6 +32,14 @@ Ordered by how much they interrupt you:
 | **Floating orb** | Docks to a screen edge; expanding ripples mean something is alive |
 | **HUD drawer** | Slides in from the right, one column per agent |
 | **Workbench** | Full task list, detail, deep link back, plus a local todo bar |
+
+The HUD drawer gives each agent a column — agents on the left rail, that agent's tasks on the right:
+
+![HUD drawer](docs/images/hud.png)
+
+Clicking a task opens its detail rather than jumping away. Confirm it's the one you wanted, then click "open in Codex." The first click only looks; the second one navigates. That keeps a stray click from throwing you out of whatever you were doing:
+
+![Task detail](docs/images/workbench-detail.png)
 
 The ripple isn't decoration. It means "something is alive," and its period is bound to state: 8s when failed, 14s when idle. With macOS Reduce Motion on, everything freezes into a single static status ring.
 

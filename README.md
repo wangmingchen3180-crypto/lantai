@@ -6,6 +6,8 @@
 
 [English](README.en.md) · [下载](https://github.com/wangmingchen3180-crypto/lantai/releases) · [MIT](LICENSE) · macOS 14+
 
+![澜台工作台](docs/images/workbench.png)
+
 ## 它解决什么
 
 你同时开着 Codex Desktop 和 Kimi，派出去几个任务，转头去干别的。过十分钟开始犯嘀咕：跑完了吗？有没有哪个卡在等我确认？
@@ -30,6 +32,14 @@
 | **悬浮球** | 贴在桌面边缘，一圈圈涟漪表示有东西在跑，快慢对应状态 |
 | **HUD 抽屉** | 从右侧拉出，按 Agent 分栏，扫一眼各自在忙什么 |
 | **工作台** | 完整任务列表、详情、跳回原应用，底部一栏本地待办 |
+
+HUD 抽屉按 Agent 分栏，左边一列是 Agent，右边是它当前的任务：
+
+![HUD 抽屉](docs/images/hud.png)
+
+点进任务是详情，不是直接跳走。确认这条确实是你要找的，再点「在 Codex 中打开」——一级点击只看，二级点击才跳，避免手滑把你从当前上下文里踢出去：
+
+![任务详情](docs/images/workbench-detail.png)
 
 涟漪不是装饰。它只表示「有东西在活着」，扩散周期绑定状态：失败最快 8 秒，待机最慢 14 秒。开了系统的「减少动态效果」就全部静止，只留一圈状态环。
 
