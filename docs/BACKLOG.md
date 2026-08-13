@@ -17,7 +17,7 @@
 
 产品定名**澜台**，英文 **Lantai**。澜取涟漪，台取观察台，正好对应「用涟漪表达状态的本地 Agent 观察台」。
 
-完整的候选清单、每个名字的排除理由和检索证据见 [docs/NAMING.md](docs/NAMING.md)。简述：Buoy、Pond、Sonar、Ripple、Crest、Tarn、观澜、Lagoon 八个候选全部已被占用，其中四个直接撞在 AI Agent 工具这一小块上；听澜、静池、枕流、漪台查过无同名但因词义或读音落选。
+完整的候选清单、每个名字的排除理由和检索证据见 [NAMING.md](NAMING.md)。简述：Buoy、Pond、Sonar、Ripple、Crest、Tarn、观澜、Lagoon 八个候选全部已被占用，其中四个直接撞在 AI Agent 工具这一小块上；听澜、静池、枕流、漪台查过无同名但因词义或读音落选。
 
 已完成：
 
@@ -35,7 +35,7 @@
 
 ## 涟漪设计语言
 
-完整规格、实验室三条路线的取舍、以及身份件怎么做，见 [docs/DESIGN.md](docs/DESIGN.md)。下面只列待办。
+完整规格、实验室三条路线的取舍、以及身份件怎么做，见 [DESIGN.md](DESIGN.md)。下面只列待办。
 
 **已落地（不要重开三条路线）：** HUD 选中态与悬浮球的运行时涟漪，`CPRippleView`，8 层明暗成对、基准 12s、状态只改周期。定稿原型是 `ripple-selection-preview.html`。`ripple-style-lab.html` 是实验室。`multitask-status-prototype.html` 已否决。
 
@@ -51,6 +51,8 @@
 ## 皮肤与主题（后续）
 
 可行，但只做「换色」，不做「整套换皮」。现状已经有一层颜色入口（`CPAccent` / `CPBg` / `CPSurface` / 状态色），数值仍写死在 `CPDyn` 里；部分 `CALayer.CGColor` 是快照，换肤时要重新赋值，否则灯和描边会留在旧色上。
+
+成本已实测量化，见 [UI_ARCHITECTURE.md](UI_ARCHITECTURE.md)：换色便宜（13 个函数覆盖 142 个调用点），运行时切换要处理 65 处 `CGColor` 快照，换密度要先收拢约 160 个散落字面量。那份文档还定死了一条边界——**皮肤不许承载交互变化**，否则皮肤配置会长成万能开关。
 
 首版范围：
 
@@ -93,7 +95,7 @@
 
 每接一个都必须满足三条：
 
-- 走 [docs/AGENT_ADAPTERS.md](docs/AGENT_ADAPTERS.md) 已定义的适配器边界，只读，不改写对方数据。
+- 走 [AGENT_ADAPTERS.md](AGENT_ADAPTERS.md) 已定义的适配器边界，只读，不改写对方数据。
 - 带健康度（复用 `CPAgentHealth`）。路径不存在、库打不开、schema 不认识时，界面要明确显示「数据源不可用」，不允许静默退化成「没有任务」——这正是 Codex 数据源那次问题的成因。
 - 深链能力要写清楚：能精确跳回具体会话的和只能唤起应用的分开标注，不把「打开了应用」当成「打开了那个任务」。
 

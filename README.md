@@ -129,12 +129,15 @@ open -n outputs/Lantai.app --args --demo
 
 ## 文档
 
+全部文档在 [docs/](docs/README.md)，索引在那里。常用的几篇：
+
 | | |
 | --- | --- |
 | [docs/AGENT_ADAPTERS.md](docs/AGENT_ADAPTERS.md) | 怎么加一个只读适配器 |
 | [docs/DESIGN.md](docs/DESIGN.md) | 涟漪规格，以及还没做完的图标和 Logo |
+| [docs/UI_ARCHITECTURE.md](docs/UI_ARCHITECTURE.md) | 改 UI 的实际成本与皮肤边界 |
 | [docs/NAMING.md](docs/NAMING.md) | 命名决策与撞名记录 |
-| [BACKLOG.md](BACKLOG.md) | 版本路线和未做事项 |
+| [docs/BACKLOG.md](docs/BACKLOG.md) | 版本路线和未做事项 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 贡献约束 |
 
 ## License

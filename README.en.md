@@ -127,12 +127,15 @@ Personal project, unofficial, unaffiliated with OpenAI or Moonshot. Currently al
 
 ## Docs
 
+Everything lives in [docs/](docs/README.md); the index is there. The ones you'll want most:
+
 | | |
 | --- | --- |
 | [docs/AGENT_ADAPTERS.md](docs/AGENT_ADAPTERS.md) | Writing a read-only adapter |
 | [docs/DESIGN.md](docs/DESIGN.md) | Ripple spec, and the icon work still outstanding |
+| [docs/UI_ARCHITECTURE.md](docs/UI_ARCHITECTURE.md) | What changing the UI actually costs; skin boundaries |
 | [docs/NAMING.md](docs/NAMING.md) | Naming decisions and collision research |
-| [BACKLOG.md](BACKLOG.md) | Roadmap |
+| [docs/BACKLOG.md](docs/BACKLOG.md) | Roadmap |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution constraints |
 
 ## License

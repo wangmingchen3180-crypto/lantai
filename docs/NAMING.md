@@ -42,4 +42,4 @@ Stillpond、Wavedeck。属于「英文合成词」方向，在确定以中文名
 
 ## 落地范围
 
-改名只覆盖显示层，不做数据迁移。具体改了什么、刻意没改什么，见 [BACKLOG.md](../BACKLOG.md) 的「命名（已落地）」一节。视觉与涟漪规格见 [DESIGN.md](DESIGN.md)。
+改名只覆盖显示层，不做数据迁移。具体改了什么、刻意没改什么，见 [BACKLOG.md](BACKLOG.md) 的「命名（已落地）」一节。视觉与涟漪规格见 [DESIGN.md](DESIGN.md)。
