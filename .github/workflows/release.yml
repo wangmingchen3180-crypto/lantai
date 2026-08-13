@@ -37,4 +37,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          # tag 推送可能早于 release 创建，缺了就先建一个，避免上传踩空。
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --generate-notes
           gh release upload "$TAG" "Lantai-${TAG}-macos.zip" --clobber

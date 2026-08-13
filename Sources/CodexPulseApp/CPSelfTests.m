@@ -2569,7 +2569,13 @@ int CPRunSelfTests(int argc, const char *argv[]) {
             printf("Codex health self-test: codex-glob=%s codex-health-missing=%s\n",
                    codexGlobOK ? "OK" : "FAIL", codexHealthMissingOK ? "OK" : "FAIL");
 
-            return (taskCount > 0 && internalThreadsFiltered && m2 && grandfatherIdempotent && taskRoutingOK && m6 && kimiOK && perfOK && todoSchemaOK && codexGlobOK && codexHealthMissingOK) ? 0 : 2;
+            // taskCount 是环境事实而非断言:没装 Codex/Kimi 的机器(CI runner、纯贡献者)
+            // 读到 0 个任务是正确结果,不该判失败。下面全部断言都跑 fixture,与本机数据无关。
+            printf("Local agent data: %s (%ld tasks)\n",
+                   taskCount > 0 ? "present" : "none — fixture assertions only",
+                   (long)taskCount);
+
+            return (internalThreadsFiltered && m2 && grandfatherIdempotent && taskRoutingOK && m6 && kimiOK && perfOK && todoSchemaOK && codexGlobOK && codexHealthMissingOK) ? 0 : 2;
 }
 
 
