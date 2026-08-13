@@ -1,0 +1,40 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and attach to (e.g. v0.3.0)'
+        required: true
+
+jobs:
+  release:
+    runs-on: macos-14
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: zsh scripts/build-app.sh
+
+      - name: Self-test
+        run: '"outputs/Lantai.app/Contents/MacOS/CodexPulse" --self-test'
+
+      # ditto 保留 bundle 结构与扩展属性，直接 zip 会破坏 .app 的符号链接与签名。
+      - name: Package
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "outputs/Lantai.app" "Lantai-${TAG}-macos.zip"
+          shasum -a 256 "Lantai-${TAG}-macos.zip" | tee checksum.txt
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          gh release upload "$TAG" "Lantai-${TAG}-macos.zip" --clobber

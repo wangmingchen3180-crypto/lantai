@@ -1,0 +1,40 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # 只在 macOS 上有意义：AppKit + 本机 SQLite。矩阵覆盖当前支持的两个大版本。
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          clang --version
+          xcodebuild -version || true
+
+      - name: Build
+        run: zsh scripts/build-app.sh
+
+      - name: Logic self-test
+        run: '"outputs/Lantai.app/Contents/MacOS/CodexPulse" --self-test'
+
+      - name: Whitespace check
+        run: git diff --check
+
+      # UI 自测要真实的 WindowServer 会话，GitHub runner 上不保证有，
+      # 所以只记录结果不阻断构建。本地发版前仍需手动跑一遍。
+      - name: UI self-test (informational)
+        continue-on-error: true
+        run: '"outputs/Lantai.app/Contents/MacOS/CodexPulse" --ui-self-test'

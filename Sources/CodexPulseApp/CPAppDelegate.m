@@ -3,6 +3,7 @@
 #import "CPScreenPolicy.h"
 #import "CPReviewStore.h"
 #import "CPControls.h"
+#import "CPDemoSource.h"
 
 #pragma mark - App Delegate
 
@@ -13,6 +14,7 @@
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
 
     self.reader = CPStateReader.new;
+    if (self.demoMode) self.reader.sources = CPDemoAgentSources();
     self.refreshQueue = dispatch_queue_create("com.codexpulse.refresh", DISPATCH_QUEUE_SERIAL);
     self.refreshGate = CPRefreshGate.new;
     // 首帧不在主线程做昂贵读取:先以空数据建 UI,启动后立即由 refresh 走后台队列填充。
@@ -207,6 +209,7 @@
     // 注册表变更后重建 reader;在途旧读取依靠 generation 自动丢弃,
     // pending 轮会用新配置立即同步,无需重启应用。
     self.reader = CPStateReader.new;
+    if (self.demoMode) self.reader.sources = CPDemoAgentSources();
     self.lastAppliedSignature = nil;
     self.refreshGeneration += 1;
     [self refresh:nil];

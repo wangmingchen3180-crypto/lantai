@@ -2,7 +2,9 @@
 
 A light in your menu bar that tells you whether your local AI agents are done, and which one is waiting on you.
 
-[中文](README.md) · [MIT](LICENSE) · macOS 14+
+[![build](https://github.com/wangmingchen3180-crypto/lantai/actions/workflows/build.yml/badge.svg)](https://github.com/wangmingchen3180-crypto/lantai/actions/workflows/build.yml)
+
+[中文](README.md) · [Download](https://github.com/wangmingchen3180-crypto/lantai/releases) · [MIT](LICENSE) · macOS 14+
 
 ## The problem
 
@@ -45,7 +47,21 @@ When a data source can't be read, the UI says so explicitly instead of silently 
 
 ## Install
 
-Build from source for now. Requires Xcode Command Line Tools.
+### Download
+
+Grab `Lantai-*-macos.zip` from [Releases](https://github.com/wangmingchen3180-crypto/lantai/releases), unzip, and move it to Applications.
+
+The build is ad-hoc signed and not notarized, so Gatekeeper will quarantine it. Clear that once:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Lantai.app
+```
+
+If you'd rather not, build it yourself — local builds carry no quarantine flag.
+
+### Build from source
+
+Requires Xcode Command Line Tools.
 
 ```sh
 git clone https://github.com/wangmingchen3180-crypto/lantai.git
@@ -54,9 +70,15 @@ zsh scripts/build-app.sh
 open outputs/Lantai.app
 ```
 
-Ad-hoc signed, so the first launch needs right-click → Open, or an override in System Settings → Privacy & Security.
-
 It lives in the menu bar and stays out of the Dock.
+
+### Try it without any agent installed
+
+```sh
+open -n outputs/Lantai.app --args --demo
+```
+
+`--demo` replaces every data source with a fixed set of fictional tasks covering all five display states. It reads none of your local agent files and is exempt from the single-instance check, so it can run alongside a normal instance. The screenshots in this README come from it.
 
 Verify the build:
 

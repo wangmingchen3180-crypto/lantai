@@ -14,9 +14,15 @@ int main(int argc, const char *argv[]) {
         if (argc > 1 && strcmp(argv[1], "--kimi-probe") == 0) {
             return CPRunKimiProbe();
         }
-        if (CPAnotherInstanceIsRunning()) return 0;
+        BOOL demo = NO;
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--demo") == 0) { demo = YES; break; }
+        }
+        // demo 用虚构数据,和正在运行的真实实例互不干扰,所以不受单实例限制。
+        if (!demo && CPAnotherInstanceIsRunning()) return 0;
         NSApplication *app = NSApplication.sharedApplication;
         AppDelegate *delegate = AppDelegate.new;
+        delegate.demoMode = demo;
         delegate.hudVisualTest = argc > 1 && strcmp(argv[1], "--visual-test-hud") == 0;
         delegate.detailVisualTest = argc > 1 && strcmp(argv[1], "--visual-test-detail") == 0;
         delegate.kimiVisualTest = argc > 1 && strcmp(argv[1], "--visual-test-kimi") == 0;

@@ -2,7 +2,9 @@
 
 菜单栏上的一盏灯，告诉你本机的 AI Agent 跑完没有、哪一个在等你。
 
-[English](README.en.md) · [MIT](LICENSE) · macOS 14+
+[![build](https://github.com/wangmingchen3180-crypto/lantai/actions/workflows/build.yml/badge.svg)](https://github.com/wangmingchen3180-crypto/lantai/actions/workflows/build.yml)
+
+[English](README.en.md) · [下载](https://github.com/wangmingchen3180-crypto/lantai/releases) · [MIT](LICENSE) · macOS 14+
 
 ## 它解决什么
 
@@ -45,7 +47,21 @@
 
 ## 安装
 
-暂时只能自己构建，需要 Xcode Command Line Tools。
+### 下载
+
+去 [Releases](https://github.com/wangmingchen3180-crypto/lantai/releases) 拿 `Lantai-*-macos.zip`，解压后拖进「应用程序」。
+
+包是 ad-hoc 签名的，没做 Apple 公证，所以从网上下载后会被 Gatekeeper 拦住。放行一次：
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Lantai.app
+```
+
+介意这一步的话，下面自己构建，本地构建的包不带隔离标记。
+
+### 自己构建
+
+需要 Xcode Command Line Tools。
 
 ```sh
 git clone https://github.com/wangmingchen3180-crypto/lantai.git
@@ -54,9 +70,17 @@ zsh scripts/build-app.sh
 open outputs/Lantai.app
 ```
 
-本地 ad-hoc 签名，第一次打开要右键选「打开」，或去「系统设置 → 隐私与安全性」放行。
-
 App 常驻菜单栏，不占 Dock。中文系统显示「澜台」，英文系统显示「Lantai」。
+
+### 先看看界面
+
+没装 Codex 或 Kimi 也能看：
+
+```sh
+open -n outputs/Lantai.app --args --demo
+```
+
+`--demo` 用一组写死的虚构任务替换全部数据源，覆盖运行中、等待确认、完成待查验、失败、待机五种状态。它不读本机任何 Agent 文件，也不受单实例限制，可以和正常运行的澜台并存。README 里的截图就是这么来的。
 
 验证构建：
 

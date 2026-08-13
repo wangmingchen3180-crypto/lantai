@@ -8,6 +8,7 @@
 #import "CPReviewStore.h"
 #import "CPStateCache.h"
 #import "CPAgentSources.h"
+#import "CPDemoSource.h"
 #import "CPTodoStore.h"
 #import "CPRouting.h"
 #import "CPRefreshPipeline.h"
