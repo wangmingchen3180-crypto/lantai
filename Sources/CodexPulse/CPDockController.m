@@ -4,7 +4,10 @@
 
 #pragma mark - Dock Capsule
 
-
+@interface CPDockWindowController ()
+@property BOOL updatingTracking; // 重建 tracking area / 改窗口尺寸时吞掉同步 enter/exit,避免误收
+@property NSUInteger transitionGen; // 贴边探出/收回/吸附动画代际,快速进出时作废旧 completion
+@end
 
 @implementation CPDockWindowController
 
@@ -14,15 +17,20 @@ const CGFloat CPOrbWindowSize = CPOrbSize + CPOrbMargin * 2.0; // 84
 const CGFloat CPStripWidth = 6.0;
 const CGFloat CPHotZone = 28.0;
 const CGFloat CPMargin = 18.0;
-const CGFloat CPSnapThreshold = 60.0;
+const CGFloat CPSnapThreshold = 24.0; // 球体贴边沿与屏幕边的间隙;60 时离边仍很宽也会吸住
 const CGFloat CPBarHeight = 48.0;
 const CGFloat CPBarItem = 34.0;
 const CGFloat CPBarWorkbenchWidth = 82.0;
+static const CGFloat CPDockPeekDuration = 0.20;
+static const CGFloat CPDockUnpeekDuration = 0.18;
+static const CGFloat CPDockSnapDuration = 0.22;
+static const CGFloat CPDockSlide = 36.0; // 探出/收回时球体沿贴边方向滑入滑出的距离
 
 - (instancetype)init {
     self = [super init];
     if (!self) return nil;
     self.docked = NO;
+    self.peeked = NO;
     self.dockEdge = NSRectEdgeMaxX;
     self.mode = 0;
     self.reviewStore = [[CPReviewStore alloc] initWithDefaults:NSUserDefaults.standardUserDefaults];
@@ -41,6 +49,7 @@ const CGFloat CPBarWorkbenchWidth = 82.0;
     self.window.backgroundColor = NSColor.clearColor;
     self.window.hasShadow = NO;
     self.window.hidesOnDeactivate = NO;
+    self.window.animationBehavior = NSWindowAnimationBehaviorNone;
     self.window.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
                                      NSWindowCollectionBehaviorFullScreenAuxiliary |
                                      NSWindowCollectionBehaviorStationary;
@@ -114,6 +123,7 @@ const CGFloat CPBarWorkbenchWidth = 82.0;
     NSView *stripView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, CPHotZone, CPOrbSize)];
     stripView.wantsLayer = YES;
     stripView.hidden = YES;
+    stripView.alphaValue = 1.0;
     self.stripView = stripView;
     [pill addSubview:stripView];
 
@@ -141,7 +151,7 @@ const CGFloat CPBarWorkbenchWidth = 82.0;
     barView.layer.shadowOffset = CGSizeMake(0, 4);
     barView.layer.shadowRadius = 18.0;
     barView.layer.shadowOpacity = 1.0;
-    barView.toolTip = @"Codex Pulse 快捷栏：打开工作台或查看 Agent 状态";
+    barView.toolTip = @"澜台快捷栏：打开工作台或查看 Agent 状态";
     barView.hidden = YES;
     self.barView = barView;
     [self.pill addSubview:barView];
@@ -153,7 +163,7 @@ const CGFloat CPBarWorkbenchWidth = 82.0;
     logo.imagePosition = NSImageLeading;
     logo.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
     logo.contentTintColor = CPFg2();
-    logo.toolTip = @"打开 Codex Pulse 工作台";
+    logo.toolTip = @"打开澜台工作台";
     logo.accessibilityLabel = @"打开工作台";
     logo.translatesAutoresizingMaskIntoConstraints = NO;
     [logo.widthAnchor constraintEqualToConstant:CPBarWorkbenchWidth].active = YES;
@@ -242,16 +252,38 @@ const CGFloat CPBarWorkbenchWidth = 82.0;
     [self applyFrame];
 }
 
+- (NSRect)hoverTrackingRect {
+    // 球体可见时(自由漂浮或贴边探出)只跟踪 48pt 圆,不含 18pt 透明安全边距。
+    // 贴边收起时跟踪 28pt 热区细条。两态热区都对齐可见物,避免「离得远才收、离得近不收」。
+    if (self.mode == 0 && !self.floatingPill.hidden) return self.floatingPill.frame;
+    return self.pill.bounds;
+}
+
+- (NSRect)keepAliveScreenRect {
+    NSRect local = [self hoverTrackingRect];
+    NSRect win = self.window.frame;
+    return NSOffsetRect(local, win.origin.x, win.origin.y);
+}
+
+- (BOOL)mouseInKeepAlive {
+    return NSPointInRect(NSEvent.mouseLocation, [self keepAliveScreenRect]);
+}
+
 - (void)updateTracking {
+    self.updatingTracking = YES;
     if (self.trackingArea) [self.pill removeTrackingArea:self.trackingArea];
-    // 悬浮球模式下只跟踪球体可见圆形,透明安全边距不响应 hover。
-    NSRect trackRect = (self.mode == 0 && !self.docked && !self.floatingPill.hidden)
-        ? self.floatingPill.frame : self.pill.bounds;
+    NSRect trackRect = [self hoverTrackingRect];
+    NSTrackingAreaOptions options = NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways;
+    if (self.window) {
+        NSPoint mouseInPill = [self.pill convertPoint:self.window.mouseLocationOutsideOfEventStream fromView:nil];
+        if (NSPointInRect(mouseInPill, trackRect)) options |= NSTrackingAssumeInside;
+    }
     self.trackingArea = [[NSTrackingArea alloc] initWithRect:trackRect
-                                                     options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways
+                                                     options:options
                                                        owner:self
                                                     userInfo:nil];
     [self.pill addTrackingArea:self.trackingArea];
+    self.updatingTracking = NO;
 }
 
 - (NSScreen *)targetScreen {
@@ -260,7 +292,7 @@ const CGFloat CPBarWorkbenchWidth = 82.0;
 
 - (void)reclampToVisibleScreen {
     if (!CPTargetScreen()) return;
-    [self snapToEdge];
+    [self snapToEdgeAllowingAnimation:NO];
 }
 
 - (NSRect)initialFrame {
@@ -285,6 +317,8 @@ const CGFloat CPBarWorkbenchWidth = 82.0;
 - (void)setMode:(NSInteger)mode {
     _mode = mode;
     self.docked = NO;
+    self.peeked = NO;
+    self.transitionGen++;
     [self cancelUnpeek];
     NSScreen *screen = self.targetScreen;
     if (!screen) {
@@ -326,11 +360,72 @@ const CGFloat CPBarWorkbenchWidth = 82.0;
     return self.mode == 0 ? CPOrbSize : CPBarHeight;
 }
 
+- (CGFloat)dockAnimDuration:(CGFloat)preferred {
+    if (CPRunningSelfTests) return 0.0;
+    if (NSWorkspace.sharedWorkspace.accessibilityDisplayShouldReduceMotion) return 0.0;
+    return preferred;
+}
+
+- (NSRect)orbRestFrame {
+    return NSMakeRect(CPOrbMargin, CPOrbMargin, CPOrbSize, CPOrbSize);
+}
+
+- (NSRect)orbTuckFrame {
+    NSRect rest = [self orbRestFrame];
+    rest.origin.x += (self.dockEdge == NSRectEdgeMaxX) ? CPDockSlide : -CPDockSlide;
+    return rest;
+}
+
+- (NSRect)dockedPeekedWindowFrame {
+    NSScreen *screen = self.targetScreen;
+    if (!screen) return NSMakeRect(0, 0, CPOrbWindowSize, CPOrbWindowSize);
+    NSRect visible = screen.visibleFrame;
+    CGFloat y = self.freeY - CPOrbMargin;
+    CGFloat x = (self.dockEdge == NSRectEdgeMaxX)
+        ? (NSMaxX(visible) - CPOrbSize - CPOrbMargin)
+        : (NSMinX(visible) - CPOrbMargin);
+    return NSMakeRect(x, y, CPOrbWindowSize, CPOrbWindowSize);
+}
+
+- (void)layoutStripInPeekedWindow {
+    CGFloat y = CPOrbMargin;
+    CGFloat x = (self.dockEdge == NSRectEdgeMaxX)
+        ? (CPOrbMargin + CPOrbSize - CPStripWidth)
+        : CPOrbMargin;
+    self.stripView.frame = NSMakeRect(x, y, CPStripWidth, CPOrbSize);
+    self.stripLine.frame = NSMakeRect(0, 8, CPStripWidth, CPOrbSize - 16);
+}
+
+- (void)resetOrbChrome {
+    self.floatingPill.frame = [self orbRestFrame];
+    self.floatingPill.alphaValue = 1.0;
+    self.badgeView.alphaValue = 1.0;
+    self.stripView.alphaValue = 1.0;
+}
+
+- (void)applyPeekedFrame {
+    NSRect frame = [self dockedPeekedWindowFrame];
+    self.updatingTracking = YES;
+    [self.window setFrame:frame display:YES];
+    self.pill.frame = NSMakeRect(0, 0, CPOrbWindowSize, CPOrbWindowSize);
+    self.updatingTracking = NO;
+    [self resetOrbChrome];
+    self.floatingPill.hidden = NO;
+    self.barView.hidden = YES;
+    self.stripView.hidden = YES;
+    [self updateTracking];
+    [self updateOrbRipples];
+}
+
 - (void)applyFrame {
     NSScreen *screen = self.targetScreen;
     if (!screen) return;
     NSRect visible = screen.visibleFrame;
     CGFloat x, y, w, h;
+    if (self.docked && self.mode == 0 && self.peeked) {
+        [self applyPeekedFrame];
+        return;
+    }
     if (self.docked && self.mode == 0) {
         y = self.freeY;
         h = CPOrbSize;
@@ -349,6 +444,7 @@ const CGFloat CPBarWorkbenchWidth = 82.0;
             self.stripView.frame = NSMakeRect(0, 0, CPStripWidth, CPOrbSize);
         }
         self.stripLine.frame = NSMakeRect(0, 8, CPStripWidth, CPOrbSize - 16);
+        [self resetOrbChrome];
     } else {
         if (self.mode == 0) {
             // freeX/freeY 始终表示球体可见圆形的屏幕原点;窗口加上透明安全边距。
@@ -368,46 +464,125 @@ const CGFloat CPBarWorkbenchWidth = 82.0;
             self.barView.hidden = NO;
             self.stripView.hidden = YES;
         }
+        [self resetOrbChrome];
     }
+    self.updatingTracking = YES;
     [self.window setFrame:NSMakeRect(x, y, w, h) display:YES];
     self.pill.frame = NSMakeRect(0, 0, w, h);
+    self.updatingTracking = NO;
     [self updateTracking];
     [self updateOrbRipples];
 }
 
 - (void)peek:(BOOL)show {
+    (void)show;
     if (!self.docked || self.mode != 0) return;
-    NSScreen *screen = self.targetScreen;
-    if (!screen) return;
-    NSRect visible = screen.visibleFrame;
-    CGFloat y = self.freeY - CPOrbMargin;
-    CGFloat h = CPOrbWindowSize;
-    CGFloat w = CPOrbWindowSize;
-    CGFloat x;
-    if (self.dockEdge == NSRectEdgeMaxX) {
-        x = NSMaxX(visible) - CPOrbSize - CPOrbMargin; // 球体右沿贴屏幕边
+    if (self.peeked) return;
+    self.peeked = YES;
+    NSUInteger gen = ++self.transitionGen;
+
+    BOOL fromStrip = self.floatingPill.hidden || fabs(self.window.frame.size.width - CPHotZone) <= 0.5;
+    NSRect peekedFrame = [self dockedPeekedWindowFrame];
+    self.updatingTracking = YES;
+    if (fromStrip) {
+        [self.window setFrame:peekedFrame display:YES];
+        self.pill.frame = NSMakeRect(0, 0, CPOrbWindowSize, CPOrbWindowSize);
+        [self layoutStripInPeekedWindow];
+        self.stripView.hidden = NO;
+        self.stripView.alphaValue = 1.0;
+        self.floatingPill.frame = [self orbTuckFrame];
+        self.floatingPill.alphaValue = 0.0;
+        self.badgeView.alphaValue = 0.0;
+        self.floatingPill.hidden = NO;
+        self.barView.hidden = YES;
     } else {
-        x = NSMinX(visible) - CPOrbMargin; // 球体左沿贴屏幕边
+        if (fabs(self.window.frame.size.width - CPOrbWindowSize) > 0.5) {
+            [self.window setFrame:peekedFrame display:YES];
+            self.pill.frame = NSMakeRect(0, 0, CPOrbWindowSize, CPOrbWindowSize);
+        }
+        self.floatingPill.hidden = NO;
+        self.stripView.hidden = NO;
+        [self layoutStripInPeekedWindow];
     }
-    [self.window setFrame:NSMakeRect(x, y, w, h) display:YES];
-    self.pill.frame = NSMakeRect(0, 0, w, h);
-    self.floatingPill.hidden = NO;
-    self.barView.hidden = YES;
-    self.stripView.hidden = YES;
+    self.updatingTracking = NO;
     [self updateTracking];
+
+    CGFloat duration = [self dockAnimDuration:CPDockPeekDuration];
+    void (^finish)(void) = ^{
+        if (gen != self.transitionGen) return;
+        self.floatingPill.frame = [self orbRestFrame];
+        self.floatingPill.alphaValue = 1.0;
+        self.badgeView.alphaValue = 1.0;
+        self.stripView.alphaValue = 0.0;
+        self.stripView.hidden = YES;
+        [self updateTracking];
+        [self updateOrbRipples];
+    };
+    if (duration <= 0.001) {
+        finish();
+        return;
+    }
+
+    self.orbRippleView.hidden = YES;
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext *ctx) {
+        ctx.duration = duration;
+        ctx.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+        ctx.allowsImplicitAnimation = YES;
+        self.floatingPill.animator.frame = [self orbRestFrame];
+        self.floatingPill.animator.alphaValue = 1.0;
+        self.badgeView.animator.alphaValue = 1.0;
+        self.stripView.animator.alphaValue = 0.0;
+    } completionHandler:finish];
 }
 
 - (void)unpeek {
     if (!self.docked || self.mode != 0) return;
-    [self applyFrame];
-    [self updateTracking];
+    self.peeked = NO;
+    NSUInteger gen = ++self.transitionGen;
+
+    if (fabs(self.window.frame.size.width - CPOrbWindowSize) > 0.5) {
+        [self applyFrame];
+        return;
+    }
+
+    self.stripView.hidden = NO;
+    [self layoutStripInPeekedWindow];
+    self.floatingPill.hidden = NO;
+
+    CGFloat duration = [self dockAnimDuration:CPDockUnpeekDuration];
+    void (^collapse)(void) = ^{
+        if (gen != self.transitionGen) return;
+        [self resetOrbChrome];
+        [self applyFrame];
+    };
+    if (duration <= 0.001) {
+        collapse();
+        return;
+    }
+
+    self.orbRippleView.hidden = YES;
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext *ctx) {
+        ctx.duration = duration;
+        ctx.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseIn];
+        ctx.allowsImplicitAnimation = YES;
+        self.floatingPill.animator.frame = [self orbTuckFrame];
+        self.floatingPill.animator.alphaValue = 0.0;
+        self.badgeView.animator.alphaValue = 0.0;
+        self.stripView.animator.alphaValue = 1.0;
+    } completionHandler:collapse];
 }
 
 - (void)scheduleUnpeek {
     [self cancelUnpeek];
     __weak typeof(self) weakSelf = self;
     self.unpeekTimer = [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:NO block:^(NSTimer *timer) {
-        [weakSelf unpeek];
+        CPDockWindowController *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if ([strongSelf mouseInKeepAlive]) {
+            [strongSelf updateTracking];
+            return;
+        }
+        [strongSelf unpeek];
     }];
 }
 
@@ -417,11 +592,10 @@ const CGFloat CPBarWorkbenchWidth = 82.0;
 }
 
 - (void)mouseEntered:(NSEvent *)event {
-    if (self.dragging) return;
+    if (self.updatingTracking || self.dragging) return;
     if (self.docked && self.mode == 0) {
         [self cancelUnpeek];
         [self peek:YES];
-        [self updateTracking];
     } else if (!self.docked && self.mode == 0) {
         self.orbHovered = YES;
         [self updateOrbRipples];
@@ -435,8 +609,12 @@ const CGFloat CPBarWorkbenchWidth = 82.0;
 }
 
 - (void)mouseExited:(NSEvent *)event {
-    if (self.dragging) return;
+    if (self.updatingTracking || self.dragging) return;
     if (self.docked && self.mode == 0) {
+        if ([self mouseInKeepAlive]) {
+            [self updateTracking];
+            return;
+        }
         [self scheduleUnpeek];
     } else if (!self.docked && self.mode == 0) {
         self.orbHovered = NO;
@@ -456,7 +634,7 @@ const CGFloat CPBarWorkbenchWidth = 82.0;
 // 悬浮球统一涟漪:状态色 + 速度由全部 agent 的最高优先状态决定。
 // reduce motion 时只留固定状态环(实色);hover/drag 时隐藏动效。
 - (void)updateOrbRipples {
-    BOOL orbVisible = (self.mode == 0 && !self.docked && !self.floatingPill.hidden);
+    BOOL orbVisible = (self.mode == 0 && !self.floatingPill.hidden);
     self.orbRippleView.hidden = !orbVisible;
     if (!orbVisible) {
         // 悬浮球不可见:移除全部无限涟漪(不可见时不参与合成),并作废参数缓存,
@@ -474,12 +652,14 @@ const CGFloat CPBarWorkbenchWidth = 82.0;
 
 - (void)pillMouseDown:(NSEvent *)event {
     [self cancelUnpeek];
+    self.transitionGen++;
     self.dragging = YES;
     self.didMove = NO;
     self.dragStartMouse = [NSEvent mouseLocation];
     self.dragStartOrigin = NSMakePoint(self.freeX, self.freeY); // 球体可见圆形原点
     if (self.docked) {
         self.docked = NO;
+        self.peeked = NO;
         NSPoint loc = self.dragStartMouse;
         self.freeX = loc.x - [self currentWidth] / 2.0;
         self.freeY = loc.y - [self currentHeight] / 2.0;
@@ -517,6 +697,43 @@ const CGFloat CPBarWorkbenchWidth = 82.0;
 }
 
 - (void)snapToEdge {
+    [self snapToEdgeAllowingAnimation:YES];
+}
+
+- (void)animateSnapIntoDock {
+    NSUInteger gen = ++self.transitionGen;
+    self.peeked = YES;
+    NSRect peekedFrame = [self dockedPeekedWindowFrame];
+    [self resetOrbChrome];
+    self.floatingPill.hidden = NO;
+    self.stripView.hidden = YES;
+    self.barView.hidden = YES;
+    self.updatingTracking = YES;
+    self.pill.frame = NSMakeRect(0, 0, CPOrbWindowSize, CPOrbWindowSize);
+    self.updatingTracking = NO;
+
+    CGFloat duration = [self dockAnimDuration:CPDockSnapDuration];
+    void (^thenTuck)(void) = ^{
+        if (gen != self.transitionGen) return;
+        self.updatingTracking = YES;
+        [self.window setFrame:peekedFrame display:YES];
+        self.pill.frame = NSMakeRect(0, 0, CPOrbWindowSize, CPOrbWindowSize);
+        self.updatingTracking = NO;
+        [self unpeek];
+    };
+    if (duration <= 0.001) {
+        thenTuck();
+        return;
+    }
+
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext *ctx) {
+        ctx.duration = duration;
+        ctx.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+        [[self.window animator] setFrame:peekedFrame display:YES];
+    } completionHandler:thenTuck];
+}
+
+- (void)snapToEdgeAllowingAnimation:(BOOL)allowAnimation {
     NSScreen *screen = self.targetScreen;
     if (!screen) return;
     NSRect visible = screen.visibleFrame;
@@ -526,22 +743,29 @@ const CGFloat CPBarWorkbenchWidth = 82.0;
     if (self.mode == 0) {
         if (self.freeX <= NSMinX(visible) + CPSnapThreshold) {
             self.docked = YES;
+            self.peeked = NO;
             self.dockEdge = NSRectEdgeMinX;
             self.freeX = NSMinX(visible);
         } else if (self.freeX >= rightEdge - CPSnapThreshold) {
             self.docked = YES;
+            self.peeked = NO;
             self.dockEdge = NSRectEdgeMaxX;
             self.freeX = rightEdge;
         } else {
             self.docked = NO;
+            self.peeked = NO;
         }
     } else {
         self.docked = NO;
+        self.peeked = NO;
     }
     CGFloat maxY = NSMaxY(visible) - h - 8;
     CGFloat minY = NSMinY(visible) + 8;
     self.freeY = MAX(minY, MIN(self.freeY, maxY));
-    [self applyFrame];
+    BOOL animate = allowAnimation && self.docked && self.mode == 0 &&
+                   [self dockAnimDuration:CPDockSnapDuration] > 0.001;
+    if (animate) [self animateSnapIntoDock];
+    else [self applyFrame];
 }
 
 - (void)renderWithAgents:(NSArray<CPAgent *> *)agents selectedAgent:(CPAgent *)agent {

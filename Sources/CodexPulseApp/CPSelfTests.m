@@ -1642,6 +1642,43 @@ int CPRunUISelfTests(int argc, const char *argv[]) {
                                                           name:NSApplicationDidChangeScreenParametersNotification
                                                         object:nil];
 
+            // Bugfix: 贴边悬浮球探出/收回热区必须对齐可见球体,刷新不得把探出态打回细条。
+            CPDockWindowController *dockPeek = CPDockWindowController.new;
+            [dockPeek setMode:0];
+            NSScreen *peekScreen = CPTargetScreen();
+            NSRect peekVisible = peekScreen ? peekScreen.visibleFrame : NSMakeRect(0, 0, 1440, 900);
+            dockPeek.freeX = NSMaxX(peekVisible) - CPOrbSize;
+            dockPeek.freeY = NSMidY(peekVisible) - CPOrbSize / 2.0;
+            [dockPeek snapToEdge];
+            BOOL dockPeekStrip = dockPeek.docked && !dockPeek.peeked && dockPeek.floatingPill.hidden &&
+                                 fabs(dockPeek.window.frame.size.width - CPHotZone) <= 0.5 &&
+                                 NSEqualRects(dockPeek.trackingArea.rect, dockPeek.pill.bounds);
+            CPDockWindowController *dockSnap = CPDockWindowController.new;
+            [dockSnap setMode:0];
+            CGFloat snapRight = NSMaxX(peekVisible) - CPOrbSize;
+            dockSnap.freeY = NSMidY(peekVisible) - CPOrbSize / 2.0;
+            dockSnap.freeX = snapRight - 50.0; // 间隙 50pt,宽于阈值,不应吸附
+            [dockSnap snapToEdge];
+            BOOL snapFarKeepsFree = !dockSnap.docked;
+            dockSnap.freeX = snapRight - 20.0; // 间隙 20pt,进入 24pt 阈值,应吸附
+            [dockSnap snapToEdge];
+            BOOL snapNearDocks = dockSnap.docked && dockSnap.dockEdge == NSRectEdgeMaxX;
+            BOOL dockSnapRangeOK = snapFarKeepsFree && snapNearDocks;
+            [dockPeek peek:YES];
+            BOOL dockPeekTracksOrb = dockPeek.peeked && !dockPeek.floatingPill.hidden &&
+                                     fabs(dockPeek.window.frame.size.width - CPOrbWindowSize) <= 0.5 &&
+                                     NSEqualRects(dockPeek.trackingArea.rect, dockPeek.floatingPill.frame) &&
+                                     !NSEqualRects(dockPeek.trackingArea.rect, dockPeek.pill.bounds);
+            [dockPeek renderWithAgents:@[] selectedAgent:nil];
+            BOOL dockPeekSurvivesRefresh = dockPeek.peeked && !dockPeek.floatingPill.hidden &&
+                                           fabs(dockPeek.window.frame.size.width - CPOrbWindowSize) <= 0.5 &&
+                                           NSEqualRects(dockPeek.trackingArea.rect, dockPeek.floatingPill.frame);
+            [dockPeek unpeek];
+            BOOL dockUnpeekStrip = dockPeek.docked && !dockPeek.peeked && dockPeek.floatingPill.hidden &&
+                                   fabs(dockPeek.window.frame.size.width - CPHotZone) <= 0.5 &&
+                                   NSEqualRects(dockPeek.trackingArea.rect, dockPeek.pill.bounds);
+            BOOL dockPeekOK = dockPeekStrip && dockPeekTracksOrb && dockPeekSurvivesRefresh && dockUnpeekStrip && dockSnapRangeOK;
+
             BOOL passed = centered && draggableHeader && labeledWorkbench && onlyRealAgents && labeledAgent && buttonReceivesClick &&
                           agentStatusDotsAligned && attentionBadgeClearsOnOpen &&
                           cardMasksToBounds && shadowCarrierNoMasks && cardIsChildOfShadowCarrier && windowHasWorkbenchInset &&
@@ -1650,9 +1687,9 @@ int CPRunUISelfTests(int argc, const char *argv[]) {
                           shadowCarrierScales && handleAnchoredTopRight && contentNotSizable && hudClickViewIsBackgroundView &&
                           hudVisualFrameExact && hudExpandedHandleHidden && m2ui && m3ui && m3entries && m4ui && m5ui && m7ui && m8ui && m9ui && m10ui &&
                           hoverResidualOK && hoverMotionOK && todoUI && perfUI && m13ui &&
-                          screenPolicyOK && screenReclampOK;
+                          screenPolicyOK && screenReclampOK && dockPeekOK;
             NSMutableString *result = [NSMutableString stringWithFormat:
-                @"Codex Pulse UI self-test: center=%@ drag=%@ workbench-label=%@ real-agents=%@ agent-label=%@ button-hit=%@ "
+                @"Lantai UI self-test: center=%@ drag=%@ workbench-label=%@ real-agents=%@ agent-label=%@ button-hit=%@ "
                 @"card-mask=%@ carrier-mask=%@ card-child=%@ win-inset=%@ card-520x402=%@ two-column=%@ right-overlay=%@ "
                 @"hud-6x72=%@ hud-collapsed-pos=%@ hud-expanded-size=%@ hud-expanded-pos=%@ "
                 @"hud-carrier-scale=%@ hud-handle-tr=%@ hud-content-fixed=%@ hud-bg-click=%@ "
@@ -1689,9 +1726,14 @@ int CPRunUISelfTests(int argc, const char *argv[]) {
                 hudAgentScope ? @"OK" : @"FAIL",
                 hudSelectByID ? @"OK" : @"FAIL",
                 agentUrgencyOK ? @"OK" : @"FAIL"];
-            [result appendFormat:@"Bugfix UI self-test: agent-dot-column=%@ attention-badge-clears=%@\n",
+            [result appendFormat:@"Bugfix UI self-test: agent-dot-column=%@ attention-badge-clears=%@ dock-peek-strip=%@ dock-peek-tracks-orb=%@ dock-peek-survives-refresh=%@ dock-unpeek-strip=%@ dock-snap-range=%@\n",
                 agentStatusDotsAligned ? @"OK" : @"FAIL",
-                attentionBadgeClearsOnOpen ? @"OK" : @"FAIL"];
+                attentionBadgeClearsOnOpen ? @"OK" : @"FAIL",
+                dockPeekStrip ? @"OK" : @"FAIL",
+                dockPeekTracksOrb ? @"OK" : @"FAIL",
+                dockPeekSurvivesRefresh ? @"OK" : @"FAIL",
+                dockUnpeekStrip ? @"OK" : @"FAIL",
+                dockSnapRangeOK ? @"OK" : @"FAIL"];
             [result appendFormat:@"M3 UI self-test: drawer-init-hidden=%@ render-no-mark=%@ drawer-on-click=%@ review-on-open=%@ stale-row=%@ esc-drawer=%@ esc-workbench=%@\n",
                 drawerInitiallyHidden ? @"OK" : @"FAIL",
                 renderDoesNotMark ? @"OK" : @"FAIL",
@@ -1897,7 +1939,7 @@ int CPRunSelfTests(int argc, const char *argv[]) {
                     else idleCount++;
                 }
             }
-            printf("Codex Pulse self-test: %lu agents, %ld tasks, local read OK\n", (unsigned long)agents.count, (long)taskCount);
+            printf("Lantai self-test: %lu agents, %ld tasks, local read OK\n", (unsigned long)agents.count, (long)taskCount);
             printf("Real task states: working=%ld attention=%ld completed=%ld failed=%ld idle=%ld\n",
                    (long)workingCount, (long)attentionCount, (long)completedCount, (long)failedCount, (long)idleCount);
             BOOL internalThreadsFiltered = strstr(CPCodexVisibleThreadsSQL, "thread_source,'') <> 'subagent'") != NULL &&

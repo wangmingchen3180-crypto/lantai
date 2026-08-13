@@ -27,6 +27,7 @@ FOUNDATION_EXPORT const CGFloat CPBarWorkbenchWidth;
 @property NSImageView *iconView;
 @property NSTrackingArea *trackingArea;
 @property BOOL docked;
+@property BOOL peeked; // 贴边后由 hover 探出球体;与 docked 独立,避免刷新/重排把探出态打回细条
 @property NSRectEdge dockEdge;
 @property CGFloat freeX;
 @property CGFloat freeY;
@@ -60,6 +61,9 @@ FOUNDATION_EXPORT const CGFloat CPBarWorkbenchWidth;
 - (void)pillMouseUp:(NSEvent *)event;
 - (void)mouseEntered:(NSEvent *)event;
 - (void)mouseExited:(NSEvent *)event;
+- (void)peek:(BOOL)show;
+- (void)unpeek;
+- (void)snapToEdge;
 - (void)barLogoClicked:(id)sender;
 @end
 

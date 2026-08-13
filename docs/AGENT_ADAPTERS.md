@@ -1,6 +1,6 @@
 # Agent 适配器
 
-Codex Pulse 把“应用内启用 Agent”和“实现一种 Agent 数据源”分开。普通用户只需在工作台点击“添加 Agent”；适配器作者负责把提供方的本地数据归一成 `CPAgent` 和 `CPTask`。
+澜台把“应用内启用 Agent”和“实现一种 Agent 数据源”分开。普通用户只需在工作台点击“添加 Agent”；适配器作者负责把提供方的本地数据归一成 `CPAgent` 和 `CPTask`。
 
 ## 用户流程
 

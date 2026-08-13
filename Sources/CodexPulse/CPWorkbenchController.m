@@ -306,7 +306,7 @@ NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     [logo.widthAnchor constraintEqualToConstant:20].active = YES;
     [logo.heightAnchor constraintEqualToConstant:20].active = YES;
 
-    NSTextField *title = CPLabel(@"Codex Pulse", 14, NSFontWeightSemibold, CPFg());
+    NSTextField *title = CPLabel(@"澜台", 14, NSFontWeightSemibold, CPFg());
     self.cardMetaLabel = CPLabel(@"2 个 Agent", 11, NSFontWeightRegular, CPMuted());
 
     NSStackView *text = [NSStackView stackViewWithViews:@[title, self.cardMetaLabel]];
@@ -1488,7 +1488,7 @@ NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText = @"添加 Agent";
     alert.informativeText = available.count
-        ? @"选择一个本机 Agent 数据源。Codex Pulse 只读取任务索引和运行状态。"
+        ? @"选择一个本机 Agent 数据源。澜台只读取任务索引和运行状态。"
         : @"所有内置 Agent 均已添加。";
     if (!available.count) {
         [alert addButtonWithTitle:@"好"];

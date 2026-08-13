@@ -1,36 +1,76 @@
-# Codex Pulse
+# 澜台 / Lantai
 
-Codex Pulse 是一个原生 macOS 本地 Agent 工作台。它以只读方式观察本机 Codex Desktop 和 Kimi App 的任务索引，统一展示最近任务、工作状态、最近活动和原应用入口。
+原生 macOS 本地 Agent 观察台。只读本机 Codex Desktop 和 Kimi App 的任务索引，用菜单栏、HUD、悬浮球和工作台显示状态，并跳回原应用。
+
+**这是个人项目，非官方，与 OpenAI / Moonshot 无关。** 核心能力依赖对方未公开的本地文件格式。客户端一升级，解析就可能失效。本仓库不承诺兼容，也不提供产品级支持。欢迎补适配器，不要把失效当成「澜台坏了」。
+
+只读本机索引，不读取、不写入、不上传登录令牌。
+
+English summary is at the end.
 
 ## 当前能力
 
-- 菜单栏常驻，不占用 Dock
-- 右侧桌面边缘抽屉：点击把手展开/收起，触控板左右滑动控制
-- 可切换到底部快捷栏：“工作台”负责打开总览，Agent 入口同时显示名称与当前状态
-- 工作台默认在主显示器居中打开，可拖动顶部标题栏移动
-- 单实例运行；再次打开会回到已经运行的 Codex Pulse，避免新旧构建同时出现
-- 识别工作、等待处理、完成、错误和空闲状态
-- 展示当前任务、项目、持续时间、Token 数和近期任务
-- 约 3 秒自动刷新
-- 一键打开 Codex 或在 Finder 中显示项目
-- 内置“添加 Agent”流程：扫描本机适配器、显示检测状态、持久化启用选择并立即刷新，不需要让 Agent 修改源码
-- Kimi 默认读取电脑 Kimi App 的 `conversations.sqlite` 及运行状态；Kimi Code CLI 是独立、默认隐藏的可选 Agent
-- 点击 Kimi 客户端任务使用 `kimi-work://chat/<conversation-id>` 返回原会话（客户端未注册深链时降级为唤起应用）
-- 工作台底部常驻待办栏：可收起/展开，支持新增、完成/恢复、行内编辑、删除与滚动，本地 SQLite 持久化（`~/Library/Application Support/Codex Pulse/todos.sqlite`），独立于 Agent，计数不进入任何提醒聚合
-- Agent 与任务的完成态统一显示为「已就绪」（底层仍保留完成事件语义）
-- 只读访问 Codex 与 Kimi 的本地索引，不读取、写入或上传登录令牌
+- 菜单栏常驻，不占 Dock
+- 右侧 HUD 抽屉；可换成底部快捷栏
+- 工作台：Agent、任务、详情、原应用跳转
+- 约 3 秒刷新；单实例
+- 内置「添加 Agent」：扫描本机适配器，不改 Agent 源码
+- Codex Desktop 与 Kimi App 默认启用；Kimi Code CLI 可选、默认隐藏
+- 本地待办栏（SQLite，独立于 Agent，不进入提醒聚合）
+- 数据源不可用时明确显示，不静默变成「没有任务」
 
-状态是根据 Codex 本地事件推断的。由于官方 Codex Desktop 尚未提供稳定的外部活动线程附着接口，应用不会尝试中断或控制现有任务。
+适配器边界见 [docs/AGENT_ADAPTERS.md](docs/AGENT_ADAPTERS.md)。命名见 [docs/NAMING.md](docs/NAMING.md)。视觉规格见 [docs/DESIGN.md](docs/DESIGN.md)。后续事项见 [BACKLOG.md](BACKLOG.md)。
 
-Agent 适配器的边界、内置注册流程和新提供方接入规则见 [docs/AGENT_ADAPTERS.md](docs/AGENT_ADAPTERS.md)。
+## 要求
 
-项目知识沉淀使用 [Project Cairn](https://github.com/iBlinkQ/project-cairn)：Skill 安装在用户级 `~/.agents/skills/project-cairn`，本地项目可在 `.agents/skills/project-cairn` 建立软链；个人绝对路径不提交到开源仓库。
+- macOS 14+
+- 本机已安装 Codex Desktop 和 / 或 Kimi 电脑客户端（否则对应 Agent 显示数据源不可用）
+- 构建：Xcode Command Line Tools（`clang`）。`scripts/build-app.sh` 是唯一验证过的构建路径。仓库里的 `Package.swift` 在部分机器上因 SDK 微版本对不上，`swift build` 会失败。
 
 ## 构建
 
 ```sh
 zsh scripts/build-app.sh
-"outputs/Codex Pulse.app/Contents/MacOS/CodexPulse" --self-test
+"outputs/Lantai.app/Contents/MacOS/CodexPulse" --self-test
 ```
 
-完成后可运行 `outputs/Codex Pulse.app`。这是本地 ad-hoc 签名的开发版本。当前 MVP 使用原生 AppKit 和系统 SQLite，不依赖第三方库。
+图形会话里还可跑 `"outputs/Lantai.app/Contents/MacOS/CodexPulse" --ui-self-test`。完成后打开 `outputs/Lantai.app`。这是本地 ad-hoc 签名的开发版，Gatekeeper 可能要右键打开。
+
+中文系统显示名为「澜台」，英文系统为 Lantai。内部 bundle id 仍是 `com.codexpulse.menubar`，待办库仍在 `~/Library/Application Support/Codex Pulse/`，避免改名时丢数据。
+
+## 隐私
+
+- SQLite 只开只读连接
+- 不读 cookie、API key、登录态
+- 事件流只读有界尾部
+- 没有网络上传
+
+## 文档
+
+| 文件 | 内容 |
+| --- | --- |
+| [docs/AGENT_ADAPTERS.md](docs/AGENT_ADAPTERS.md) | 如何加一个只读适配器 |
+| [docs/NAMING.md](docs/NAMING.md) | 为什么叫澜台，哪些名字已经撞车 |
+| [docs/DESIGN.md](docs/DESIGN.md) | 涟漪规格、菜单栏/Logo 还没做的部分 |
+| [BACKLOG.md](BACKLOG.md) | 版本路线和未做事项 |
+
+项目知识沉淀使用 [Project Cairn](https://github.com/iBlinkQ/project-cairn)：Skill 装在用户级 `~/.agents/skills/project-cairn`。个人绝对路径不要提交。
+
+## License
+
+[MIT](LICENSE)
+
+---
+
+# Lantai
+
+A native macOS menu-bar workbench that **read-only** watches local GUI coding agents (Codex Desktop, Kimi App), shows status, and deep-links back into the original app.
+
+This is an unofficial personal project. It parses private on-disk formats that can change without notice. No compatibility guarantee.
+
+```sh
+zsh scripts/build-app.sh
+open outputs/Lantai.app
+```
+
+macOS 14+. Ad-hoc signed. See `docs/AGENT_ADAPTERS.md` to add a provider.

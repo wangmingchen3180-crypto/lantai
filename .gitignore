@@ -16,3 +16,12 @@ xcuserdata/
 
 # User-level Agent Skills are installed once under ~/.agents/skills and linked here locally.
 .agents/skills/
+
+# Local Open Design / agent-browser skill copies; not part of the product.
+.od-skills/
+
+# Generator sidecars for HTML prototypes
+*.artifact.json
+
+# Rejected visual prototype; do not treat as design source.
+multitask-status-prototype.html

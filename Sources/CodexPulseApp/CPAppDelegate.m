@@ -20,7 +20,7 @@
     self.lastAppliedSignature = CPAgentsSignature(self.agents);
 
     self.statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSSquareStatusItemLength];
-    self.statusItem.button.image = [NSImage imageWithSystemSymbolName:@"sparkles" accessibilityDescription:@"Codex Pulse"];
+    self.statusItem.button.image = [NSImage imageWithSystemSymbolName:@"sparkles" accessibilityDescription:@"澜台"];
     self.statusItem.menu = [self statusMenu];
 
     __weak typeof(self) weakSelf = self;
@@ -114,12 +114,12 @@
 }
 
 - (NSMenu *)statusMenu {
-    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Codex Pulse"];
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"澜台"];
     NSMenuItem *openItem = [[NSMenuItem alloc] initWithTitle:@"打开工作台" action:@selector(openWorkbenchFromMenu:) keyEquivalent:@""];
     openItem.target = self;
     [menu addItem:openItem];
     [menu addItem:[NSMenuItem separatorItem]];
-    NSMenuItem *quitItem = [[NSMenuItem alloc] initWithTitle:@"退出 Codex Pulse" action:@selector(terminate:) keyEquivalent:@"q"];
+    NSMenuItem *quitItem = [[NSMenuItem alloc] initWithTitle:@"退出澜台" action:@selector(terminate:) keyEquivalent:@"q"];
     quitItem.target = NSApp;
     [menu addItem:quitItem];
     return menu;
@@ -238,8 +238,8 @@
 
     NSInteger attention = CPBadgeCountForAgents(self.agents, self.card.reviewStore);
     self.statusItem.button.toolTip = attention
-        ? [NSString stringWithFormat:@"Codex Pulse · %ld 个任务需关注", (long)attention]
-        : [NSString stringWithFormat:@"Codex Pulse · %@", CPStatusTitle(overall)];
+        ? [NSString stringWithFormat:@"澜台 · %ld 个任务需关注", (long)attention]
+        : [NSString stringWithFormat:@"澜台 · %@", CPStatusTitle(overall)];
 }
 
 @end
