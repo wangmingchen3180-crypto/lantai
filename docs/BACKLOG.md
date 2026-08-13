@@ -1,6 +1,18 @@
 # 澜台 / Lantai 后续事项
 
-记录日期：2026-08-12，命名与路线于 2026-08-13 更新。除「已落地」标注的条目外，其余仅作为后续设计与优化清单。
+记录日期：2026-08-12。命名与路线于 2026-08-13 更新；手机第一阶段、待办升级范围、UI 可变性于 2026-08-14 更新。除「已落地」标注的条目外，其余仅作为后续设计与优化清单。
+
+所有计划、决策、规格都只写在 `docs/` 里，索引见 [README.md](README.md)。不要在根目录再放一份计划。
+
+## 下一轮开工顺序（2026-08-14 夜定）
+
+用户当天收工，下一轮按这个顺序。四象限的交互已经定了（四格缩略 + 点选放大），所以原先「先纯设计、不写代码」那一步已经做完。
+
+1. **把本机未入库的第一阶段提交进 git。** Bridge、手机 PWA、配对卡目前只在用户 Mac 的工作区里，这个仓库的 `main` 还没有那些文件。不先入库，后面所有手机/待办改动都会和那批 diff 缠在一起。
+2. **补免费那档 PWA**：`manifest.json` + 一套图标 + 「添加到主屏幕」引导。半小时的事，做完手机上就是独立 App 图标，不需要 HTTPS。
+3. **待办升级**：四象限（四格缩略 + 点选放大）+ 截止时间 + 拖拽排序 + 个人/Agent 分区 + 已完成归档。新界面按 [UI_ARCHITECTURE.md](UI_ARCHITECTURE.md) 的三条规矩写，不进 `CPWorkbenchController.m`。
+4. **2A：撞 `codex app-server` 那个风险点**，把实时事件流打通。一行控制命令都不发。
+5. 之后才是 2B 指挥、2C 审批、Tailscale/HTTPS。
 
 ## 版本路线（整体）
 
@@ -8,8 +20,9 @@
 - **v0.4（进行中）** 命名与涟漪设计语言。命名已落地；运行时涟漪已按定稿写入 `CPRippleView`。还剩身份件：菜单栏同心弧、Logo、空状态、详情页返回入口。
 - **v0.5** 接入更多 GUI Agent。
 - **v0.6** 首次公开（Alpha）：许可证、README 风险说明、不含真实截图。身份件和打码截图可以在公开之后补，不必挡第一次上传。
-- **v0.7 起** Agent 待办联动（原阶段二）。
-- **v0.8 起** 澜台 Bridge + 手机 Web/PWA（原阶段三）。
+- **v0.7** 待办升级：四象限、截止时间、拖拽排序、个人/Agent 分区、已完成归档。范围已定，下一轮做。
+- **v0.8（本机已落地，未入库）** 澜台 Bridge + 手机 Web/PWA 第一阶段：只读观察 + 待办读写 + 扫码配对。2026-08-14 真机配对成功。代码还在本机工作区，没有进这个 git 仓库。
+- **v0.9** 手机指挥 Agent：先读侧事件流（2A），再三个写动作（2B），再审批（2C）。
 
 必须串行的一处：涟漪身份件（图标、Logo）要在皮肤之前做完，否则色板会围着一套即将废弃的符号去定。原先「开源必须排在接入更多 Agent 之后」已取消——第一次公开按当前 Alpha 能力写清楚限制即可，能力清单随适配器再改 README。
 
@@ -52,7 +65,7 @@
 
 可行，但只做「换色」，不做「整套换皮」。现状已经有一层颜色入口（`CPAccent` / `CPBg` / `CPSurface` / 状态色），数值仍写死在 `CPDyn` 里；部分 `CALayer.CGColor` 是快照，换肤时要重新赋值，否则灯和描边会留在旧色上。
 
-成本已实测量化，见 [UI_ARCHITECTURE.md](UI_ARCHITECTURE.md)：换色便宜（13 个函数覆盖 142 个调用点），运行时切换要处理 65 处 `CGColor` 快照，换密度要先收拢约 160 个散落字面量。那份文档还定死了一条边界——**皮肤不许承载交互变化**，否则皮肤配置会长成万能开关。
+成本已实测量化，见 [UI_ARCHITECTURE.md](UI_ARCHITECTURE.md)：换色便宜（12 个函数覆盖 142 个调用点），运行时切换要处理 65 处 `CGColor` 快照，换密度要先收拢 116 个约束字面量 + 23 个圆角 + 19 个字号。那份文档还定死了一条边界——**皮肤不许承载交互变化**，否则皮肤配置会长成万能开关。
 
 首版范围：
 
@@ -132,14 +145,150 @@
 
 ### 待决策问题
 
-- 界面是固定分为“个人待办 / Agent 待办”，还是保持一个列表并以来源筛选、标签或自动分组呈现。
+- ~~界面是固定分为“个人待办 / Agent 待办”，还是保持一个列表并以来源筛选、标签或自动分组呈现~~ → 已定：分区复用已有 `agent_id`（非空即 Agent 待办），界面上分开。
 - Agent 根据对话总结时，首版只生成标题，还是同时生成说明/下一步；哪些字段应该在 Todo 栏直接展示。
 - 用户明确发出“转为待办”指令时是直接创建，还是先让 Agent 回显摘要并等待一次确认。
 - 是否允许 Agent 主动提议待办，如果允许，建议项的数量上限、展示位置和拒绝后的降噪规则如何设置。
 
+### 待办升级（已选定范围，2026-08-14 用户确认）
+
+要做：**截止时间 + 到期提醒、四象限、拖拽排序、个人/Agent 分区、已完成归档**。备注/子项这次不做。
+
+`CPTodoStore` 已有 `PRAGMA user_version` 的 switch 式迁移框架（当前 v1），加字段是 v1→v2 一个 case 的事，成本低。已有真实待办在库里，迁移必须就地升级而不是重建表。
+
+#### 交互：四格缩略 + 点选放大（已定）
+
+硬摊 2×2 装不进现在的待办栏（展开态列表区 520×158，每格只剩两行高）。用户提出的解法：常态四格各占一小格（象限名、条数、最多一两条标题），点中的那一格放大成可读可录入的完整列表，其余三格让位收成窄条。
+
+这个方案同时解决三个问题：空间、手机窄屏（同一套「概览 → 点开一格」）、以及「新界面不进 1712 行那个文件」的试验田。细节与三条规矩见 [UI_ARCHITECTURE.md](UI_ARCHITECTURE.md)。
+
+#### 字段草案（v1→v2，一次迁移做完）
+
+- `due_at REAL NULL`：截止时间。到期提醒的触发在 Mac 端算，不依赖手机在线。
+- `urgent INTEGER NOT NULL DEFAULT 0` / `important INTEGER NOT NULL DEFAULT 0`：四象限就是这两个布尔的组合，不要存 `quadrant` 枚举。拖到另一个象限只是改一个布尔；以后想单独按重要性筛选也不用再迁移。
+- `sort_order REAL NOT NULL`：拖拽排序。用浮点而不是整数，插入两行之间取中间值即可，不必重排整列。排序作用域是「同一象限 + 同一分区内」，跨象限拖拽等于改象限。
+- `archived_at REAL NULL`：归档是软状态，不是删除；`allTodos` 默认不返回已归档。
+- 分区复用已有的 `agent_id`：非空即 Agent 待办。不新增分区字段。
+
+迁移后必须跑一次自测，确认旧数据的 `sort_order` 有确定值（按现有 `created_at` 升序回填），否则排序会是随机的。
+
+#### 截止时间 ≠ 到期提醒
+
+HTTPS 没通之前，提醒只能是 Mac 端本地通知 + 手机打开时看到；通了之后才能锁屏推送。所以「截止时间」和「提醒」是两步，可以先做前者。
+
+硬规矩：Mac 与手机共用同一套写入接口和字段，不允许手机端自己加字段。加字段时同步 `BRIDGE_API.md`（待那份文件入库），否则两边必然漂移。
+
+## 代码债与模块边界（2026-08-13 体检，2026-08-14 补数字）
+
+现状不是屎山：总量约 8500 行，数据层（`CPModels` / `CPTodoStore` / `CPAgentSources` / `CPStatusEngine` / `CPStateCache`）不依赖任何 UI 控制器，依赖方向干净。已知的债集中在 UI 层。改 UI 各层的实际成本已经量化，见 [UI_ARCHITECTURE.md](UI_ARCHITECTURE.md)，这里只记账，不要求现在偿还：
+
+- `CPWorkbenchController.m` 1712 行；头文件暴露 52 个属性，是最接近 god object 的地方。**行数和属性数都不许再涨。**
+- `CPSelfTests.m` 2607 行单文件。
+- `CPHUDController` import 了 `CPWorkbenchController`（UI 咬 UI 的唯一一处）。
+- 密度字面量：约束 116、圆角 23、字号 19。`CGColor` 快照 65 处。绕过调色板直写颜色 7 处。
+
+新增手机/Bridge/待办四象限代码时的三条硬规矩（防止债扩散）：
+
+1. Bridge 和 Agent driver 永远不 import 任何 Controller；UI 永远不 import Bridge。两边只依赖数据层。
+2. 手机端只认识澜台 Bridge 自己的协议；各家 Agent 的协议细节藏在 driver 后面，对外只暴露能力标签（可指挥 / 只可观察 / 可打断 / 可审批）。
+3. 每个 driver 自带健康度（复用 `CPAgentHealth` 语义），协议对不上就明确降级只读，不静默出错。
+
+新界面额外三条（从四象限这一版开始执行，详见 [UI_ARCHITECTURE.md](UI_ARCHITECTURE.md)）：
+
+1. 新界面不进 `CPWorkbenchController.m`，各自成文件。
+2. 新界面不许出现新的密度字面量，走 token（表还没有就先在自己文件顶部定命名常量）。
+3. 新界面的自测只钉行为，不钉像素。
+
+现在不要重构那个 1712 行的类。在不知道未来界面长什么样的时候拆，是凭想象划边界。正确时机是真的开始改布局那一次。
+
+可选加固：若 `Package.swift` 的 SPM 路修通，把数据层拆为独立 target，让「Bridge 不许碰 UI」成为编译错误而非口头纪律。
+
 ## 手机联动与远程工作台
 
 目标：为澜台增加手机客户端，可随时查看 Mac 上的 Agent/任务运行情况，完成审阅、处理待办，并在可靠的 Agent 接口范围内下发操作。Mac 端仍是本地任务和工作目录的执行主体，手机端不直接读写 Codex/Kimi 的数据库或任务文件。
+
+### 2026-08-13 实测结论（Codex 控制通路已验证）
+
+在本机实测，原「评估 `codex app-server`」一项已从假设变为事实：
+
+- Codex Desktop 即 `/Applications/ChatGPT.app`，内置 `codex` 二进制（实测版本 0.147.0-alpha.6.5），且桌面端自身就在跑 `app-server`。
+- `codex app-server --listen stdio://` 握手成功；`thread/list` 能读到 `~/.codex/sessions` 的真实会话（状态、预览、时间戳）。探测全程只读。
+- 协议可用 `generate-json-schema` 自描述：95 个客户端方法（含 `turn/start`、`turn/steer`、`turn/interrupt`、`thread/resume`、`thread/rollback`），70 个服务端通知（逐字输出、命令输出、diff、计划、token 用量）。审批是服务端反向请求（Exec/ApplyPatch/Permissions/ToolRequestUserInput 四类），天然对应手机上的同意/拒绝按钮。
+- 官方自带远程能力：`app-server daemon bootstrap --remote-control`（自述 for SSH-driven use）、`enable-remote-control`、`--listen ws://` 加 capability-token 鉴权。澜台不需要自己发明 Agent 控制协议。
+- 协议标注 `[experimental]`、版本 alpha，会变。对策：启动时用 schema 自检，认不出就降级只读（接 `CPAgentHealth` 那套「数据源不可用」显示）。
+- 待实测的第一个真问题：桌面端已有一个 app-server 在跑，澜台自起一个是双写；控制桌面端活跃会话应验证 `app-server proxy --sock` 接同一 daemon 的路子。这是整条指挥路线唯一的真风险，必须先撞。
+
+多 Agent 控制的定调（2026-08-13）：原生控制协议只有 Codex 一家全套，Claude Code（Agent SDK / stream-json）次之，Kimi App GUI 无。首版只做 Codex driver；其他家走「Codex 编排 CLI + 澜台原生只读观察」（本机已装 Kimi CLI 与 Claude Code CLI，Codex 驱动 Kimi CLI 的模式已有 kimi-cli-supervisor skill 实践）。代价记录在案：观察被压扁成命令输出、双份 token、打断粒度粗。UI 上「通过 Codex 转达」与「原生指挥」必须分开标注。
+
+### 第一阶段已落地（2026-08-14，代码尚未入库）
+
+只读观察 + 待办读写这一刀在用户本机已经可用，真机扫码配对成功。契约见 `BRIDGE_API.md`（随那批代码一起进仓库，目前还不在这个 git 副本里）：
+
+- `Sources/CodexPulseBridge/`：自写 HTTP + SSE（BSD socket + 独立 accept 队列），配对码 / token / 设备管理独立成 `CPBridgePairing`，token 存 Keychain。
+- 手机端 `Resources/mobile/`：无依赖 PWA，色板与涟漪规格直接取自 Mac 端 `CPStatusEngine` 与 `CPRippleView`；`?demo=1` 显式演示态，真实模式连不上只显示离线，不拿假数据兜底。
+- 入口：工作台标题栏 iPhone 图标按钮 + 菜单栏「连接手机…」双入口。原打算只放菜单栏（配对是一次性动作，不该占标题栏），实测失败——菜单栏图标多时被系统折叠，用户找不到。**找不到的入口等于不存在。** 工作台按钮只发 `CPConnectPhone` 通知，不 import Bridge。
+- `CPPairingSheetController` 显示二维码 + 六位码 + 倒计时，Bridge 未启动时明说而不画空码。
+- 二维码走 CoreImage `CIQRCodeGenerator`，按整数倍放大后原尺寸显示；自测用 `CIDetector` 回读断言扫得出且内容一致。
+- 配对成功自动关卡片：Bridge 发 `CPBridgeDevicePairedNotification`（只带设备名，token/deviceId 不出 Bridge），卡片显示「<设备> 已连接」并撤掉已失效的码，1.4s 后关闭；自测态不排延迟，直接断言确认态。
+- 分层守住：Bridge 不 import 任何 Controller，UI 不 import Bridge，手机端只认澜台协议。
+- 自测：`Bridge self-test` 14 项（含鉴权、幂等 opID、锁定、路径脱敏、SSE、SO_SNDTIMEO），`Pairing UI self-test` 含 `paired-state`。
+
+审阅修掉的三处（记账，避免重犯）：
+
+- SSE 鉴权原本只认 Authorization 头，而浏览器 `EventSource` 无法设自定义头，实时推送必然 401。现仅 `/api/events` 额外接受 query token。
+- `activity` / `title` 会把家目录绝对路径带给手机。现在 Bridge 输出层统一脱敏为 `~`，不改 CPTask 与 Mac 端显示。
+- SSE 阻塞写跑在状态队列上且未设 `SO_SNDTIMEO`，手机断网可致整个 Bridge 假死。现已设写超时并在失败时清理客户端。
+
+另记一处产品级坑：澜台是单实例应用。旧实例还在跑时，新构建的功能（菜单项、按钮）全部看不见。`main.m` 已加提示：「若刚更新过却看不到新功能，请先退出再打开」。以后凡是「我明明加了怎么没有」先查是不是旧进程。
+
+尚未入库：上述全部代码仍在用户 Mac 工作区。这个仓库的 `main` 没有 `Sources/CodexPulseBridge/`、`Resources/mobile/`、`CPPairingSheetController`。下一轮第一件事就是提交它们。
+
+尚未做：手机端指挥 Agent（第二阶段）、异地访问（Tailscale，未实测）、装成主屏 App、推送。
+
+### 指挥路线：先看得准，再能指挥（2026-08-14 定序）
+
+顺序是 **2A → 2B → 2C**。理由：指挥的价值取决于能不能实时看到指挥的后果，事件流没通就发命令，等于闭着眼开车。
+
+#### 2A. 让手机看到「正在发生」（读侧）
+
+现在手机看到的是 `~/.codex/sessions` 落盘后的结果，秒级滞后且没有过程。这一步把 `codex app-server` 的实时通知接进来，仍然一行控制命令都不发。
+
+- 新增 `Sources/CodexPulseAgents/CPCodexDriver`：启动/接上 app-server，跑 JSON-RPC，把 70 类服务端通知折叠成澜台自己的少数几种事件（逐字输出、命令输出、diff、计划、token 用量、等待审批）。
+- 开工第一件事是验证 `app-server proxy --sock` 能否接桌面端已在跑的那个 daemon。接不上就只能自起进程，那意味着「只能观察澜台自己启的会话」，产品形态要跟着改。
+- 启动时用 `generate-json-schema` 自检协议；认不出就整体降级只读，走 `CPAgentHealth` 的「数据源不可用」显示，不静默出错。
+- Bridge 侧只加事件类型，不加控制端点；`BRIDGE_API.md` 同步扩事件表。
+- 完成判据：手机上能逐字看到 Codex 正在写的内容，且拔掉 app-server 后手机明确显示降级而不是空白。
+
+#### 2B. 手机能指挥（写侧，只做安全的三个动作）
+
+- 只开三个：`turn/start`（发新指令）、`turn/steer`（补充指令）、`turn/interrupt`（打断）。`thread/rollback` 这类会改历史的先不开。
+- 一切写操作走 Mac 端指令队列：验设备权限 → 验任务归属 → 验当前状态，再执行，回传已接收/执行中/成功/失败。opID 幂等复用第一阶段那套。
+- 只允许指挥「澜台托管任务」。桌面端已有会话保持只读，除非 2A 证明能接同一 daemon。
+- UI 必须区分「原生指挥」与「通过 Codex 转达」（Kimi/Claude 走 CLI 编排那条），不能让用户以为两者可靠性一样。
+
+#### 2C. 审批（真正把手机变成遥控器的那一步）
+
+app-server 的四类反向请求（Exec / ApplyPatch / Permissions / ToolRequestUserInput）天然对应手机上的同意/拒绝。做到这里，「人在外面，Agent 卡在等确认」才算解决。审批请求有超时，手机端要显示剩余时间，过期要如实说明是超时而不是拒绝。
+
+### 装成 iPhone App（PWA，2026-08-14 查证）
+
+结论：**能装成看起来完全像原生 App 的东西（全屏、自己的图标、独立进程），但要拿到推送和角标，必须先解决 HTTPS。**
+
+现状（`Resources/mobile/`，本机已有、未入库）：已有 `apple-mobile-web-app-capable` 等 meta，加到主屏就能全屏无地址栏运行；但没有 manifest、没有图标、没有 service worker。
+
+分成两档，成本差很远：
+
+- **免费的一档（不需要 HTTPS，下一轮做）**：补 `manifest.json`（`display: standalone`、图标、`theme_color`、`start_url`）+ 一套 App 图标 + 手机端一句「点分享 → 添加到主屏幕」的引导。iOS 没有 `beforeinstallprompt`，也没有任何 API 能唤起分享面板，装不装只能靠引导文案。做完就有独立图标、全屏、独立进程。iOS 对主屏 Web App 的存储不套用 Safari 那个 7 天清理，token 不会莫名失效。
+- **要 HTTPS 的一档（推送 + 图标角标）**：`navigator.setAppBadge()` 和 Web Push 都只在「已加到主屏的 Web App」里存在，且 **service worker 与 Push 强制要求 HTTPS，iOS 连 localhost 都不豁免**。现在是 `http://192.168.x.x:8787`，这一档一行代码都不通。
+
+HTTPS 两条路，建议选第一条：
+
+1. **Tailscale + `tailscale serve`**：拿到 `*.ts.net` 的真证书，顺带把「异地访问」一起解决。代价是 Mac 和手机都要装 Tailscale。
+2. **mkcert 自签 + 手机装根证书**：不依赖外部服务，但用户要在 iOS 设置里手动「证书信任设置」开完全信任，讲不清就是劝退。
+
+Web Push 的其他硬约束（做之前照着核对，避免白写）：manifest 必须 `display: standalone`（否则 iOS 上 `registration.pushManager` 直接是 undefined）；权限必须由真实点击触发，页面加载时请求会被自动拒；不支持静默推送，收到 push 必须 `showNotification`，否则 iOS 会吊销通知权限；`actions` 按钮、`image`、`vibrate` 等选项被 WebKit 静默忽略，通知内容全部塞进 title 和 body；VAPID 走标准协议，Mac 端 Bridge 可以自己直接向 `web.push.apple.com` 发，不需要第三方服务器。可靠性上留一手：iOS Web Push 有重启后不触发、静默掉订阅的既有毛病，`pushsubscriptionchange` 要处理，每次启动重查 `getSubscription()`；关键信息不能只走推送这一条路。
+
+待验证：`setAppBadge` 是否也需要先拿到通知权限（多处实践称需要，未在本机确认）。
 
 ### 第一阶段：Mac 本地 Bridge + 手机端 MVP
 
@@ -192,10 +341,32 @@
 ### 待决策问题
 
 - 首版是否只面向个人使用，并要求 Mac 必须在线。
-- 手机首版是 PWA，还是直接开发 SwiftUI iOS 客户端。
-- 异地访问是否接受用户安装 Tailscale，以及什么阶段引入澜台 Relay。
+- ~~手机首版是 PWA，还是直接开发 SwiftUI iOS 客户端~~ → 已定 PWA 并在本机落地；加主屏后即为独立全屏 App，暂无换原生的理由。
+- 异地访问是否接受用户安装 Tailscale，以及什么阶段引入澜台 Relay。倾向接受：Tailscale 同时解决 HTTPS（`*.ts.net` 真证书），是通往推送与图标角标的唯一低摩擦路径。
 - Todo 是否要支持 Mac 离线时在手机修改；若需要，优先选 CloudKit 还是跨平台 Relay/CRDT。
 - “已审阅”是账号级状态还是每设备状态，是否与现有“已查看/已处理”语义一起重新设计。
+- ~~待办四象限放在哪（工作台内独立视图 / 另开窗口 / 只在手机做）~~ → 已定：就在现有待办栏里，四格缩略 + 点选放大。
+
+## 本轮记下的经验（2026-08-14）
+
+这些不是计划，是踩过之后不能再忘的东西。改 UI 的量化分析在 [UI_ARCHITECTURE.md](UI_ARCHITECTURE.md)，这里只记产品与工程上的教训。
+
+- **找不到的入口等于不存在。** 配对入口原放菜单栏，图标一多就被系统折叠，用户反复说看不到。后来加到工作台标题栏才解决。以后凡是一次性、低频的动作，也必须在用户正在看的那个面上有入口。
+- **单实例会把新功能藏起来。** 旧进程还在跑，新构建的按钮和菜单项全部看不见。表现为「你说加了但没有」。先退出再打开；启动时若已有实例，要明说而不是默默退出。
+- **功能落了 UI 还能改，但尺寸会锁死。** 数据层加字段和界面长什么样是解耦的。真正会锁死的是硬编码尺寸（`CPCardWidth 520` 等）和钉像素的自测。所以新界面只钉行为。
+- **皮肤不是换 UI。** 用皮肤机制承载交互变化，配置会长成万能开关。判断标准：切换后如果自测要换一套，它就不是皮肤。
+- **现在不要拆那个 1712 行的类。** 在不知道未来界面长什么样的时候拆，是凭想象划边界。现在只加防线：新界面不往里塞。
+- **密度 token 是唯一现在就值得花的钱。** 换色已经集中；换布局要等真改的那天。圆角/间距/字号现在每加一个界面就多几十个字面量，债线性增长。
+- **指挥之前先把「正在发生」看清。** 事件流没通就发命令，等于闭着眼开车。2A 必须先于 2B。
+- **iPhone Web App 分两档。** 全屏独立图标不需要 HTTPS；推送和角标硬性要求 HTTPS，iOS 连 localhost 都不豁免。不要把两档写成一件事。
+- **浏览器 `EventSource` 不能设自定义头。** SSE 鉴权只能额外走 query token，且仅限那一个端点。
+- **路径脱敏在输出层做。** 不要改 `CPTask` 本身，否则 Mac 端显示也被改掉。
+- **SSE 写必须有超时。** 没 `SO_SNDTIMEO` 时手机断网能把整个 Bridge 卡住。
+- **配对成功通知不许带凭据。** 通知会流到 UI 层，只许带设备名。
+- **计划只放 `docs/`。** 同一件事写进两个文件，一定有一份先过期。推翻旧决定时划掉留在原处，不要直接删。
+- **数字要能重跑。** 「约 160 个字面量」这类结论必须附命令，否则三个月后没人知道它还成不成立。
+
+自动关闭配对卡只验到自测那一层（确认态显示对、失效的码撤掉了）。从手机真扫一次到卡片自己关上的完整链路，还要人工点一次才算数。
 
 ## 性能
 

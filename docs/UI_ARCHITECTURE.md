@@ -165,3 +165,5 @@ rg -c "^@property" Sources/CodexPulse/CPWorkbenchController.h
 ```
 
 第 3 条和第 5 条是硬线：**绕过调色板的数量不许涨，`CPWorkbenchController.m` 的行数不许涨。** 其余允许缓慢改善。
+
+配对入口、单实例、指挥顺序、PWA 分档这类产品/工程教训不在这份文档里，见 [BACKLOG.md](BACKLOG.md) 的「本轮记下的经验」。
