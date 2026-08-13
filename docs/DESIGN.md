@@ -4,8 +4,8 @@
 
 对照原型：
 
-- 定稿预览：[ripple-selection-preview.html](../ripple-selection-preview.html)（方向 A，已写入 `CPRippleView`）
-- 三条路线对比：[ripple-style-lab.html](../ripple-style-lab.html)（实验室，不是产品依据）
+- 定稿预览：[ripple-selection-preview.html](prototypes/ripple-selection-preview.html)（方向 A，已写入 `CPRippleView`）
+- 三条路线对比：[ripple-style-lab.html](prototypes/ripple-style-lab.html)（实验室，不是产品依据）
 - [multitask-status-prototype.html](../multitask-status-prototype.html) 已被否决，不要当设计依据，也不要提交到公开仓库
 
 ## 已经落地：运行时涟漪
