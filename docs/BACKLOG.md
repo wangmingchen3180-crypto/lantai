@@ -6,11 +6,11 @@
 
 ## 下一轮开工顺序（2026-08-14 夜定）
 
-用户当天收工，下一轮按这个顺序。四象限的交互已经定了（四格缩略 + 点选放大），所以原先「先纯设计、不写代码」那一步已经做完。
+用户当天收工，下一轮按这个顺序。四象限的**交互**已经定了（四格缩略 + 点选放大）；**视觉方向没有定**——v3 原型审美被否，编码代理不再发明下一版样子。先用 Claude Design 出 4 张静帧再挑，方法见 [UI_ARCHITECTURE.md](UI_ARCHITECTURE.md)「四、审美失败之后」。
 
 1. **把本机未入库的第一阶段提交进 git。** Bridge、手机 PWA、配对卡目前只在用户 Mac 的工作区里，这个仓库的 `main` 还没有那些文件。不先入库，后面所有手机/待办改动都会和那批 diff 缠在一起。
 2. **补免费那档 PWA**：`manifest.json` + 一套图标 + 「添加到主屏幕」引导。半小时的事，做完手机上就是独立 App 图标，不需要 HTTPS。
-3. **待办升级**：四象限（四格缩略 + 点选放大）+ 截止时间 + 拖拽排序 + 个人/Agent 分区 + 已完成归档。新界面按 [UI_ARCHITECTURE.md](UI_ARCHITECTURE.md) 的三条规矩写，不进 `CPWorkbenchController.m`。
+3. **待办升级**：先选定视觉静帧，再做四象限（四格缩略 + 点选放大）+ 截止时间 + 拖拽排序 + 个人/Agent 分区 + 已完成归档。新界面按 [UI_ARCHITECTURE.md](UI_ARCHITECTURE.md) 的三条规矩写，不进 `CPWorkbenchController.m`。
 4. **2A：撞 `codex app-server` 那个风险点**，把实时事件流打通。一行控制命令都不发。
 5. 之后才是 2B 指挥、2C 审批、Tailscale/HTTPS。
 
