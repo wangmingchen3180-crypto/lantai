@@ -7,7 +7,7 @@
 | 文件 | 装什么 | 什么时候写 |
 | --- | --- | --- |
 | [BACKLOG.md](BACKLOG.md) | 版本路线、未做事项、已落地记录、待决策问题、踩过的坑 | 定了要做什么、做完了某一块、或记下一条不能再忘的教训 |
-| [UI_ARCHITECTURE.md](UI_ARCHITECTURE.md) | 改 UI 的实际成本、皮肤边界、新界面必须守的规矩 | 动界面结构、抽 token、考虑换皮之前 |
+| [UI_ARCHITECTURE.md](UI_ARCHITECTURE.md) | 改 UI 的实际成本、皮肤边界、新界面规矩、以及为什么不做「一切皆插件」 | 动界面结构、抽 token、考虑换皮或插件化之前 |
 | [DESIGN.md](DESIGN.md) | 涟漪设计语言、视觉规格、身份件（图标 / Logo / 空状态） | 改视觉规格、画图标 |
 | `BRIDGE_API.md` | 手机端与 Mac 端之间的协议契约 | 改接口、加字段、加事件类型 |
 | [AGENT_ADAPTERS.md](AGENT_ADAPTERS.md) | 接入各家 Agent 的适配器边界与健康度语义 | 接新 Agent、改数据源探测 |
