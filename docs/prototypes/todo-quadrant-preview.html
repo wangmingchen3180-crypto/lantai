@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>待办四象限 · 原型 v3（水线）</title>
+<style>
+/* 全部取自 design-systems/lantai/DESIGN.md。不要在这里发明数值。
+   v3 的设计主张：「有生气」= 差异 + 回应 + 数据可见，不等于加动画。
+   - 差异：四格是四种水，水线形态不同，不再是四个相同灰盒子
+   - 回应：hover / 完成 / 新增 都有 100ms 级的手感反馈
+   - 数据可见：水位高度 = 条数；有过期条目时水线泛红 */
+:root{
+  --bg:#13151C; --surface:#20222C;
+  --fg:#F2F2F5; --fg2:#C7C7CF; --muted:#9E9FA8;
+  --accent:#668FFF; --hairline:rgba(255,255,255,.08); --border:#555969;
+  --ready:#61E380; --attention:#FFA84C; --failed:#FF787A; --working:#7AA3FF;
+  /* 圆角只用梯度内的值：卡片 10 / 行 8 / 小标签 6 / 极小 2 */
+  --r-card:10px; --r-row:8px; --r-chip:6px;
+  /* 运动：面板级 0.20 进 0.24 出；hover 0.12 进 0.15 出；一律 ease-out，无回弹 */
+  --t-in:.2s; --t-out:.24s; --e:cubic-bezier(.22,.61,.36,1);
+  --wash:rgba(255,255,255,.04);
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{background:#0e1015;color:var(--fg);
+  font:13px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC",system-ui,sans-serif;
+  -webkit-font-smoothing:antialiased}
+body{padding:32px 24px 48px}
+.stage{display:flex;gap:40px;align-items:flex-start;justify-content:center;flex-wrap:wrap}
+.cap{font-size:10px;color:var(--muted);margin-bottom:10px;text-align:center}
+
+/* ---------- 画布：模拟工作台卡片 ---------- */
+.card{background:var(--bg);border:1px solid var(--hairline);border-radius:var(--r-card);overflow:hidden}
+.card-mac{width:520px}
+.stub{height:56px;display:flex;align-items:center;gap:10px;padding:0 12px;color:var(--muted);font-size:10px}
+.stub .d{width:7px;height:7px;border-radius:50%;background:var(--working)}
+.card-phone{width:390px;height:720px;display:flex;flex-direction:column}
+.card-phone .stub{height:40px;justify-content:space-between;font-size:10px}
+
+/* ---------- 待办区 ---------- */
+.todo{position:relative;background:var(--surface);border:1px solid var(--hairline);
+  border-radius:var(--r-card);overflow:hidden}
+.card-mac .todo{height:158px;margin:0 12px 12px}          /* 硬约束：158，不许超 */
+.card-phone .todo{flex:1;min-height:0;margin:0 12px 12px}
+
+/* 待分类横条：条数用 muted，不用语义色 */
+.inbox{height:20px;display:flex;align-items:center;gap:6px;padding:0 10px;
+  font-size:9px;color:var(--muted);border-bottom:1px solid var(--hairline);
+  cursor:pointer;user-select:none;transition:background var(--t-in) var(--e)}
+.inbox:hover{background:var(--wash)}
+.inbox .tag{font-size:9px;padding:0 5px;border-radius:var(--r-chip);border:1px solid var(--hairline)}
+.card-phone .inbox{height:26px;font-size:10px;padding:0 14px}
+.card-phone .inbox .tag{font-size:10px}
+
+/* ---------- 四格态：选择器,不是列表 ---------- */
+.quads{position:absolute;left:0;right:0;top:20px;bottom:0;
+  display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr}
+.card-phone .quads{top:26px}
+.quad{position:relative;padding:8px 10px;cursor:pointer;overflow:hidden;
+  display:flex;flex-direction:column;
+  transition:background var(--t-in) var(--e),opacity var(--t-in) var(--e)}
+.quad:hover{background:var(--wash)}
+.card-phone .quad{padding:16px 16px}
+/* 格与格之间靠留白分隔,不画田字格。只在中缝各留一条极淡分隔,长度不满格(呼吸) */
+.seam{position:absolute;background:var(--hairline);pointer-events:none;z-index:1}
+.seam-v{width:1px;left:50%;top:14%;bottom:14%}
+.seam-h{height:1px;top:50%;left:8%;right:8%}
+
+.qname{font-size:12px;font-weight:600;color:var(--fg);letter-spacing:.5px}
+.card-phone .qname{font-size:15px}
+.qcount{font-size:9px;color:var(--muted);margin-left:6px;font-weight:400;letter-spacing:0}
+.card-phone .qcount{font-size:11px}
+.qhead{display:flex;align-items:baseline;gap:0}
+/* 状态点：澜台通用语言（7pt 圆点表状态）。这是四格态里唯一的颜色,而且是数据——
+   该格最紧的那条的到期状态。上线工作台的生气就来自那一列彩色点,四格态不能全是灰的。 */
+.qdot{flex:none;width:5px;height:5px;border-radius:50%;margin-right:6px;
+  transform:translateY(-3px);transition:background .15s var(--e)}
+.card-phone .qdot{width:6px;height:6px;margin-right:8px;transform:translateY(-4px)}
+.qdot.none{background:transparent}
+.qdot.today{background:var(--attention)}
+.qdot.over{background:var(--failed)}
+.qdot.calm{background:var(--muted);opacity:.4}
+.quad.empty .qname{color:var(--fg2);opacity:.55}       /* 空格退到背景里,让有内容的那格自然成为主角 */
+.quad.empty .qcount{opacity:.5}
+
+/* 密度按画布分档：Mac 每格只有 59px,只放名字;手机有地方,补说明和预览,
+   否则四格是三百多像素的虚空（v3 第一次渲染的教训）。 */
+.qdesc,.qprev{display:none}
+.card-phone .qdesc{display:block;font-size:11px;color:var(--muted);margin-top:4px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.card-phone .qprev{display:block;margin-top:12px;font-size:12px;color:var(--fg2)}
+.card-phone .qprev div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  line-height:22px;opacity:.85}
+.card-phone .qprev div{display:flex;align-items:center;gap:7px}
+.card-phone .qprev i{flex:none;width:4px;height:4px;border-radius:50%;
+  background:var(--muted);opacity:.45}
+.card-phone .qprev i.today{background:var(--attention);opacity:1}
+.card-phone .qprev i.over{background:var(--failed);opacity:1}
+.card-phone .qprev span{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.card-phone .quad.empty .qprev::after{content:"空着";font-size:11px;color:var(--muted);opacity:.6}
+
+/* 水线：静态几何,数据变成形状。hover 时轻浮 1px 作为回应 */
+.wl{position:absolute;left:0;right:0;bottom:0;height:34px;pointer-events:none;
+  transition:transform var(--t-in) var(--e)}
+.card-phone .wl{height:64px}
+.quad:hover .wl{transform:translateY(-1px)}
+.wl svg{display:block;width:100%;height:100%}
+.wl .line{fill:none;stroke:rgba(255,255,255,.13);stroke-width:1;vector-effect:non-scaling-stroke}
+/* 水体必须向下淡出。带硬下边的矩形填充会读成一个错位的 div,不是水（v3 第一次渲染的教训） */
+.wl.hot .line{stroke:rgba(255,120,122,.20)}             /* 该格有过期条目 → 水线微微泛红,克制 */
+
+/* ---------- 满格态 ---------- */
+.panel{position:absolute;left:0;right:0;bottom:0;top:20px;z-index:4;
+  background:var(--surface);display:none;flex-direction:column;
+  will-change:transform,opacity}
+.card-phone .panel{top:26px}
+.panel.open{display:flex}
+/* Mac：标题与输入并成一行。独占一行的输入 band 会把 138px 里的列表挤到只剩 2 行
+   （v3 满格态渲染的教训）。合并后列表可见 4 行。手机空间够,保持上下两段。 */
+.phead{flex:none;border-bottom:1px solid var(--hairline)}
+.card-mac .phead{display:flex;align-items:center;gap:8px;padding:0 8px;height:30px}
+.ptop{flex:none;display:flex;align-items:baseline;gap:8px}
+.card-mac .ptop{flex:0 1 auto;min-width:0}
+.card-phone .ptop{padding:12px 14px 10px}
+.pname{font-size:13px;font-weight:600}
+.card-phone .pname{font-size:16px}
+.pdesc{font-size:9px;color:var(--muted);flex:1;min-width:0;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.card-phone .pdesc{font-size:11px}
+.pback{flex:none;font-size:9px;color:var(--muted);background:none;border:none;
+  cursor:pointer;font-family:inherit;padding:2px 0 2px 6px;transition:color var(--t-in) var(--e)}
+.pback:hover{color:var(--fg2)}
+/* 手机：收起回到标题行右端,不要自成一行 */
+.card-phone .phead{position:relative}
+.card-phone .pback{position:absolute;top:14px;right:14px;font-size:11px;padding:0}
+.card-phone .ptop{padding-right:44px}
+
+/* 输入：沿用上线待办栏的写法——暗底 + hairline,新增是 plus 图标而非实心主按钮 */
+.pin{flex:none;display:flex;align-items:center;gap:6px;
+  background:rgba(0,0,0,.22);border:1px solid var(--hairline);border-radius:var(--r-row);
+  padding:0 3px 0 9px;transition:border-color var(--t-in) var(--e)}
+.card-mac .pin{flex:1 1 auto;min-width:0;height:22px}
+.card-phone .pin{margin:10px 14px;padding:2px 4px 2px 12px}
+.pin:focus-within{border-color:rgba(102,143,255,.55)}
+.pin input{flex:1;min-width:0;background:none;border:none;outline:none;color:var(--fg);
+  font:11px/1 inherit;font-family:inherit;padding:7px 0}
+.card-mac .pin input{padding:0}
+.card-mac .plus{width:18px;height:18px}
+.card-phone .pin input{font-size:13px;padding:9px 0}
+.pin input::placeholder{color:var(--muted)}
+.plus{flex:none;width:22px;height:22px;border-radius:var(--r-chip);border:none;
+  background:none;cursor:pointer;color:var(--muted);position:relative;
+  transition:color var(--t-in) var(--e),background var(--t-in) var(--e)}
+.plus:hover{color:var(--fg);background:var(--wash)}
+.plus::before,.plus::after{content:"";position:absolute;background:currentColor;
+  left:50%;top:50%;transform:translate(-50%,-50%)}
+.plus::before{width:9px;height:1px}
+.plus::after{width:1px;height:9px}
+
+.plist{flex:1;min-height:0;overflow-y:auto;padding:1px 0 4px;
+  scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.14) transparent}
+.plist::-webkit-scrollbar{width:3px}
+.plist::-webkit-scrollbar-thumb{background:rgba(255,255,255,.14);border-radius:2px}
+
+/* 行：透明底,只在 hover 加 4% 白。不是卡片 */
+.row{display:flex;align-items:center;gap:8px;height:26px;margin:0 6px;padding:0 4px;
+  border-radius:var(--r-row);position:relative;
+  transition:background .12s var(--e)}
+.row:hover{background:var(--wash)}
+.card-phone .row{height:38px;gap:10px;margin:0 10px;padding:0 4px}
+.chk{flex:none;width:15px;height:15px;border-radius:50%;border:1.5px solid var(--muted);
+  cursor:pointer;position:relative;background:none;
+  transition:border-color .12s var(--e)}
+.chk:hover{border-color:var(--fg2)}
+.row.done .chk{border-color:var(--ready);background:var(--ready)}   /* 完成是绿色,不是强调蓝 */
+.row.done .chk::after{content:"";position:absolute;left:4px;top:2px;width:4px;height:7px;
+  border:solid var(--surface);border-width:0 1.5px 1.5px 0;transform:rotate(42deg)}
+.rt{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  font-size:11px;color:var(--fg2);transition:color .15s var(--e)}
+.card-phone .rt{font-size:13px}
+.row.done .rt{color:var(--muted);text-decoration:line-through}
+.rdue{flex:none;font-size:9px;color:var(--muted)}
+.card-phone .rdue{font-size:10px}
+.rdue.today{color:var(--attention)}
+.rdue.over{color:var(--failed)}
+.rsrc{flex:none;font-size:9px;color:var(--muted);padding:0 5px;border-radius:var(--r-chip);
+  border:1px solid var(--hairline)}
+.rnew{animation:rise .24s var(--e)}
+@keyframes rise{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+.arc{display:flex;align-items:center;gap:6px;height:22px;margin:2px 10px 0;
+  font-size:9px;color:var(--muted);cursor:pointer;user-select:none;
+  border-top:1px solid var(--hairline)}
+.card-phone .arc{font-size:10px;height:30px;margin:2px 14px 0}
+.arc .c{transition:transform var(--t-in) var(--e);font-size:9px}
+.arc.open .c{transform:rotate(90deg)}
+.arcbody{overflow:hidden;max-height:0;transition:max-height var(--t-in) var(--e)}
+.arcbody.open{max-height:220px}
+
+/* ---------- 单次涟漪：刚发生了一件事 ---------- */
+/* 与常开涟漪（悬浮球/HUD = 有东西在活着）区分：这是瞬时的,只在完成/新增时荡一次。
+   明暗成对（亮峰 + 暗谷）沿用 CPRippleView 的做法,曲线沿用定稿的贝塞尔。 */
+.rip{position:absolute;left:0;top:50%;width:15px;height:15px;margin-top:-7.5px;
+  border-radius:50%;pointer-events:none;z-index:2}
+.rip i{position:absolute;inset:0;border-radius:50%;border:1px solid var(--ready);opacity:0;
+  animation:rip .55s cubic-bezier(.45,.08,.35,1) forwards}
+.rip i:nth-child(2){border-color:rgba(0,0,0,.5);animation-delay:.07s}
+@keyframes rip{
+  0%{transform:scale(.7);opacity:0}
+  18%{opacity:.5}
+  100%{transform:scale(3.2);opacity:0;border-width:.5px}
+}
+
+@media (prefers-reduced-motion:reduce){
+  *{animation:none !important}
+  .panel,.quad,.wl,.row,.chk{transition:opacity .15s linear !important}
+}
+</style>
+</head>
+<body>
+<div class="stage" id="stage"></div>
+
+<script>
+/* ===== 四格：位置与叫法按 design-systems/lantai/DESIGN.md 定案 ===== */
+const QUADS = [
+  { k:"jiliu",   name:"急流", desc:"卷着走，先过这一段",     wl:"rapid" },
+  { k:"shentan", name:"深潭", desc:"要沉下去做，别搁浅",     wl:"deep"  },
+  { k:"suilang", name:"碎浪", desc:"琐碎又催人，蹚过去就完", wl:"broken"},
+  { k:"jingshui",name:"静水", desc:"没动静，想不起来也无妨", wl:"still" },
+];
+const TODOS = [
+  {id:1, q:"jiliu",   t:"修复导出图片在高分屏下模糊",              due:"today", src:"" },
+  {id:2, q:"jiliu",   t:"回复关于四象限交互的反馈，这条标题特别特别长用来验证截断是否正常", due:"over", src:"Codex"},
+  {id:3, q:"jiliu",   t:"整理 ~/Documents 下的截图素材",            due:"",      src:"" },
+  {id:4, q:"jiliu",   t:"给 Bridge 补一条鉴权自测",                due:"",      src:"Kimi" },
+  {id:5, q:"shentan", t:"重写待办四象限的展开动画",                due:"today", src:"Codex"},
+  {id:6, q:"shentan", t:"通读 BRIDGE_API 草案并标注疑问",          due:"",      src:"" },
+  {id:7, q:"suilang", t:"把构建产物挪到 outputs 目录",             due:"over",  src:"" },
+  {id:8, q:"jiliu",   t:"上一版原型的旧交互走查",                  due:"",      src:"", done:true},
+  {id:9, q:"suilang", t:"清理 work/shots 里的旧截图",              due:"",      src:"Codex", done:true},
+];
+const INBOX = [
+  {id:101, t:"还没想清楚归哪格：给原型加音效？", src:"Kimi"},
+  {id:102, t:"导出 PNG 的默认倍率",              src:""},
+];
+const live = k => TODOS.filter(t => t.q === k && !t.done);
+const hot  = k => live(k).some(t => t.due === "over");
+/* 该格最紧的到期状态：过期 > 今天 > 有但不急 > 空 */
+const worst = k => {
+  const l = live(k);
+  if (!l.length) return "none";
+  if (l.some(t => t.due === "over")) return "over";
+  if (l.some(t => t.due === "today")) return "today";
+  return "calm";
+};
+
+function el(tag, cls, txt){ const e=document.createElement(tag); if(cls)e.className=cls;
+  if(txt!=null)e.textContent=txt; return e; }
+
+/* ===== 水线：四种水各不相同,水位高度 = 条数 =====
+   静态几何,不做常开动画（常开动画会稀释涟漪「有东西在活着」的唯一含义）。 */
+/* 振幅一律 ≤1.4px。再大就从「水」变成拼写错误的波浪下划线（v3 第一次渲染的教训）。 */
+function waterPath(kind, w, h, n, max){
+  const ratio = max ? n / max : 0;
+  const y = h - 5 - ratio * (h - 16);             // 水位：条数越多越高
+  if (kind === "rapid"){                          // 急流：紧促但极浅的波
+    let d = `M0 ${y}`;
+    for (let x = 0; x < w; x += 14)
+      d += ` Q${x+7} ${y + ((x/14) % 2 ? 1.3 : -1.3)} ${x+14} ${y}`;
+    return { d, y };
+  }
+  if (kind === "broken"){                         // 碎浪：断续短线,两端留出内边距
+    const seg = [];
+    for (let x = 6; x < w - 12; x += 17)
+      seg.push(`M${x} ${y + ((x % 34 < 17) ? -1 : .9)} L${x+10} ${y + ((x % 34 < 17) ? -1 : .9)}`);
+    return { d: seg.join(" "), y };
+  }
+  return { d: `M0 ${y} L${w} ${y}`, y };          // 深潭 / 静水：平线,区别在水体厚度
+}
+function drawWater(host, kind, n, max){
+  const w = Math.round(host.clientWidth) || 240, h = Math.round(host.clientHeight) || 34;
+  const { d, y } = waterPath(kind, w, h, n, max);
+  const uid = "g" + Math.random().toString(36).slice(2, 8);
+  const top = kind === "deep" ? .052 : .026;      // 深潭水体更厚,读作「深」
+  const hotCls = host.classList.contains("hot");
+  const c = hotCls ? "255,120,122" : "255,255,255";
+  host.innerHTML =
+    `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+       <defs><linearGradient id="${uid}" x1="0" y1="0" x2="0" y2="1">
+         <stop offset="0" stop-color="rgba(${c},${top})"/>
+         <stop offset="1" stop-color="rgba(${c},0)"/>
+       </linearGradient></defs>
+       <path fill="url(#${uid})" d="M0 ${y} L${w} ${y} L${w} ${h} L0 ${h} Z"/>
+       <path class="line" d="${d}"/>
+     </svg>`;
+}
+
+/* ===== 构建 ===== */
+const views = [];
+function build(kind){
+  const wrap = el("div");
+  wrap.appendChild(el("div","cap", kind==="mac"
+    ? "Mac 工作台 · 底部待办区（496 × 158，硬约束）"
+    : "手机 · 同一套交互（390 宽）"));
+  const card = el("div","card card-"+kind);
+
+  const stub = el("div","stub");
+  if (kind==="mac"){ stub.appendChild(el("span","d")); stub.appendChild(el("span",null,"工作台任务区（示意，不在本原型范围）")); }
+  else { stub.appendChild(el("span",null,"9:41")); stub.appendChild(el("span",null,"澜台")); }
+  card.appendChild(stub);
+
+  const todo = el("div","todo");
+
+  const inbox = el("div","inbox");
+  inbox.appendChild(el("span","tag","待分类"));
+  const ibn = el("span"); inbox.appendChild(ibn);
+  todo.appendChild(inbox);
+
+  const quads = el("div","quads");
+  const cells = {};
+  QUADS.forEach(q => {
+    const c = el("div","quad");
+    c.dataset.k = q.k;
+    const head = el("div","qhead");
+    const dot = el("span","qdot"); head.appendChild(dot);
+    head.appendChild(el("span","qname",q.name));
+    const cnt = el("span","qcount"); head.appendChild(cnt);
+    c.appendChild(head);
+    c.appendChild(el("div","qdesc",q.desc));
+    const prev = el("div","qprev"); c.appendChild(prev);
+    const wl = el("div","wl"); c.appendChild(wl);
+    c.addEventListener("click", () => open(v, q));
+    quads.appendChild(c);
+    cells[q.k] = { c, cnt, wl, prev, dot };
+  });
+  quads.appendChild(el("div","seam seam-v"));
+  quads.appendChild(el("div","seam seam-h"));
+  todo.appendChild(quads);
+
+  const panel = el("div","panel");
+  todo.appendChild(panel);
+
+  card.appendChild(todo);
+  wrap.appendChild(card);
+  document.getElementById("stage").appendChild(wrap);
+
+  const v = { kind, todo, quads, panel, cells, ibn, open:null };
+  views.push(v);
+  return v;
+}
+
+function refresh(){
+  const max = Math.max(1, ...QUADS.map(q => live(q.k).length));
+  for (const v of views){
+    v.ibn.textContent = INBOX.length ? `${INBOX.length} 条未归类` : "没有未归类";
+    QUADS.forEach(q => {
+      const n = live(q.k).length, cell = v.cells[q.k];
+      cell.cnt.textContent = n ? `${n} 条` : "—";      // 空格用淡「—」,不写 0
+      cell.c.classList.toggle("empty", n === 0);
+      cell.wl.classList.toggle("hot", hot(q.k));
+      cell.dot.className = "qdot " + worst(q.k);
+      cell.prev.innerHTML = "";
+      live(q.k).slice(0, 2).forEach(t => {
+        const line = el("div");
+        line.appendChild(el("i", t.due || ""));
+        line.appendChild(el("span", null, t.t));
+        cell.prev.appendChild(line);
+      });
+      drawWater(cell.wl, q.wl, n, max);
+    });
+    if (v.open){
+      const c = v.panel.querySelector(".pcount");
+      if (c) c.textContent = live(v.open.k).length ? live(v.open.k).length + " 条" : "";
+    }
+  }
+}
+
+/* ===== 行 ===== */
+function rowEl(v, td, isNew){
+  const r = el("div","row" + (td.done?" done":"") + (isNew?" rnew":""));
+  const chk = el("button","chk");
+  chk.setAttribute("aria-label", td.done ? "恢复为待办" : "标记完成");
+  chk.addEventListener("click", ev => {
+    ev.stopPropagation();
+    const becoming = !td.done;
+    td.done = becoming;
+    r.classList.toggle("done", becoming);
+    if (becoming && !matchMedia("(prefers-reduced-motion: reduce)").matches){
+      const rip = el("span","rip");
+      rip.appendChild(el("i")); rip.appendChild(el("i"));
+      r.appendChild(rip);
+      setTimeout(() => rip.remove(), 700);
+    }
+    refresh();
+    setTimeout(() => { if (v.open) list(v, v.open); }, becoming ? 420 : 0);
+  });
+  r.appendChild(chk);
+  r.appendChild(el("span","rt",td.t));
+  if (td.due) r.appendChild(el("span","rdue "+(td.due==="today"?"today":"over"),
+                              td.due==="today"?"今天":"已过期"));
+  if (td.src) r.appendChild(el("span","rsrc",td.src));
+  return r;
+}
+
+function list(v, q, newId){
+  const l = v.panel.querySelector(".plist");
+  if (!l) return;
+  l.innerHTML = "";
+  live(q.k).forEach(t => l.appendChild(rowEl(v, t, t.id === newId)));
+  const dones = TODOS.filter(t => t.q === q.k && t.done);
+  if (dones.length){
+    const head = el("div","arc");
+    head.appendChild(el("span","c","▶"));
+    head.appendChild(el("span",null,"已完成 "+dones.length));
+    const body = el("div","arcbody");
+    dones.forEach(t => body.appendChild(rowEl(v, t)));
+    head.addEventListener("click", ev => {
+      ev.stopPropagation();
+      head.classList.toggle("open"); body.classList.toggle("open");
+    });
+    l.appendChild(head); l.appendChild(body);
+  }
+  if (!live(q.k).length && !dones.length){
+    const e = el("div","row"); e.style.color="var(--muted)";
+    e.appendChild(el("span","rt","这格是空的，上面加一条"));
+    e.querySelector(".rt").style.color="var(--muted)";
+    l.appendChild(e);
+  }
+}
+
+/* ===== 满格接管 / 再点缩回 ===== */
+function open(v, q){
+  if (v.open) return;                       // 满格态里看不到别的格,没有跳格
+  v.open = q;
+  const p = v.panel;
+  p.innerHTML = "";
+
+  const head = el("div","phead");
+  const top = el("div","ptop");
+  top.appendChild(el("span","pname",q.name));
+  top.appendChild(el("span","pdesc",q.desc));   // 说明只在满格态出现
+  if (v.kind !== "mac") top.appendChild(el("span","pcount"));  // Mac 一行放不下,条数在四格态已有
+  top.addEventListener("click", ev => { if (ev.target === top) close(v); });
+  head.appendChild(top);
+
+  const pin = el("div","pin");
+  const input = el("input");
+  input.placeholder = "加一条到「"+q.name+"」";
+  const plus = el("button","plus");
+  plus.setAttribute("aria-label","添加");
+  const submit = () => {
+    const s = input.value.trim(); if (!s) return;
+    const id = Date.now();
+    TODOS.push({ id, q:q.k, t:s, due:"", src:"" });
+    input.value = "";
+    list(v, q, id); refresh(); input.focus();
+  };
+  plus.addEventListener("click", submit);
+  input.addEventListener("keydown", e => { if (e.key === "Enter") submit(); });
+  pin.appendChild(input); pin.appendChild(plus);
+  head.appendChild(pin);
+  const back = el("button","pback","收起");
+  back.addEventListener("click", ev => { ev.stopPropagation(); close(v); });
+  head.appendChild(back);
+  p.appendChild(head);
+
+  const l = el("div","plist");
+  l.addEventListener("click", ev => { if (ev.target === l) close(v); });
+  p.appendChild(l);
+  list(v, q);
+
+  p.classList.add("open");
+  const cell = v.cells[q.k].c;
+  const pr = p.getBoundingClientRect(), cr = cell.getBoundingClientRect();
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches){
+    v.quads.style.opacity = 0; input.focus(); refresh(); return;
+  }
+  /* FLIP：从被点的格子长到满格。只动 transform + opacity,无回弹 */
+  p.style.transition = "none";
+  p.style.transformOrigin = "0 0";
+  p.style.transform = `translate(${cr.left-pr.left}px,${cr.top-pr.top}px) scale(${cr.width/pr.width},${cr.height/pr.height})`;
+  p.style.opacity = .35;
+  p.getBoundingClientRect();
+  p.style.transition = `transform var(--t-in) var(--e),opacity .16s var(--e)`;
+  p.style.transform = "none";
+  p.style.opacity = 1;
+  v.quads.style.transition = "opacity .16s var(--e)";
+  v.quads.style.opacity = 0;
+  setTimeout(() => { if (v.open === q) input.focus(); }, 200);
+  refresh();
+}
+
+function close(v){
+  if (!v.open) return;
+  const q = v.open, p = v.panel;
+  const cell = v.cells[q.k].c;
+  v.quads.style.opacity = 1;
+  const fin = () => { p.classList.remove("open"); p.style.cssText=""; v.open = null; };
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches){ fin(); return; }
+  const pr = p.getBoundingClientRect(), cr = cell.getBoundingClientRect();
+  /* 缩回 0.24s,比展开 0.20s 略慢——出比进慢,离开时不突然 */
+  p.style.transition = `transform var(--t-out) var(--e),opacity .2s var(--e)`;
+  p.style.transform = `translate(${cr.left-pr.left}px,${cr.top-pr.top}px) scale(${cr.width/pr.width},${cr.height/pr.height})`;
+  p.style.opacity = 0;
+  setTimeout(fin, 260);
+}
+
+document.addEventListener("keydown", e => { if (e.key === "Escape") views.forEach(close); });
+
+build("mac");
+build("phone");
+refresh();
+addEventListener("resize", refresh);
+
+/* 调试：?open=jiliu 直接进满格态,方便截图审阅两种状态。?open=phone:jiliu 只开手机那块 */
+const qp = new URLSearchParams(location.search).get("open");
+if (qp){
+  const [a, b] = qp.includes(":") ? qp.split(":") : [null, qp];
+  const q = QUADS.find(x => x.k === b);
+  if (q) views.filter(v => !a || v.kind === a).forEach(v => open(v, q));
+}
+</script>
+</body>
+</html>

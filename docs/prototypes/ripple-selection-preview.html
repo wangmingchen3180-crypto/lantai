@@ -5,30 +5,34 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ripple 选中态 · 方向 A 预览</title>
 <style>
+/* 配色与字体一律取自 design-systems/lantai/DESIGN.md（= 上线代码 CPStatusEngine 的
+   dark 槽）。2026-08-14 重新蒙皮：此前这里是 Discord 的设计系统（#313338 系灰、
+   Blurple #5865f2、gg sans 字体），与上线配色完全不同，被当成设计依据会把新界面
+   带向 Discord 的味道。这份原型的有效资产只有涟漪的几何与节奏，不是配色。 */
 :root {
-  --bg:           #313338;
-  --surface:      #2b2d31;
-  --surface-warm: #1e1f22;
-  --fg:   #dbdee1;
-  --fg-2: #f2f3f5;
-  --muted: #949ba4;
-  --meta:  #80848e;
-  --border:      rgba(255, 255, 255, 0.06);
-  --border-soft: #3f4147;
-  --accent:        #5865f2;
-  --accent-on:     #ffffff;
-  --accent-hover:  #4752c4;
-  --success: #23a55a;
-  --warn:    #f0b232;
-  --danger:  #f23f43;
-  --info:    #00a8fc;
-  --calm:    #3ba55d;
-  --font-body: "gg sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
-  --font-mono: "gg mono", Consolas, "Andale Mono", "Courier New", Courier, monospace;
+  --bg:           #20222C;  /* surface：容器 */
+  --surface:      #20222C;
+  --surface-warm: #13151C;  /* bg：页面底 */
+  --fg:   #C7C7CF;          /* fg2 */
+  --fg-2: #F2F2F5;          /* fg */
+  --muted: #9E9FA8;
+  --meta:  #9E9FA8;
+  --border:      rgba(255, 255, 255, 0.08);  /* hairline */
+  --border-soft: #555969;                    /* border */
+  --accent:        #668FFF;
+  --accent-on:     #FFFFFF;
+  --accent-hover:  #5280FF;
+  --success: #61E380;  /* status.ready */
+  --warn:    #FFA84C;  /* status.attention */
+  --danger:  #FF787A;  /* status.failed */
+  --info:    #7AA3FF;  /* status.working */
+  --calm:    #61E380;
+  --font-body: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
   --radius-sm: 4px;
   --radius-md: 8px;
-  --radius-lg: 16px;
-  --focus-ring: 0 0 0 3px rgba(88, 101, 242, 0.3);
+  --radius-lg: 16px;  /* radius.orb */
+  --focus-ring: 0 0 0 3px rgba(102, 143, 255, 0.3);
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }

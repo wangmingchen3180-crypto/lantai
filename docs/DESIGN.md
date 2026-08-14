@@ -4,9 +4,9 @@
 
 对照原型：
 
-- 定稿预览：[ripple-selection-preview.html](prototypes/ripple-selection-preview.html)（方向 A，已写入 `CPRippleView`）
+- 定稿预览：[ripple-selection-preview.html](prototypes/ripple-selection-preview.html)（方向 A，已写入 `CPRippleView`）。**它的权威范围只有涟漪的几何与节奏**（8 层、1.55 倍、12s 基准、`cubic-bezier(0.45,0.08,0.35,1)`、层间错峰 1/8）。配色、字体、圆角、布局一律不作依据——见下面「这份原型曾经是个陷阱」。
 - 三条路线对比：[ripple-style-lab.html](prototypes/ripple-style-lab.html)（实验室，不是产品依据）
-- [multitask-status-prototype.html](../multitask-status-prototype.html) 已被否决，不要当设计依据，也不要提交到公开仓库
+- `multitask-status-prototype.html` 已被否决，不要当设计依据，也不要提交到公开仓库（因此这里刻意不给链接——它不在仓库里）
 
 ## 已经落地：运行时涟漪
 
@@ -58,6 +58,20 @@
 
 任务卡、待办行、按钮、返回入口。涟漪只表示「有东西在活着」。全都在动等于都不动。
 
+## 这份原型曾经是个陷阱（2026-08-14 已拆）
+
+`ripple-selection-preview.html` 里的整套 CSS 变量原本是**Discord 的设计系统**，不是澜台的：`#313338` / `#2b2d31` / `#1e1f22` 那组暖灰、Blurple `#5865f2`、以及 Discord 自有字体 `gg sans` / `gg mono`，状态色也是 Discord 的 `#23a55a` / `#f0b232` / `#f23f43`。
+
+上线的澜台一个都没用：底是 `#13151C`、卡片 `#20222C`、强调 `#668FFF`——更冷更暗的石墨。也就是说这份被文档称作「定稿」的原型，除了涟漪几何之外，**和真实产品没有一处配色相同**。
+
+为什么这是陷阱而不只是过时：任何人（或任何 AI 工具）被指向 `docs/prototypes/` 找视觉参考，都会把 Discord 的味道吸进新界面。2026-08-14 一次生成的待办原型令人不满意，这大概是其中一个成因。
+
+已处理：把变量重新蒙皮成 [`design-systems/lantai/DESIGN.md`](../design-systems/lantai/DESIGN.md) 的真实 token，涟漪几何一行未动。留下的教训：
+
+- **原型的权威范围要写清楚。** 「定稿」二字只对它验证过的那一件事成立（这里是涟漪的几何与节奏），不覆盖它顺手带上的配色和排版。
+- **上线代码才是配色真相。** 原型会漂移，代码不会。新界面取色一律去 token 表，不去原型。
+- 原型里还有一处上线版从未实现的动画：`bob`（选中态图标与环 <1px 的上下浮动）。`CPRippleView` 里没有它。要么补进代码，要么从原型删掉，不要让两边继续不一致——目前按「不实现」处理，因为菜单栏与 HUD 都明确不加多余动效。
+
 ## 实验室三条路线，不要重开
 
 `ripple-style-lab.html` 比过三条：
@@ -70,4 +84,6 @@
 
 ## 皮肤边界
 
-皮肤换背景、表面、强调色、文字。涟漪的几何、环数、速度不随皮肤变。状态灯是语义色，倾向固定。详见 `BACKLOG.md` 皮肤一节。
+皮肤换背景、表面、强调色、文字。涟漪的几何、环数、速度不随皮肤变。状态灯是语义色，倾向固定。首版范围见 [BACKLOG.md](BACKLOG.md) 皮肤一节；改 UI 的实际成本、以及「皮肤不许承载交互变化」这条边界见 [UI_ARCHITECTURE.md](UI_ARCHITECTURE.md)。
+
+这份文件说的是**设计意图**。具体色值、圆角、字号、间距的机器可读 token 在 [`design-systems/lantai/DESIGN.md`](../design-systems/lantai/DESIGN.md)，那里是唯一真相，两边不要各写一套。
