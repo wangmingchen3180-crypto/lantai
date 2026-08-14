@@ -6,7 +6,7 @@
 
 - 定稿预览：[ripple-selection-preview.html](prototypes/ripple-selection-preview.html)（方向 A，已写入 `CPRippleView`）。**它的权威范围只有涟漪的几何与节奏**（8 层、1.55 倍、12s 基准、`cubic-bezier(0.45,0.08,0.35,1)`、层间错峰 1/8）。配色、字体、圆角、布局一律不作依据——见下面「这份原型曾经是个陷阱」。
 - 三条路线对比：[ripple-style-lab.html](prototypes/ripple-style-lab.html)（实验室，不是产品依据）
-- [multitask-status-prototype.html](../multitask-status-prototype.html) 已被否决，不要当设计依据，也不要提交到公开仓库
+- `multitask-status-prototype.html` 已被否决，不要当设计依据，也不要提交到公开仓库（因此这里刻意不给链接——它不在仓库里）
 
 ## 已经落地：运行时涟漪
 
