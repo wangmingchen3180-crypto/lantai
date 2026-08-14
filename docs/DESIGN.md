@@ -71,3 +71,5 @@
 ## 皮肤边界
 
 皮肤换背景、表面、强调色、文字。涟漪的几何、环数、速度不随皮肤变。状态灯是语义色，倾向固定。首版范围见 [BACKLOG.md](BACKLOG.md) 皮肤一节；改 UI 的实际成本、以及「皮肤不许承载交互变化」这条边界见 [UI_ARCHITECTURE.md](UI_ARCHITECTURE.md)。
+
+这份文件说的是**设计意图**。具体色值、圆角、字号、间距的机器可读 token 在 [`design-systems/lantai/DESIGN.md`](../design-systems/lantai/DESIGN.md)，那里是唯一真相，两边不要各写一套。

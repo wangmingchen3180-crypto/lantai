@@ -13,9 +13,12 @@
 | [AGENT_ADAPTERS.md](AGENT_ADAPTERS.md) | 接入各家 Agent 的适配器边界与健康度语义 | 接新 Agent、改数据源探测 |
 | [NAMING.md](NAMING.md) | 命名决策与改名时刻意没改的东西 | 改显示名、改标识符 |
 | [prototypes/](prototypes/) | HTML 原型。是探索记录，不是产品依据 | 试新界面方向 |
+| [`design-systems/lantai/DESIGN.md`](../design-systems/lantai/DESIGN.md) | 机器可读的 token 真相：颜色、圆角、字号、间距、固定几何 | 改任何 token、或让工具/Agent 渲染界面之前 |
 | [images/](images/) | README 配图，由 `--shot` 自渲染生成 | 界面变了要重出图 |
 
 `BRIDGE_API.md` 暂时没有链接：它随第一阶段的手机端 / Bridge 一起进仓库，那批改动目前还只在本地未提交。
+
+**两个 DESIGN.md 不要混。** `docs/DESIGN.md` 是给人看的视觉语言（涟漪规格、图标、空状态）；`design-systems/lantai/DESIGN.md` 是给机器读的 token 表（颜色、圆角、字号、间距）。后者放在仓库根的 `design-systems/` 下，是为了让 Open Design 这类工具按约定路径找到它，所以它是唯一不在 `docs/` 里的文档。改 token 改后者，改设计意图改前者。
 
 几条避免文档本身变乱的规矩：
 
