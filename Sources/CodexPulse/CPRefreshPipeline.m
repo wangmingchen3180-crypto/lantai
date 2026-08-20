@@ -8,7 +8,10 @@
 NSString *CPAgentsSignature(NSArray<CPAgent *> *agents) {
     NSMutableString *sig = [NSMutableString string];
     for (CPAgent *a in agents) {
-        [sig appendFormat:@"A:%@|%d|", a.agentID, (int)a.status];
+        [sig appendFormat:@"A:%@|%d|%d|", a.agentID, (int)a.status, (int)a.quota.health];
+        for (CPQuotaWindow *w in a.quota.windows) {
+            [sig appendFormat:@"Q:%@|%.1f|%.0f;", w.windowID, w.usedPercent, w.resetsAt.timeIntervalSince1970];
+        }
         for (CPTask *t in a.tasks) {
             [sig appendFormat:@"T:%@|%d|%.3f|%ld|%tu|%tu;",
                               t.taskID, (int)t.status, t.updatedAt.timeIntervalSince1970,

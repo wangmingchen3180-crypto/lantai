@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="zh-Hans">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>澜台 · 手机入口对照</title>
+<style>
+:root {
+  --accent: #668fff;
+  --bg: #13151c;
+  --surface: #20222c;
+  --border: #555969;
+  --fg: #f2f2f5;
+  --fg2: #c7c7cf;
+  --muted: #9e9fa8;
+  --working: #7aa3ff;
+  --waiting: #ffa84d;
+  --completed: #61e380;
+  --hairline: rgba(255,255,255,.08);
+  --wash: rgba(255,255,255,.07);
+  --sunken: rgba(0,0,0,.22);
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  min-height: 100%;
+  background: #0b0c10;
+  color: var(--fg);
+  font: 14px/1.45 -apple-system, "SF Pro Text", "PingFang SC", system-ui, sans-serif;
+}
+body { padding: 36px 28px 80px; }
+h1 { font-size: 22px; font-weight: 600; margin: 0 0 8px; }
+.lead { color: var(--fg2); max-width: 720px; margin: 0 0 28px; }
+.note { color: var(--muted); font-size: 13px; max-width: 720px; margin: -12px 0 32px; }
+
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 28px;
+  align-items: start;
+}
+@media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
+
+.option {
+  background: #161821;
+  border: 1px solid var(--hairline);
+  border-radius: 16px;
+  padding: 18px 18px 22px;
+}
+.option h2 { margin: 0 0 4px; font-size: 16px; }
+.option p { margin: 0 0 16px; color: var(--muted); font-size: 13px; }
+.pick {
+  margin-top: 14px;
+  height: 36px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  font: 600 13px/1 inherit;
+  cursor: pointer;
+}
+.pick.ghost { background: var(--surface); color: var(--fg); border: 1px solid var(--hairline); }
+
+/* desktop mock */
+.desk {
+  position: relative;
+  height: 420px;
+  border-radius: 12px;
+  overflow: hidden;
+  background:
+    linear-gradient(180deg, #1a1d28 0%, #12141b 100%);
+  border: 1px solid #2a2d38;
+}
+.menubar {
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 12px;
+  background: rgba(20,22,28,.72);
+  border-bottom: 1px solid rgba(255,255,255,.06);
+  font-size: 12px;
+  color: #d8d8de;
+}
+.mb-left, .mb-right { display: flex; align-items: center; gap: 10px; }
+.mb-icon {
+  width: 16px; height: 16px;
+  border-radius: 50%;
+  border: 1.4px solid var(--accent);
+  display: grid; place-items: center;
+  cursor: pointer;
+  position: relative;
+}
+.mb-icon::after {
+  content: "";
+  width: 6px; height: 6px;
+  border: 1.2px solid var(--accent);
+  border-radius: 50%;
+}
+.mb-icon:hover { background: rgba(102,143,255,.18); }
+.mb-icon.on { background: rgba(102,143,255,.22); }
+
+.menu-pop {
+  position: absolute;
+  top: 30px; right: 78px;
+  width: 168px;
+  background: #2a2c34;
+  border: 1px solid #3a3d48;
+  border-radius: 8px;
+  padding: 5px;
+  box-shadow: 0 12px 28px rgba(0,0,0,.45);
+  z-index: 4;
+  display: none;
+}
+.menu-pop.show { display: block; }
+.menu-item {
+  height: 28px;
+  border-radius: 5px;
+  padding: 0 10px;
+  display: flex; align-items: center;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.menu-item:hover, .menu-item.hit { background: var(--accent); color: #fff; }
+.menu-sep { height: 1px; background: rgba(255,255,255,.08); margin: 4px 6px; }
+
+.workbench {
+  position: absolute;
+  left: 28px; top: 58px;
+  width: 430px; height: 318px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  overflow: hidden;
+  box-shadow: 0 18px 40px rgba(0,0,0,.35);
+}
+.wb-head {
+  height: 48px;
+  display: flex; align-items: center;
+  padding: 0 12px 0 16px;
+  border-bottom: 1px solid rgba(255,255,255,.08);
+}
+.logo {
+  width: 20px; height: 20px; margin-right: 8px;
+}
+.title { font-size: 14px; font-weight: 600; }
+.meta { font-size: 11px; color: var(--muted); }
+.head-right { margin-left: auto; display: flex; gap: 4px; }
+.ibtn {
+  width: 26px; height: 26px;
+  border-radius: 6px;
+  border: 0;
+  background: transparent;
+  color: var(--fg2);
+  cursor: pointer;
+  display: grid; place-items: center;
+}
+.ibtn:hover, .ibtn.hit { background: var(--wash); color: var(--fg); }
+.ibtn.phone { color: var(--accent); }
+
+.wb-body { display: flex; height: calc(100% - 48px - 46px); }
+.left {
+  width: 110px;
+  border-right: 1px solid rgba(255,255,255,.06);
+  padding: 10px 8px;
+}
+.agent {
+  display: flex; align-items: center; gap: 8px;
+  height: 34px; padding: 0 8px; border-radius: 8px;
+  font-size: 13px;
+}
+.agent.sel { background: var(--wash); }
+.dot { width: 8px; height: 8px; border-radius: 50%; }
+.mid { flex: 1; padding: 12px 14px; }
+.task {
+  height: 44px; border-radius: 8px;
+  background: rgba(255,255,255,.03);
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  font-size: 12px; color: var(--fg2);
+}
+.todo {
+  height: 46px; margin: 0 12px 12px;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  display: flex; align-items: center;
+  padding: 0 12px;
+  font-size: 12px; color: var(--muted);
+}
+.todo b { color: var(--fg2); font-weight: 600; margin-right: 8px; }
+
+/* pairing sheet */
+.sheet-mask {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,.45);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 20;
+}
+.sheet-mask.show { display: flex; }
+.sheet {
+  width: 360px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 22px 22px 18px;
+  box-shadow: 0 24px 60px rgba(0,0,0,.5);
+}
+.sheet h3 { margin: 0 0 6px; font-size: 16px; }
+.sheet .desc { color: var(--fg2); font-size: 13px; margin: 0 0 16px; }
+.qr {
+  width: 168px; height: 168px;
+  margin: 0 auto 14px;
+  background: #fff;
+  border-radius: 10px;
+  display: grid; place-items: center;
+  color: #111;
+  font-weight: 700;
+  letter-spacing: .08em;
+}
+.code {
+  text-align: center;
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: .42em;
+  padding-left: .42em;
+  margin: 0 0 6px;
+}
+.hint { text-align: center; color: var(--muted); font-size: 12px; margin: 0 0 16px; }
+.sheet-row { display: flex; gap: 8px; }
+.sheet-row button {
+  flex: 1; height: 36px; border-radius: 8px; border: 0; cursor: pointer; font: 600 13px inherit;
+}
+.ghost { background: var(--surface); color: var(--fg); border: 1px solid var(--hairline) !important; }
+.ok { background: var(--accent); color: #fff; }
+
+.callout {
+  margin-top: 28px;
+  max-width: 920px;
+  padding: 14px 16px;
+  border-radius: 12px;
+  background: #161821;
+  border: 1px solid var(--hairline);
+  color: var(--fg2);
+  font-size: 13px;
+}
+.callout strong { color: var(--fg); }
+</style>
+</head>
+<body>
+<h1>手机连上电脑，入口放哪？</h1>
+<p class="lead">不是做一个新 App，也不是改菜单栏图标本身。只是：你在 Mac 上点一下，弹出一个二维码和六位数字，手机扫码或手输就能连上。</p>
+<p class="note">下面两张图都能点。点亮蓝色的那个位置，就会弹出同一张配对卡。配对卡长什么样才是真正要做的东西；入口只是「从哪打开这张卡」。</p>
+
+<div class="grid">
+  <section class="option">
+    <h2>方案 A · 工作台右上角加一个按钮</h2>
+    <p>和图钉、关闭排在一起。打开工作台就能看见，不用去翻菜单。</p>
+    <div class="desk" id="desk-a">
+      <div class="menubar">
+        <div class="mb-left"><span></span><span>澜台</span></div>
+        <div class="mb-right"><div class="mb-icon" title="澜台"></div><span>12:43</span></div>
+      </div>
+      <div class="workbench">
+        <div class="wb-head">
+          <svg class="logo" viewBox="0 0 46 46"><g fill="none" stroke="#668fff"><circle cx="23" cy="23" r="5" stroke-width="2"/><circle cx="23" cy="23" r="11.5" stroke-width="1.6" opacity=".62"/><circle cx="23" cy="23" r="18" stroke-width="1.2" opacity=".32"/></g></svg>
+          <div><div class="title">澜台</div><div class="meta">2 个 Agent</div></div>
+          <div class="head-right">
+            <button class="ibtn" title="切换栏">▭</button>
+            <button class="ibtn phone hit" title="连接手机" onclick="openSheet('工作台按钮')">☎︎</button>
+            <button class="ibtn" title="固定">⌖</button>
+            <button class="ibtn" title="关闭">✕</button>
+          </div>
+        </div>
+        <div class="wb-body">
+          <div class="left">
+            <div class="agent sel"><span class="dot" style="background:var(--working)"></span>Codex</div>
+            <div class="agent"><span class="dot" style="background:var(--waiting)"></span>Kimi</div>
+          </div>
+          <div class="mid">
+            <div class="task">给澜台加手机 Bridge · 工作中</div>
+            <div class="task">整理涟漪身份件 · 已就绪</div>
+          </div>
+        </div>
+        <div class="todo"><b>待办</b> 2 项未完成</div>
+      </div>
+    </div>
+    <button class="pick" onclick="openSheet('工作台按钮')">点这个按钮，弹出配对卡</button>
+  </section>
+
+  <section class="option">
+    <h2>方案 B · 塞进菜单栏菜单</h2>
+    <p>点屏幕右上角澜台小图标，下拉里多一行「连接手机」。工作台界面一个字都不改。</p>
+    <div class="desk" id="desk-b">
+      <div class="menubar">
+        <div class="mb-left"><span></span><span>澜台</span></div>
+        <div class="mb-right"><div class="mb-icon on" title="澜台"></div><span>12:43</span></div>
+      </div>
+      <div class="menu-pop show">
+        <div class="menu-item">打开工作台</div>
+        <div class="menu-item hit" onclick="openSheet('菜单栏')">连接手机…</div>
+        <div class="menu-sep"></div>
+        <div class="menu-item">退出澜台</div>
+      </div>
+      <div class="workbench" style="opacity:.55">
+        <div class="wb-head">
+          <svg class="logo" viewBox="0 0 46 46"><g fill="none" stroke="#668fff"><circle cx="23" cy="23" r="5" stroke-width="2"/><circle cx="23" cy="23" r="11.5" stroke-width="1.6" opacity=".62"/><circle cx="23" cy="23" r="18" stroke-width="1.2" opacity=".32"/></g></svg>
+          <div><div class="title">澜台</div><div class="meta">2 个 Agent</div></div>
+          <div class="head-right">
+            <button class="ibtn">▭</button>
+            <button class="ibtn">⌖</button>
+            <button class="ibtn">✕</button>
+          </div>
+        </div>
+        <div class="wb-body">
+          <div class="left">
+            <div class="agent sel"><span class="dot" style="background:var(--working)"></span>Codex</div>
+            <div class="agent"><span class="dot" style="background:var(--waiting)"></span>Kimi</div>
+          </div>
+          <div class="mid">
+            <div class="task">给澜台加手机 Bridge · 工作中</div>
+            <div class="task">整理涟漪身份件 · 已就绪</div>
+          </div>
+        </div>
+        <div class="todo"><b>待办</b> 2 项未完成</div>
+      </div>
+    </div>
+    <button class="pick ghost" onclick="openSheet('菜单栏')">点菜单里的「连接手机」</button>
+  </section>
+</div>
+
+<div class="callout">
+  <strong>弹出的东西两边是同一张卡。</strong>
+  上面只是「从哪点开」。真要连手机时，你看到的是：一个二维码 + 六位数字。手机浏览器扫码，或打开地址后手输这六位，就连上了。
+</div>
+
+<div class="sheet-mask" id="sheet" onclick="if(event.target===this)closeSheet()">
+  <div class="sheet">
+    <h3>连接手机</h3>
+    <p class="desc" id="from">从工作台按钮打开</p>
+    <div class="qr">QR</div>
+    <div class="code">482 019</div>
+    <p class="hint">3 分钟内有效 · 手机扫码，或在网页里手输这六位数字</p>
+    <div class="sheet-row">
+      <button class="ghost" onclick="closeSheet()">关闭</button>
+      <button class="ok" onclick="closeSheet()">重新生成</button>
+    </div>
+  </div>
+</div>
+
+<script>
+function openSheet(from) {
+  document.getElementById('from').textContent = '从「' + from + '」打开 · 两边弹出的是同一张卡';
+  document.getElementById('sheet').classList.add('show');
+}
+function closeSheet() {
+  document.getElementById('sheet').classList.remove('show');
+}
+</script>
+</body>
+</html>

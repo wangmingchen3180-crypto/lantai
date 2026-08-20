@@ -26,7 +26,15 @@ int main(int argc, const char *argv[]) {
             }
         }
         // demo 用虚构数据,和正在运行的真实实例互不干扰,所以不受单实例限制。
-        if (!demo && CPAnotherInstanceIsRunning()) return 0;
+        // 单实例:再次双击 .app 只会激活旧进程并直接退出——旧进程内存里的菜单不会自动更新。
+        if (!demo && CPAnotherInstanceIsRunning()) {
+            NSAlert *alert = [[NSAlert alloc] init];
+            alert.messageText = @"澜台已在运行";
+            alert.informativeText = @"若刚更新过却看不到新功能,请先在菜单栏点「退出澜台」,再重新打开 Lantai.app。";
+            [alert addButtonWithTitle:@"好"];
+            [alert runModal];
+            return 0;
+        }
         NSApplication *app = NSApplication.sharedApplication;
         AppDelegate *delegate = AppDelegate.new;
         delegate.demoMode = demo;

@@ -25,3 +25,8 @@ xcuserdata/
 
 # Rejected visual prototype; do not treat as design source.
 multitask-status-prototype.html
+
+# Ad-hoc screenshots dropped in the repo root; they often contain real personal data.
+/截屏*.png
+/Screenshot*.png
+/Screen Shot*.png

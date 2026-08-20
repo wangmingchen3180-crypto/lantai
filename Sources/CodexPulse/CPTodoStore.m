@@ -92,6 +92,31 @@
     return todos;
 }
 
+- (CPTodo *)todoWithID:(NSInteger)todoID {
+    if (!_db) return nil;
+    const char *sql = "SELECT id, title, completed, agent_id, thread_id, created_at, updated_at "
+                      "FROM todos WHERE id=? LIMIT 1";
+    sqlite3_stmt *stmt = NULL;
+    CPTodo *todo = nil;
+    if (sqlite3_prepare_v2(_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, todoID);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            todo = CPTodo.new;
+            todo.todoID = (NSInteger)sqlite3_column_int64(stmt, 0);
+            todo.title = [NSString stringWithUTF8String:(const char *)sqlite3_column_text(stmt, 1)] ?: @"";
+            todo.completed = sqlite3_column_int(stmt, 2) != 0;
+            todo.agentID = sqlite3_column_text(stmt, 3)
+                ? [NSString stringWithUTF8String:(const char *)sqlite3_column_text(stmt, 3)] : nil;
+            todo.threadID = sqlite3_column_text(stmt, 4)
+                ? [NSString stringWithUTF8String:(const char *)sqlite3_column_text(stmt, 4)] : nil;
+            todo.createdAt = CPDateFromSeconds(sqlite3_column_double(stmt, 5)) ?: NSDate.date;
+            todo.updatedAt = CPDateFromSeconds(sqlite3_column_double(stmt, 6)) ?: NSDate.date;
+        }
+    }
+    if (stmt) sqlite3_finalize(stmt);
+    return todo;
+}
+
 - (NSInteger)pendingCount {
     if (!_db) return 0;
     NSInteger count = 0;

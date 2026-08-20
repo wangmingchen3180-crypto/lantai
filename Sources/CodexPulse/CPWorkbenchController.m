@@ -320,11 +320,13 @@ NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     left.spacing = 8;
     left.translatesAutoresizingMaskIntoConstraints = NO;
 
+    // 菜单栏图标在图标多/有刘海的机器上会被系统折叠隐藏,配对入口不能只挂在那里。
+    self.phoneButton = CPIconButton(@"iphone", self, @selector(connectPhone:), @"连接手机");
     self.modeButton = CPIconButton(@"rectangle.2.swap", self, @selector(toggleDockMode:), @"切换为底部快捷栏");
     self.pinButton = CPIconButton(@"pin.fill", self, @selector(togglePin:), @"固定");
     NSButton *closeButton = CPIconButton(@"xmark", self, @selector(close), @"关闭");
 
-    NSStackView *right = [NSStackView stackViewWithViews:@[self.modeButton, self.pinButton, closeButton]];
+    NSStackView *right = [NSStackView stackViewWithViews:@[self.phoneButton, self.modeButton, self.pinButton, closeButton]];
     right.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     right.spacing = 4;
     right.translatesAutoresizingMaskIntoConstraints = NO;
@@ -1223,7 +1225,8 @@ NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
     self.centerTitle.stringValue = agent.name;
     NSInteger attention = 0;
     for (CPTask *t in tasks) if (t.status == CPStatusAttention || t.status == CPStatusFailed) attention++;
-    self.centerMeta.stringValue = [NSString stringWithFormat:@"%lu 个活动 · %ld 个需关注", (unsigned long)tasks.count, (long)attention];
+    self.centerMeta.stringValue = [NSString stringWithFormat:@"%lu 个活动 · %ld 个需关注",
+                                   (unsigned long)tasks.count, (long)attention];
 
     if (!tasks.count) {
         NSString *emptyText = (agent.health == CPAgentHealthMissing) ? @"数据源不可用" : @"暂无活动任务";
@@ -1521,6 +1524,12 @@ NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size) {
         NSString *providerID = picker.selectedItem.representedObject;
         CPEnableAgentProvider(providerID);
     }
+}
+
+// 工作台只发意图,不碰 Bridge 与配对逻辑(UI 不依赖 Bridge)。
+- (void)connectPhone:(id)sender {
+    (void)sender;
+    [NSNotificationCenter.defaultCenter postNotificationName:@"CPConnectPhone" object:nil];
 }
 
 - (void)togglePin:(id)sender {

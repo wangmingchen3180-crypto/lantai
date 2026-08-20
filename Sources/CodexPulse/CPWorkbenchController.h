@@ -55,6 +55,7 @@ NSRect CPRectAtTopRightOfVisibleFrame(NSRect visible, NSSize size);
 @property NSStackView *detailStack;
 @property NSButton *pinButton;
 @property NSButton *modeButton;
+@property NSButton *phoneButton; // 「连接手机」入口:菜单栏可能被系统折叠,这里必须有
 @property NSTextField *cardMetaLabel;
 @property NSTextField *centerTitle;
 @property NSTextField *centerMeta;

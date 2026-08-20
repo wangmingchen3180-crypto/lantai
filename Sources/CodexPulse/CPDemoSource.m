@@ -1,5 +1,6 @@
 #import "CPDemoSource.h"
 #import "CPStatusEngine.h"
+#import "CPQuota.h"
 
 @interface CPDemoSource ()
 @property (nonatomic, copy) NSString *demoAgentID;
@@ -77,6 +78,33 @@ static CPTask *CPDemoTask(NSString *taskID, NSString *title, NSString *project,
     }
 
     agent.status = CPOverallStatusForTasks(agent.tasks);
+    CPQuotaSnapshot *quota = CPQuotaSnapshot.new;
+    quota.agentID = agent.agentID;
+    quota.health = CPAgentHealthOK;
+    quota.updatedAt = NSDate.date;
+    quota.windows = NSMutableArray.array;
+    if ([self.demoAgentID isEqualToString:@"kimi"]) {
+        [quota.windows addObject:({
+            CPQuotaWindow *w = CPQuotaWindow.new;
+            w.windowID = @"session"; w.title = @"5小时"; w.usedPercent = 0; w.windowMinutes = 300;
+            w.resetsAt = [NSDate dateWithTimeIntervalSinceNow:4 * 3600];
+            w;
+        })];
+        [quota.windows addObject:({
+            CPQuotaWindow *w = CPQuotaWindow.new;
+            w.windowID = @"weekly"; w.title = @"周"; w.usedPercent = 15; w.windowMinutes = 10080;
+            w.resetsAt = [NSDate dateWithTimeIntervalSinceNow:2.5 * 86400];
+            w;
+        })];
+    } else {
+        [quota.windows addObject:({
+            CPQuotaWindow *w = CPQuotaWindow.new;
+            w.windowID = @"weekly"; w.title = @"周"; w.usedPercent = 57; w.windowMinutes = 10080;
+            w.resetsAt = [NSDate dateWithTimeIntervalSinceNow:2.9 * 86400];
+            w;
+        })];
+    }
+    agent.quota = quota;
     return agent;
 }
 

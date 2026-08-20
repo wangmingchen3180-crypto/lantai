@@ -55,6 +55,7 @@ FOUNDATION_EXPORT const CGFloat CPHUDAgentRail;
 @property NSTextField *agentNameLabel;
 @property NSTextField *agentStatusLabel;
 @property NSTextField *agentUpdatedLabel;
+@property NSView *quotaView;
 @property NSView *bottomBar;      // 底行:左侧任务数量/滑动提示,右侧图例「?」钮
 @property NSTextField *moreLabel;
 @property NSButton *legendButton;

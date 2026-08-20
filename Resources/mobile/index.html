@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh-Hans">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="澜台">
+<meta name="theme-color" content="#13151c">
+<title>澜台</title>
+<link rel="stylesheet" href="assets/app.css">
+</head>
+<body>
+
+<!-- 配对页：未持有 token 时显示 -->
+<section id="pair" class="pair-screen hidden">
+  <div>
+    <svg class="still-water" viewBox="0 0 46 46" aria-hidden="true" style="opacity:.7">
+      <circle cx="23" cy="23" r="6" stroke-width="1.4"/>
+      <circle cx="23" cy="23" r="12" stroke-width="1.1" opacity=".6"/>
+      <circle cx="23" cy="23" r="18" stroke-width="0.9" opacity=".35"/>
+    </svg>
+    <h1 class="pair-title">连接澜台</h1>
+  </div>
+  <p class="pair-desc">在 Mac 上打开澜台工作台，找到手机连接的六位配对码，填在下面。</p>
+  <input id="pair-code" class="code-input" type="text" inputmode="numeric" pattern="[0-9]*"
+         maxlength="6" autocomplete="one-time-code" placeholder="······" aria-label="配对码">
+  <p id="pair-error" class="pair-error" role="alert"></p>
+  <button id="pair-submit" class="primary-btn" disabled>连接</button>
+</section>
+
+<!-- 主界面 -->
+<div id="app" class="hidden">
+  <header class="topbar">
+    <div class="brand">
+      <svg width="20" height="20" viewBox="0 0 46 46" aria-hidden="true">
+        <g fill="none" stroke="var(--accent)">
+          <circle cx="23" cy="23" r="5" stroke-width="2"/>
+          <circle cx="23" cy="23" r="11.5" stroke-width="1.6" opacity=".62"/>
+          <circle cx="23" cy="23" r="18" stroke-width="1.2" opacity=".32"/>
+        </g>
+      </svg>
+      <span class="brand-name">澜台</span>
+    </div>
+    <div id="link-state" class="link-state" data-link="connecting">
+      <span class="link-dot"></span>
+      <span id="link-text">连接中</span>
+    </div>
+  </header>
+
+  <main>
+    <!-- 任务页 -->
+    <section id="view-tasks">
+      <div class="section-head">
+        <span class="section-title">AGENT</span>
+        <span id="agent-count" class="section-count"></span>
+      </div>
+      <p id="control-hint" class="control-hint hidden"></p>
+      <div id="cmd-banner" class="cmd-banner hidden" role="status"></div>
+      <div id="agent-list" style="display:flex;flex-direction:column;gap:12px;margin-top:10px"></div>
+    </section>
+
+    <!-- 待办页 -->
+    <section id="view-todos" class="hidden">
+      <div class="section-head">
+        <span class="section-title">待办</span>
+        <span id="todo-count" class="section-count"></span>
+      </div>
+      <div class="todo-card" style="margin-top:10px">
+        <div class="todo-input-wrap">
+          <input id="todo-input" class="todo-input" type="text" placeholder="添加待办" enterkeyhint="done"
+                 autocomplete="off" aria-label="新待办标题">
+          <button id="todo-add" class="todo-add" disabled aria-label="添加">+</button>
+        </div>
+        <div id="todo-list"></div>
+      </div>
+    </section>
+  </main>
+
+  <nav class="tabbar" role="tablist">
+    <button class="tab" role="tab" data-view="tasks" aria-selected="true">
+      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"
+           stroke-linecap="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="7.5" opacity=".55"/>
+      </svg>
+      <span>任务</span>
+    </button>
+    <button class="tab" role="tab" data-view="todos" aria-selected="false">
+      <span id="todo-badge" class="tab-badge hidden"></span>
+      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M4 7h16M4 12h16M4 17h10"/>
+      </svg>
+      <span>待办</span>
+    </button>
+  </nav>
+
+  <button type="button" id="fab-start" class="fab hidden" aria-label="新建任务">+</button>
+</div>
+
+<!-- 新建任务 / 补充指令 -->
+<div id="command-sheet" class="sheet hidden">
+  <div id="sheet-backdrop" class="sheet-backdrop"></div>
+  <div class="sheet-panel" role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+    <div class="sheet-head">
+      <h2 id="sheet-title" class="sheet-title">新建任务</h2>
+      <button type="button" id="sheet-close" class="sheet-close" aria-label="关闭">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" aria-hidden="true">
+          <path d="M6 6l12 12M18 6L6 18"/>
+        </svg>
+      </button>
+    </div>
+    <p id="sheet-context" class="sheet-hint hidden"></p>
+    <p id="sheet-empty" class="sheet-hint hidden"></p>
+    <div id="sheet-agents" class="chip-list hidden"></div>
+    <div class="sheet-pickers">
+      <div id="sheet-workdirs" class="chip-list hidden"></div>
+      <div id="sheet-models" class="chip-list hidden"></div>
+    </div>
+    <textarea id="sheet-text" class="sheet-text" rows="5" maxlength="8000"
+              placeholder="写给 Agent 的指令" aria-label="指令"></textarea>
+    <p id="sheet-status" class="sheet-status" role="status"></p>
+    <button type="button" id="sheet-send" class="primary-btn" disabled>发送</button>
+  </div>
+</div>
+
+<!-- 打断确认 -->
+<div id="confirm-sheet" class="sheet hidden">
+  <div id="confirm-backdrop" class="sheet-backdrop"></div>
+  <div class="sheet-panel confirm-panel" role="alertdialog" aria-modal="true"
+       aria-labelledby="confirm-title" aria-describedby="confirm-desc">
+    <h2 id="confirm-title" class="sheet-title">打断任务</h2>
+    <p id="confirm-desc" class="sheet-hint">打断后，Agent 会停下当前这一步。</p>
+    <div class="confirm-actions">
+      <button type="button" id="confirm-cancel" class="ghost-btn">取消</button>
+      <button type="button" id="confirm-ok" class="danger-btn">打断</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast" role="status"></div>
+
+<script src="assets/app.js"></script>
+</body>
+</html>

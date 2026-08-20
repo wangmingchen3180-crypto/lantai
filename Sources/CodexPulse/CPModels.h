@@ -32,6 +32,21 @@ typedef NS_ENUM(NSInteger, CPAgentHealth) {
 @property CPStatus status;
 @end
 
+@interface CPQuotaWindow : NSObject
+@property NSString *windowID;     // session / weekly / monthly
+@property NSString *title;        // 由窗口长度决定,例如「5小时」「周」
+@property double usedPercent;    // 0–100
+@property NSInteger windowMinutes;
+@property NSDate *resetsAt;
+@end
+
+@interface CPQuotaSnapshot : NSObject
+@property NSString *agentID;
+@property CPAgentHealth health; // Missing=读不到,与「没有窗口」区分
+@property NSMutableArray<CPQuotaWindow *> *windows;
+@property NSDate *updatedAt;
+@end
+
 @interface CPAgent : NSObject
 @property NSString *agentID;
 @property NSString *name;
@@ -40,6 +55,7 @@ typedef NS_ENUM(NSInteger, CPAgentHealth) {
 @property BOOL placeholder;
 @property CPStatus status;
 @property CPAgentHealth health; // 缺省 CPAgentHealthOK;各 source 在数据不可用时置 Missing
+@property CPQuotaSnapshot *quota; // 额度是观察结果,不是任务;缺省 nil 表示还没取过
 @property NSMutableArray<CPTask *> *tasks;
 @end
 

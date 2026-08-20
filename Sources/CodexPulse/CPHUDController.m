@@ -3,6 +3,7 @@
 #import "CPScreenPolicy.h"
 #import "CPRouting.h"
 #import "CPWorkbenchController.h"
+#import "CPQuota.h"
 
 #pragma mark - Status HUD
 
@@ -35,6 +36,127 @@
 - (void)resizeSubviewsWithOldSize:(NSSize)oldSize {
     [super resizeSubviewsWithOldSize:oldSize];
     [self setProgress:self.progress];
+}
+
+@end
+
+// CodexBar 菜单栏图标:18pt 里两根短胶囊,上 6pt / 下 4pt / 宽 15pt。HUD 里放大一倍,仍是图标不是通栏进度条。
+static const CGFloat CPHUDQuotaMeterWidth = 30.0;
+static const CGFloat CPHUDQuotaMeterHeight = 22.0;
+static const CGFloat CPHUDQuotaTopBarHeight = 10.0;
+static const CGFloat CPHUDQuotaBottomBarHeight = 7.0;
+static const CGFloat CPHUDQuotaBarGap = 3.0;
+
+static BOOL CPQuotaWindowIsSession(CPQuotaWindow *window) {
+    return window.windowMinutes >= 270 && window.windowMinutes <= 330;
+}
+
+static BOOL CPQuotaWindowIsWeek(CPQuotaWindow *window) {
+    return window.windowMinutes >= 10020 && window.windowMinutes <= 10140;
+}
+
+static NSString *CPHUDQuotaLimitTip(CPQuotaWindow *window) {
+    if (!window) return nil;
+    NSString *title = window.title.length ? window.title : @"额度";
+    return [NSString stringWithFormat:@"%@限额 %.0f%%", title, window.usedPercent];
+}
+
+@interface CPHUDQuotaView : NSView
+@property CPQuotaWindow *topWindow;
+@property CPQuotaWindow *bottomWindow;
+@property BOOL available;
+- (void)applySnapshot:(CPQuotaSnapshot *)quota;
+@end
+
+@implementation CPHUDQuotaView
+
+- (instancetype)initWithFrame:(NSRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+    self.translatesAutoresizingMaskIntoConstraints = NO;
+    return self;
+}
+
+- (BOOL)isFlipped {
+    return YES;
+}
+
+- (void)applySnapshot:(CPQuotaSnapshot *)quota {
+    self.topWindow = nil;
+    self.bottomWindow = nil;
+    self.available = quota && quota.health != CPAgentHealthMissing && quota.windows.count > 0;
+    if (self.available) {
+        for (CPQuotaWindow *window in quota.windows) {
+            if (!self.topWindow && CPQuotaWindowIsSession(window)) self.topWindow = window;
+            if (!self.bottomWindow && CPQuotaWindowIsWeek(window)) self.bottomWindow = window;
+        }
+        for (CPQuotaWindow *window in quota.windows) {
+            if (window == self.topWindow || window == self.bottomWindow) continue;
+            if (!self.topWindow) self.topWindow = window;
+            else if (!self.bottomWindow) self.bottomWindow = window;
+        }
+        if (!self.topWindow && self.bottomWindow) {
+            self.topWindow = self.bottomWindow;
+            self.bottomWindow = nil;
+        }
+    }
+    NSMutableArray<NSString *> *tips = NSMutableArray.array;
+    NSString *topTip = CPHUDQuotaLimitTip(self.topWindow);
+    NSString *bottomTip = CPHUDQuotaLimitTip(self.bottomWindow);
+    if (topTip) [tips addObject:topTip];
+    if (bottomTip) [tips addObject:bottomTip];
+    if (!self.available) {
+        self.toolTip = quota ? @"额度不可用" : nil;
+    } else {
+        self.toolTip = tips.count ? [tips componentsJoinedByString:@"\n"] : nil;
+    }
+    self.hidden = (quota == nil);
+    [self setNeedsDisplay:YES];
+}
+
+- (void)drawCapsuleInRect:(NSRect)rect usedPercent:(double)percent dimmed:(BOOL)dimmed {
+    if (rect.size.width < 1 || rect.size.height < 1) return;
+    CGFloat radius = rect.size.height / 2.0;
+    NSBezierPath *track = [NSBezierPath bezierPathWithRoundedRect:rect xRadius:radius yRadius:radius];
+    CGFloat trackAlpha = dimmed ? 0.10 : 0.22;
+    CGFloat strokeAlpha = dimmed ? 0.18 : 0.40;
+    [[[NSColor whiteColor] colorWithAlphaComponent:trackAlpha] setFill];
+    [track fill];
+
+    if (!dimmed && percent > 0) {
+        [NSGraphicsContext saveGraphicsState];
+        [track addClip];
+        CGFloat fillWidth = floor(rect.size.width * MIN(100.0, MAX(0.0, percent)) / 100.0);
+        if (fillWidth > 0) {
+            [[[NSColor whiteColor] colorWithAlphaComponent:0.92] setFill];
+            NSRectFill(NSMakeRect(rect.origin.x, rect.origin.y, fillWidth, rect.size.height));
+        }
+        [NSGraphicsContext restoreGraphicsState];
+    }
+
+    NSRect strokeRect = NSInsetRect(rect, 0.5, 0.5);
+    CGFloat strokeRadius = MAX(0, strokeRect.size.height / 2.0);
+    NSBezierPath *stroke = [NSBezierPath bezierPathWithRoundedRect:strokeRect xRadius:strokeRadius yRadius:strokeRadius];
+    stroke.lineWidth = 1.0;
+    [[[NSColor whiteColor] colorWithAlphaComponent:strokeAlpha] setStroke];
+    [stroke stroke];
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+    (void)dirtyRect;
+    NSRect top = NSMakeRect(0, 0, self.bounds.size.width, CPHUDQuotaTopBarHeight);
+    NSRect bottom = NSMakeRect(0, CPHUDQuotaTopBarHeight + CPHUDQuotaBarGap,
+                               self.bounds.size.width, CPHUDQuotaBottomBarHeight);
+    if (self.available && self.topWindow) {
+        [self drawCapsuleInRect:top usedPercent:self.topWindow.usedPercent dimmed:NO];
+    } else {
+        [self drawCapsuleInRect:top usedPercent:0 dimmed:YES];
+    }
+    if (self.available && self.bottomWindow) {
+        [self drawCapsuleInRect:bottom usedPercent:self.bottomWindow.usedPercent dimmed:NO];
+    } else {
+        [self drawCapsuleInRect:bottom usedPercent:0 dimmed:YES];
+    }
 }
 
 @end
@@ -203,6 +325,10 @@ const CGFloat CPHUDAgentRail = 64.0;
     [container addSubview:agentUpdated];
     self.agentUpdatedLabel = agentUpdated;
 
+    CPHUDQuotaView *quotaView = [[CPHUDQuotaView alloc] initWithFrame:NSZeroRect];
+    [container addSubview:quotaView];
+    self.quotaView = quotaView;
+
     // 任务区域 NSScrollView 化:默认可见约 2 张卡,超出部分触控板/滚轮纵向滑动浏览;
     // overlay scroller 自动隐藏,滚动事件由滚动区消费,不会误触背景「打开工作台」。
     NSScrollView *taskScroll = [[NSScrollView alloc] initWithFrame:NSZeroRect];
@@ -269,7 +395,7 @@ const CGFloat CPHUDAgentRail = 64.0;
 
         [agentName.leadingAnchor constraintEqualToAnchor:railSep.trailingAnchor constant:18],
         [agentName.topAnchor constraintEqualToAnchor:container.topAnchor constant:18],
-        [agentName.trailingAnchor constraintLessThanOrEqualToAnchor:container.trailingAnchor constant:-18],
+        [agentName.trailingAnchor constraintLessThanOrEqualToAnchor:quotaView.leadingAnchor constant:-12],
 
         [agentStatus.leadingAnchor constraintEqualToAnchor:agentName.leadingAnchor],
         [agentStatus.topAnchor constraintEqualToAnchor:agentName.bottomAnchor constant:5],
@@ -278,7 +404,12 @@ const CGFloat CPHUDAgentRail = 64.0;
 
         [agentUpdated.leadingAnchor constraintGreaterThanOrEqualToAnchor:agentStatus.trailingAnchor constant:12],
         [agentUpdated.centerYAnchor constraintEqualToAnchor:agentStatus.centerYAnchor],
-        [agentUpdated.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-18],
+        [agentUpdated.trailingAnchor constraintEqualToAnchor:quotaView.leadingAnchor constant:-10],
+
+        [quotaView.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-18],
+        [quotaView.centerYAnchor constraintEqualToAnchor:agentName.bottomAnchor constant:2.5],
+        [quotaView.widthAnchor constraintEqualToConstant:CPHUDQuotaMeterWidth],
+        [quotaView.heightAnchor constraintEqualToConstant:CPHUDQuotaMeterHeight],
 
         [self.taskScrollView.leadingAnchor constraintEqualToAnchor:agentName.leadingAnchor],
         [self.taskScrollView.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-18],
@@ -512,6 +643,7 @@ const CGFloat CPHUDAgentRail = 64.0;
     } else {
         self.agentUpdatedLabel.stringValue = @"暂无活动";
     }
+    [(CPHUDQuotaView *)self.quotaView applySnapshot:agent.quota];
 
     // Agent list
     while (self.agentList.arrangedSubviews.count > 0) {

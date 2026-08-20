@@ -81,6 +81,12 @@ void CPCaptureScreenshots(AppDelegate *delegate, NSString *outputDir) {
     CPShotStep(3.8, ^{
         AppDelegate *d = weakDelegate; if (!d) return;
         CPShotWrite(d.card.window.contentView, @"workbench-detail");
+        [d connectPhoneFromMenu:nil];
+    });
+
+    CPShotStep(4.8, ^{
+        AppDelegate *d = weakDelegate; if (!d) return;
+        CPShotWrite(d.pairingSheet.window.contentView, @"pairing");
         NSLog(@"[shot] 完成");
         [NSApp terminate:nil];
     });

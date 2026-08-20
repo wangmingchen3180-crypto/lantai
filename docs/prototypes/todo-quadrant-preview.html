@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>待办四象限 · 原型预览 v2</title>
+<style>
+  :root{
+    --bg:#13151C;
+    --card:#20222C;
+    --text:#F2F2F5;
+    --sub:#C7C7CF;
+    --hint:#9E9FA8;
+    --accent:#668FFF;
+    --stroke:rgba(255,255,255,.08);
+    --today:#FFA84C;
+    --overdue:#FF787A;
+    --radius:12px;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;}
+  html,body{background:var(--bg);color:var(--text);
+    font:13px/1.5 -apple-system,"SF Pro Text","PingFang SC",sans-serif;
+    -webkit-font-smoothing:antialiased;}
+  body{padding:28px 24px 40px;}
+
+  .stage{display:flex;gap:36px;align-items:flex-start;justify-content:center;flex-wrap:wrap;}
+  .canvas-label{font-size:12px;color:var(--hint);margin-bottom:10px;text-align:center;letter-spacing:.5px;}
+
+  /* ---------- 画布 ---------- */
+  .canvas{background:var(--bg);border:1px solid var(--stroke);border-radius:16px;
+    overflow:hidden;position:relative;}
+  .canvas-mac{width:520px;padding:12px 12px 0;}
+  .canvas-mac .workbench-hint{height:34px;display:flex;align-items:center;gap:8px;
+    color:var(--hint);font-size:12px;border-bottom:1px solid var(--stroke);
+    padding:0 6px;margin-bottom:10px;}
+  .canvas-mac .workbench-hint .dot{width:8px;height:8px;border-radius:50%;background:var(--accent);opacity:.6;}
+  .canvas-phone{width:390px;height:780px;display:flex;flex-direction:column;}
+  .canvas-phone .statusbar{height:34px;display:flex;align-items:center;justify-content:space-between;
+    padding:0 18px;color:var(--hint);font-size:11px;flex:none;}
+
+  /* ---------- 待办区（Mac 限定 158px） ---------- */
+  .todo-area{position:relative;background:var(--card);border:1px solid var(--stroke);
+    border-radius:var(--radius);overflow:hidden;}
+  .canvas-mac .todo-area{height:158px;margin-bottom:12px;}
+  .canvas-phone .todo-area{flex:1;margin:0 12px 12px;min-height:0;}
+
+  /* ---------- 待分类横条 ---------- */
+  .inbox-bar{height:20px;flex:none;display:flex;align-items:center;gap:6px;
+    padding:0 10px;color:var(--hint);font-size:11px;
+    border-bottom:1px solid var(--stroke);background:rgba(255,255,255,.02);
+    cursor:pointer;user-select:none;}
+  .inbox-bar b{color:var(--today);font-weight:600;}
+  .inbox-bar .tag{font-size:10px;padding:0 6px;border-radius:8px;
+    border:1px solid var(--stroke);color:var(--sub);}
+  .canvas-phone .inbox-bar{height:24px;font-size:12px;}
+
+  /* ---------- 四格态 ---------- */
+  .quad-body{position:absolute;left:0;right:0;bottom:0;top:20px;}
+  .canvas-phone .quad-body{top:24px;}
+  .quad-grid{position:absolute;inset:0;display:grid;
+    grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;}
+  .quad{position:relative;padding:7px 9px;cursor:pointer;overflow:hidden;
+    transition:background .15s ease;display:flex;flex-direction:column;min-height:0;}
+  .quad:hover{background:rgba(255,255,255,.035);}
+  .quad.q1{border-right:1px solid var(--stroke);border-bottom:1px solid var(--stroke);}
+  .quad.q2{border-bottom:1px solid var(--stroke);}
+  .quad.q3{border-right:1px solid var(--stroke);}
+  .quad-name{font-size:12px;font-weight:600;color:var(--text);display:flex;align-items:baseline;gap:6px;}
+  .quad-count{font-size:10px;color:var(--hint);font-weight:400;}
+  .quad-desc{font-size:10px;color:var(--hint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .quad-titles{margin-top:3px;font-size:11px;color:var(--sub);min-height:0;overflow:hidden;
+    line-height:15px;max-height:30px;}
+  .quad-titles div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:15px;}
+  .canvas-mac .quad{padding:5px 8px;}
+  .canvas-mac .quad-name{font-size:11px;}
+  .canvas-mac .quad-count{font-size:9px;}
+  .canvas-mac .quad-desc{font-size:9px;}
+  .canvas-mac .quad-titles{font-size:10px;line-height:13px;max-height:26px;margin-top:2px;}
+  .canvas-mac .quad-titles div{line-height:13px;}
+  .canvas-phone .quad{padding:14px 14px;}
+  .canvas-phone .quad-name{font-size:15px;}
+  .canvas-phone .quad-desc{font-size:11px;margin-top:2px;}
+  .canvas-phone .quad-titles{font-size:12px;margin-top:8px;line-height:19px;max-height:38px;}
+  .canvas-phone .quad-titles div{line-height:19px;}
+  .canvas-phone .quad-count{font-size:11px;}
+
+  /* 轴标签 */
+  .axis{position:absolute;font-size:9px;color:var(--hint);letter-spacing:1px;
+    padding:1px 7px;border-radius:8px;border:1px solid var(--stroke);
+    background:var(--bg);z-index:3;pointer-events:none;}
+  .canvas-phone .axis{font-size:10px;padding:2px 9px;}
+  .axis-top{top:0;left:50%;transform:translate(-50%,-50%);}
+  .axis-left{left:13px;top:50%;transform:translate(-50%,-50%) rotate(-90deg);transform-origin:center;}
+  .canvas-mac .axis{font-size:8px;padding:0 5px;letter-spacing:0;}
+  .canvas-mac .axis-left{left:8px;}
+  .canvas-phone .axis-left{left:16px;}
+
+  /* 四格退场（满格态时） */
+  .quad-grid.away .quad{opacity:0;transform:scale(.96) translateY(6px);pointer-events:none;}
+  .quad-grid .quad{transition:opacity .26s ease,transform .32s cubic-bezier(.34,1.2,.4,1),background .15s ease;}
+  .quad-grid.away ~ .axis, .todo-area.full .axis{opacity:0;transition:opacity .2s ease;}
+
+  /* ---------- 满格态面板 ---------- */
+  .panel{position:absolute;z-index:5;background:var(--card);
+    border:1px solid var(--stroke);border-radius:var(--radius);
+    display:none;flex-direction:column;overflow:hidden;
+    will-change:transform,width,height,opacity;
+    box-shadow:0 12px 40px rgba(0,0,0,.45);}
+  .panel.open{display:flex;}
+  .panel-top{flex:none;display:flex;align-items:center;gap:8px;padding:7px 9px;
+    border-bottom:1px solid var(--stroke);}
+  .canvas-mac .panel-top{padding:5px 8px;}
+  .back-btn{flex:none;width:22px;height:22px;border-radius:50%;border:1px solid var(--stroke);
+    background:transparent;color:var(--sub);font-size:12px;cursor:pointer;
+    display:flex;align-items:center;justify-content:center;transition:background .15s;}
+  .back-btn:hover{background:rgba(255,255,255,.06);color:var(--text);}
+  .panel-name{font-size:13px;font-weight:600;}
+  .axis-chip{font-size:10px;color:var(--hint);padding:1px 8px;border-radius:9px;
+    border:1px solid var(--stroke);}
+  .panel-count{margin-left:auto;font-size:10px;color:var(--hint);}
+
+  .panel-input{flex:none;display:flex;gap:6px;padding:7px 9px;
+    border-bottom:1px solid var(--stroke);}
+  .canvas-mac .panel-input{padding:5px 8px;}
+  .panel-input input{flex:1;min-width:0;background:rgba(255,255,255,.04);
+    border:1px solid var(--stroke);border-radius:8px;color:var(--text);
+    font-size:12px;padding:4px 9px;outline:none;font-family:inherit;}
+  .canvas-mac .panel-input input{padding:3px 8px;font-size:11px;}
+  .panel-input input:focus{border-color:var(--accent);}
+  .panel-input input::placeholder{color:var(--hint);}
+  .done-btn{flex:none;background:var(--accent);color:#fff;border:none;border-radius:8px;
+    font-size:11px;padding:0 12px;cursor:pointer;font-family:inherit;}
+  .done-btn:hover{filter:brightness(1.1);}
+
+  .panel-list{flex:1;min-height:0;overflow-y:auto;padding:3px 0;
+    scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.15) transparent;}
+  .panel-list::-webkit-scrollbar{width:4px;}
+  .panel-list::-webkit-scrollbar-thumb{background:rgba(255,255,255,.15);border-radius:2px;}
+
+  .row{display:flex;align-items:center;gap:7px;padding:4px 10px;min-height:24px;}
+  .canvas-mac .row{padding:3px 9px;min-height:22px;}
+  .check{flex:none;width:14px;height:14px;border-radius:50%;
+    border:1.5px solid var(--hint);cursor:pointer;position:relative;
+    transition:border-color .15s,background .2s,transform .2s;}
+  .check:hover{border-color:var(--accent);transform:scale(1.12);}
+  .row.done .check{background:var(--accent);border-color:var(--accent);}
+  .row.done .check::after{content:"";position:absolute;left:3.5px;top:1.5px;
+    width:4px;height:7px;border:solid #fff;border-width:0 1.5px 1.5px 0;transform:rotate(42deg);}
+  .row-title{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+    color:var(--text);font-size:12px;transition:color .2s;}
+  .canvas-mac .row-title{font-size:11px;}
+  .row.done .row-title{color:var(--hint);text-decoration:line-through;}
+  .row-due{flex:none;font-size:10px;color:var(--hint);}
+  .row-due.today{color:var(--today);}
+  .row-due.overdue{color:var(--overdue);}
+  .row-agent{flex:none;font-size:9px;color:var(--sub);padding:0 6px;border-radius:7px;
+    border:1px solid var(--stroke);background:rgba(255,255,255,.03);}
+
+  .archive-head{display:flex;align-items:center;gap:6px;padding:4px 10px;
+    font-size:11px;color:var(--hint);cursor:pointer;user-select:none;
+    border-top:1px solid var(--stroke);}
+  .canvas-mac .archive-head{padding:3px 9px;font-size:10px;}
+  .archive-head .caret{transition:transform .2s ease;font-size:9px;}
+  .archive-head.open .caret{transform:rotate(90deg);}
+  .archive-body{overflow:hidden;max-height:0;transition:max-height .25s ease;}
+  .archive-body.open{max-height:400px;}
+  .archive-body .row-title{color:var(--hint);text-decoration:line-through;}
+
+  /* ---------- 减少动效 ---------- */
+  @media (prefers-reduced-motion:reduce){
+    .panel{transition:opacity .18s ease !important;}
+    .quad-grid .quad{transition:opacity .18s ease !important;}
+    .archive-body{transition:none;}
+    *{animation:none !important;}
+  }
+</style>
+</head>
+<body>
+<div class="stage" id="stage"></div>
+
+<script>
+/* ================= 假数据 ================= */
+const QUADS = {
+  jiliu:  { name:"急流", desc:"卷着走，先过这一段", chip:"要紧 · 急", axis:{top:true,left:true} },
+  shengtan:{ name:"深潭", desc:"要沉下去做，别搁浅", chip:"要紧 · 不急", axis:{top:true,left:false} },
+  suilang: { name:"碎浪", desc:"琐碎又催人，蹚过去就完", chip:"不要紧 · 急", axis:{top:false,left:true} },
+  jingshui:{ name:"静水", desc:"没动静，想不起来也无妨", chip:"不要紧 · 不急", axis:{top:false,left:false} },
+};
+const ORDER = ["jiliu","shengtan","suilang","jingshui"];
+
+const TODOS = [
+  { id:1, q:"jiliu",   title:"修复导出图片在高分屏下模糊的问题", due:"today",   agent:"Kimi" },
+  { id:2, q:"jiliu",   title:"回复用户关于四象限交互的反馈，这行标题特别特别长用来验证截断效果是否正常工作", due:"overdue", agent:"Codex" },
+  { id:3, q:"jiliu",   title:"整理 ~/Documents/Codex/小项目 下的截图素材", due:"", agent:"" },
+  { id:4, q:"shengtan",title:"重写待办四象限原型的展开动画（FLIP + 回弹曲线）", due:"today", agent:"Codex" },
+  { id:5, q:"shengtan",title:"通读 BRIDGE_API 草案并标注疑问", due:"", agent:"Kimi" },
+  { id:6, q:"suilang", title:"把构建产物挪到 outputs 目录", due:"overdue", agent:"" },
+  { id:7, q:"suilang", title:"更新 README 里的截图", due:"", agent:"Codex" },
+  { id:8, q:"jingshui",title:"研究一下菜单栏图标的动态渲染方案", due:"", agent:"Kimi" },
+  { id:9, q:"jiliu",   title:"上一版原型的旧交互走查", due:"", agent:"", done:true },
+  { id:10,q:"suilang", title:"清理 work/shots 里的旧截图", due:"", agent:"Codex", done:true },
+];
+const INBOX = [
+  { id:101, title:"还没想清楚归哪格：给原型加音效？", agent:"Kimi" },
+  { id:102, title:"待分类：导出 PNG 的默认倍率", agent:"" },
+];
+
+/* ================= 工具 ================= */
+const RM = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const EASE_OUT = "cubic-bezier(0.34, 1.3, 0.4, 1)";   // 弹出，轻微回弹
+const EASE_IN  = "cubic-bezier(0.5, 0, 0.75, 0)";      // 收回
+const T_OPEN = 380, T_CLOSE = 300;
+
+function el(tag, cls, text){
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+function dueChip(todo){
+  if (!todo.due) return null;
+  const d = el("span", "row-due " + todo.due);
+  d.textContent = todo.due === "today" ? "今天到期" : "已过期";
+  return d;
+}
+function rowEl(todo, archived){
+  const r = el("div", "row" + (todo.done ? " done" : ""));
+  const c = el("span", "check");
+  c.addEventListener("click", ev => {
+    ev.stopPropagation();
+    todo.done = !todo.done;
+    r.classList.toggle("done", todo.done);
+    refreshCounts();
+    if (!archived) { /* 活跃区点完成：短暂停留后可由归档区查看 */ }
+  });
+  r.appendChild(c);
+  r.appendChild(el("span", "row-title", todo.title));
+  const d = dueChip(todo); if (d) r.appendChild(d);
+  if (todo.agent) r.appendChild(el("span", "row-agent", todo.agent));
+  return r;
+}
+
+/* ================= 画布构建 ================= */
+const canvases = [];
+
+function buildCanvas(kind){
+  const wrap = el("div");
+  wrap.appendChild(el("div", "canvas-label",
+    kind === "mac" ? "Mac 工作台 · 底部待办区（520 × 158）" : "手机 · 整屏四象限单页（390 × 780）"));
+
+  const cv = el("div", "canvas canvas-" + kind);
+  cv.dataset.odId = kind === "mac" ? "canvas-mac" : "canvas-phone";
+
+  if (kind === "mac"){
+    const wb = el("div", "workbench-hint");
+    wb.appendChild(el("span", "dot"));
+    wb.appendChild(el("span", null, "工作台任务区（示意，不在原型范围内）"));
+    cv.appendChild(wb);
+  } else {
+    const sb = el("div", "statusbar");
+    sb.appendChild(el("span", null, "9:41"));
+    sb.appendChild(el("span", null, "Codex Pulse"));
+    cv.appendChild(sb);
+  }
+
+  const area = el("div", "todo-area");
+  area.dataset.odId = "todo-area-" + kind;
+
+  /* 待分类横条 */
+  const bar = el("div", "inbox-bar");
+  bar.dataset.odId = "inbox-bar-" + kind;
+  const barText = el("span");
+  bar.appendChild(el("span", "tag", "待分类"));
+  bar.appendChild(barText);
+  area.appendChild(bar);
+
+  /* 四格态 */
+  const body = el("div", "quad-body");
+  const grid = el("div", "quad-grid");
+  grid.dataset.odId = "quad-grid-" + kind;
+  ORDER.forEach((key, i) => {
+    const meta = QUADS[key];
+    const q = el("div", "quad q" + (i+1));
+    q.dataset.odId = "quad-" + key + "-" + kind;
+    q.dataset.quad = key;
+    const nm = el("div", "quad-name");
+    nm.appendChild(el("span", null, meta.name));
+    const cnt = el("span", "quad-count");
+    cnt.dataset.quadCount = key;
+    nm.appendChild(cnt);
+    q.appendChild(nm);
+    q.appendChild(el("div", "quad-desc", meta.desc));
+    const titles = el("div", "quad-titles");
+    TODOS.filter(t => t.q === key && !t.done).slice(0,2)
+      .forEach(t => titles.appendChild(el("div", null, t.title)));
+    q.appendChild(titles);
+    q.addEventListener("click", () => openPanel(ctx, key, q));
+    grid.appendChild(q);
+  });
+  body.appendChild(grid);
+  /* 轴标签 */
+  const axTop = el("div", "axis axis-top", "要紧");
+  axTop.dataset.odId = "axis-top-" + kind;
+  const axLeft = el("div", "axis axis-left", "急");
+  axLeft.dataset.odId = "axis-left-" + kind;
+  body.appendChild(axTop);
+  body.appendChild(axLeft);
+  area.appendChild(body);
+
+  /* 满格态面板 */
+  const panel = el("div", "panel");
+  panel.dataset.odId = "panel-" + kind;
+  area.appendChild(panel);
+
+  cv.appendChild(area);
+  wrap.appendChild(cv);
+  document.getElementById("stage").appendChild(wrap);
+
+  const ctx = { kind, area, grid, panel, body, barText, open: null };
+  canvases.push(ctx);
+  refreshCounts();
+  return ctx;
+}
+
+function refreshCounts(){
+  const inboxN = INBOX.length;
+  for (const ctx of canvases){
+    ctx.barText.innerHTML = "";
+    ctx.barText.appendChild(document.createTextNode("共 "));
+    const b = el("b", null, String(inboxN));
+    ctx.barText.appendChild(b);
+    ctx.barText.appendChild(document.createTextNode(" 条未归类"));
+    ctx.area.querySelectorAll("[data-quad-count]").forEach(s => {
+      const n = TODOS.filter(t => t.q === s.dataset.quadCount && !t.done).length;
+      s.textContent = n + " 条";
+    });
+    if (ctx.open){
+      const c = ctx.panel.querySelector(".panel-count");
+      if (c) c.textContent = TODOS.filter(t => t.q === ctx.open && !t.done).length + " 条";
+      const ah = ctx.panel.querySelector(".archive-head .arc-n");
+      if (ah) ah.textContent = "已完成 " + TODOS.filter(t => t.q === ctx.open && t.done).length;
+    }
+  }
+}
+
+/* ================= 满格态内容 ================= */
+function fillPanel(ctx, key){
+  const meta = QUADS[key];
+  const p = ctx.panel;
+  p.innerHTML = "";
+
+  const top = el("div", "panel-top");
+  const back = el("button", "back-btn", "←");
+  back.dataset.odId = "panel-back-" + ctx.kind;
+  back.title = "返回四格";
+  back.addEventListener("click", ev => { ev.stopPropagation(); closePanel(ctx); });
+  top.appendChild(back);
+  top.appendChild(el("span", "panel-name", meta.name));
+  top.appendChild(el("span", "axis-chip", meta.chip));
+  top.appendChild(el("span", "panel-count"));
+  p.appendChild(top);
+
+  const inp = el("div", "panel-input");
+  const input = el("input");
+  input.dataset.odId = "panel-input-" + ctx.kind;
+  input.placeholder = "加一条到「" + meta.name + "」…";
+  const btn = el("button", "done-btn", "添加");
+  const submit = () => {
+    const v = input.value.trim();
+    if (!v) return;
+    TODOS.push({ id: Date.now(), q: key, title: v, due:"", agent:"" });
+    input.value = "";
+    rebuildList(ctx, key);
+    refreshCounts();
+  };
+  btn.addEventListener("click", submit);
+  input.addEventListener("keydown", e => { if (e.key === "Enter") submit(); });
+  inp.appendChild(input); inp.appendChild(btn);
+  p.appendChild(inp);
+
+  const list = el("div", "panel-list");
+  list.dataset.odId = "panel-list-" + ctx.kind;
+  p.appendChild(list);
+  rebuildList(ctx, key);
+
+  /* 点击面板空白（列表 padding 区）缩回 */
+  p.addEventListener("click", e => {
+    if (e.target === p || e.target === list) closePanel(ctx);
+  });
+  ctx._input = input;
+  refreshCounts();
+}
+
+function rebuildList(ctx, key){
+  const list = ctx.panel.querySelector(".panel-list");
+  list.innerHTML = "";
+  TODOS.filter(t => t.q === key && !t.done).forEach(t => list.appendChild(rowEl(t, false)));
+  const dones = TODOS.filter(t => t.q === key && t.done);
+  if (dones.length){
+    const head = el("div", "archive-head");
+    head.dataset.odId = "archive-head-" + ctx.kind;
+    head.appendChild(el("span", "caret", "▶"));
+    head.appendChild(el("span", "arc-n", "已完成 " + dones.length));
+    const body = el("div", "archive-body");
+    dones.forEach(t => body.appendChild(rowEl(t, true)));
+    head.addEventListener("click", ev => {
+      ev.stopPropagation();
+      head.classList.toggle("open");
+      body.classList.toggle("open");
+    });
+    list.appendChild(head);
+    list.appendChild(body);
+  }
+}
+
+/* ================= FLIP 展开 / 收回（纯 transform + opacity） ================= */
+/* 面板始终停在目标 rect（横条下方铺满），动画只改 transform/opacity：
+   展开时先从目标 rect 反推出对齐格子的 translate+scale，再过渡到 none。 */
+function panelHome(ctx){
+  const barH = ctx.barText.closest(".inbox-bar").getBoundingClientRect().height;
+  return { left: 0, top: barH, width: "100%", height: `calc(100% - ${barH}px)` };
+}
+function setPanelHome(ctx){
+  const h = panelHome(ctx);
+  Object.assign(ctx.panel.style, {
+    left: h.left + "px", top: h.top + "px", width: h.width, height: h.height,
+    transformOrigin: "0 0"
+  });
+}
+/* 从格子 rect 计算对齐到它的 transform（面板此时已在目标位置） */
+function transformFromQuad(ctx, quadEl){
+  const ar = ctx.area.getBoundingClientRect();
+  const qr = quadEl.getBoundingClientRect();
+  const pr = ctx.panel.getBoundingClientRect();
+  const sx = qr.width / pr.width;
+  const sy = qr.height / pr.height;
+  const dx = (qr.left - ar.left) - (pr.left - ar.left);
+  const dy = (qr.top - ar.top) - (pr.top - ar.top);
+  return `translate(${dx}px, ${dy}px) scale(${sx}, ${sy})`;
+}
+
+function openPanel(ctx, key, quadEl){
+  if (ctx.open) return;               // 没有直接跳格
+  ctx.open = key;
+  ctx.area.classList.add("full");
+  fillPanel(ctx, key);
+
+  const p = ctx.panel;
+  p.classList.add("open");
+  setPanelHome(ctx);
+
+  /* 其余三格淡出 + 轻微下沉缩小 */
+  ctx.grid.classList.add("away");
+
+  if (RM){
+    p.style.transition = "opacity .18s ease";
+    p.style.opacity = 1;
+    if (ctx._input) ctx._input.focus();
+    return;
+  }
+
+  const startT = transformFromQuad(ctx, quadEl);
+  p.style.transition = "none";
+  p.style.transform = startT;
+  p.style.opacity = 0.4;
+  p.getBoundingClientRect();           // 强制 reflow
+  p.style.transition =
+    `transform ${T_OPEN}ms ${EASE_OUT}, opacity 220ms ease`;
+  p.style.transform = "none";
+  p.style.opacity = 1;
+  setTimeout(() => {
+    if (ctx.open === key){
+      p.style.transition = "";
+      if (ctx._input) ctx._input.focus();
+    }
+  }, T_OPEN);
+}
+
+function closePanel(ctx){
+  if (!ctx.open) return;
+  const key = ctx.open;
+  const quadEl = ctx.grid.querySelector(`.quad[data-quad="${key}"]`);
+  const p = ctx.panel;
+
+  const done = () => {
+    p.classList.remove("open");
+    p.style.cssText = "";
+    ctx.open = null;
+  };
+
+  /* 其余三格淡回 */
+  ctx.grid.classList.remove("away");
+  ctx.area.classList.remove("full");
+
+  if (RM){
+    p.style.transition = "opacity .18s ease";
+    p.style.opacity = 0;
+    setTimeout(done, 190);
+    return;
+  }
+
+  const endT = transformFromQuad(ctx, quadEl);
+  p.style.transition =
+    `transform ${T_CLOSE}ms ${EASE_IN}, opacity ${T_CLOSE}ms ease`;
+  p.style.transform = endT;
+  p.style.opacity = 0;
+  setTimeout(done, T_CLOSE + 20);
+}
+
+function escHandler(e){
+  if (e.key === "Escape") canvases.forEach(closePanel);
+}
+document.addEventListener("keydown", escHandler);
+
+/* ================= 启动 ================= */
+buildCanvas("mac");
+buildCanvas("phone");
+</script>
+</body>
+</html>
