@@ -62,7 +62,7 @@ async function main() {
     canvas,
     tooltip,
     () => rig.camera,
-    () => candles
+    () => candleRoot
   );
 
   // —— UI wiring ——
@@ -104,7 +104,7 @@ async function main() {
     volumeMode = "relative";
     volumeSelect.value = "relative";
     candles = buildCandles(candleRoot, bars, layout, volumeMode);
-    setActive(viewBtns, "data-view", "iso");
+    setActive(viewBtns, "data-view", "front");
     setActive(projBtns, "data-proj", "ortho");
     rig.reset();
   });
@@ -120,6 +120,23 @@ async function main() {
 
   // Sync active view button when user finishes a manual orbit near a preset (optional skip)
   // Keep toolbar in sync only on explicit button clicks for MVP clarity.
+
+  // Expose for automated tests / console debugging
+  window.__candleChart = {
+    scene,
+    rig,
+    candleRoot,
+    bars,
+    pickAtNdc(x, y) {
+      const raycaster = new THREE.Raycaster();
+      raycaster.setFromCamera(new THREE.Vector2(x, y), rig.camera);
+      const hits = raycaster.intersectObjects(candleRoot.children, true);
+      return hits.length
+        ? hits[0].object.userData.candle?.index ??
+            hits[0].object.parent?.userData.candle?.index
+        : null;
+    },
+  };
 
   function frame() {
     rig.update();

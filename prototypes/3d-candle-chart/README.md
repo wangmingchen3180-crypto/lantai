@@ -33,6 +33,8 @@ python3 -m http.server 5173 --directory prototypes/3d-candle-chart
 
 Toolbar: **Front** · **Side** · **3D** · **Ortho / Persp** · **Volume Scale** · **Reset**
 
+Default camera is **Front** (classic Time×Price). Drag to reveal volume depth, or jump to **3D** / **Side** (top-down Time×Volume).
+
 ## Project layout
 
 ```

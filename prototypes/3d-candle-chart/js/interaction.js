@@ -10,16 +10,17 @@ export class CandlePicker {
    * @param {HTMLCanvasElement} canvas
    * @param {HTMLElement} tooltip
    * @param {() => THREE.Camera} getCamera
-   * @param {() => THREE.Object3D[]} getTargets
+   * @param {() => THREE.Object3D} getCandleRoot  parent group containing candle groups
    */
-  constructor(viewport, canvas, tooltip, getCamera, getTargets) {
+  constructor(viewport, canvas, tooltip, getCamera, getCandleRoot) {
     this.viewport = viewport;
     this.canvas = canvas;
     this.tooltip = tooltip;
     this.getCamera = getCamera;
-    this.getTargets = getTargets;
+    this.getCandleRoot = getCandleRoot;
 
     this.raycaster = new THREE.Raycaster();
+    this.raycaster.params.Line = { threshold: 0.2 };
     this.pointer = new THREE.Vector2();
     this.hovered = null;
     this.selected = null;
@@ -102,19 +103,14 @@ export class CandlePicker {
 
   #hitTest(clientX, clientY) {
     const rect = this.canvas.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
     this.pointer.x = ((clientX - rect.left) / rect.width) * 2 - 1;
     this.pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
     this.raycaster.setFromCamera(this.pointer, this.getCamera());
 
-    const targets = this.getTargets();
-    const meshes = [];
-    for (const g of targets) {
-      g.traverse((o) => {
-        if (o.isMesh) meshes.push(o);
-      });
-    }
-
-    const hits = this.raycaster.intersectObjects(meshes, false);
+    const root = this.getCandleRoot();
+    if (!root) return null;
+    const hits = this.raycaster.intersectObjects(root.children, true);
     if (!hits.length) return null;
     let obj = hits[0].object;
     // Resolve to the candle Group (not the body/wick mesh)

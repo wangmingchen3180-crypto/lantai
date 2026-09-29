@@ -24,8 +24,8 @@ export function computeLayout(bars) {
   const priceRange = Math.max(maxP - minP, 1e-6);
 
   const candleGap = 1.0;
-  const bodyWidth = 0.62;
-  const wickWidth = 0.1;
+  const bodyWidth = 0.72;
+  const wickWidth = 0.12;
   const chartWidth = (bars.length - 1) * candleGap;
   const chartHeight = 28;
   const priceScale = chartHeight / priceRange;

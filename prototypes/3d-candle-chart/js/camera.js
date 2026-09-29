@@ -17,7 +17,7 @@ export class CameraRig {
     this.layout = layout;
 
     this.mode = "ortho"; // ortho | persp
-    this.viewName = "iso";
+    this.viewName = "front";
 
     const aspect = this.#aspect();
     const frustum = this.#frustumSize();
@@ -47,7 +47,8 @@ export class CameraRig {
     this.controls.update();
 
     this._anim = null;
-    this.applyView("iso", false);
+    // First paint = classic Time×Price; user discovers volume by dragging
+    this.applyView("front", false);
   }
 
   #aspect() {
@@ -66,27 +67,29 @@ export class CameraRig {
 
   /**
    * Preset camera positions relative to chart center.
-   * Front: look along -Z so Z depth collapses (classic Time×Price).
-   * Side: look along +X so Y compresses (Time×Volume).
-   * Iso: ~35° oblique — the product's hero state.
+   * Front: look along −Z → Z depth collapses (classic Time×Price).
+   * Side: look along −Y (top-down) → Y compresses (Time×Volume).
+   * Iso: ~38° azimuth / ~28° elevation — hero state showing all 3 axes.
    */
   getViewPose(name) {
-    const t = this.controls.target.clone();
+    const cx = this.layout.centerX;
     const dist = Math.max(this.layout.chartWidth, this.layout.chartHeight) * 1.05;
+    const zMid = -2.2;
 
     if (name === "front") {
       return {
-        position: new THREE.Vector3(t.x, t.y, dist * 0.95),
-        target: t,
+        position: new THREE.Vector3(cx, 0, dist * 0.95),
+        target: new THREE.Vector3(cx, 0, zMid),
         up: new THREE.Vector3(0, 1, 0),
       };
     }
 
     if (name === "side") {
+      // Top-down: screen X = Time, screen Y = Volume depth (−Z)
       return {
-        position: new THREE.Vector3(t.x - dist * 0.95, t.y * 0.15, t.z - 2.5),
-        target: new THREE.Vector3(t.x, 0, -2.5),
-        up: new THREE.Vector3(0, 1, 0),
+        position: new THREE.Vector3(cx, dist * 0.95, zMid),
+        target: new THREE.Vector3(cx, 0, zMid),
+        up: new THREE.Vector3(0, 0, -1),
       };
     }
 
@@ -94,13 +97,14 @@ export class CameraRig {
     const az = THREE.MathUtils.degToRad(38);
     const el = THREE.MathUtils.degToRad(28);
     const r = dist * 0.92;
+    const target = new THREE.Vector3(cx, 0, zMid);
     return {
       position: new THREE.Vector3(
-        t.x + r * Math.sin(az) * Math.cos(el),
-        t.y + r * Math.sin(el),
-        t.z + r * Math.cos(az) * Math.cos(el)
+        target.x + r * Math.sin(az) * Math.cos(el),
+        target.y + r * Math.sin(el),
+        target.z + r * Math.cos(az) * Math.cos(el)
       ),
-      target: new THREE.Vector3(t.x, 0, -2),
+      target,
       up: new THREE.Vector3(0, 1, 0),
     };
   }
@@ -149,7 +153,7 @@ export class CameraRig {
       this.active.zoom = 1;
       this.active.updateProjectionMatrix();
     }
-    this.applyView("iso", true);
+    this.applyView("front", true);
   }
 
   resize() {
