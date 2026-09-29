@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>3D Candle · Time × Price × Volume</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="css/styles.css" />
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <header class="toolbar" role="toolbar" aria-label="Chart controls">
+      <div class="brand">
+        <span class="brand-mark"></span>
+        <span class="brand-name">3D Candle</span>
+        <span class="brand-sub">Time · Price · Volume</span>
+      </div>
+
+      <div class="toolbar-group" role="group" aria-label="Camera views">
+        <button type="button" class="tool-btn" data-view="front" title="Front / Price View">Front</button>
+        <button type="button" class="tool-btn" data-view="side" title="Side / Volume View">Side</button>
+        <button type="button" class="tool-btn is-active" data-view="iso" title="3D Oblique View">3D</button>
+      </div>
+
+      <div class="toolbar-group" role="group" aria-label="Projection">
+        <button type="button" class="tool-btn is-active" data-proj="ortho" title="Orthographic">Ortho</button>
+        <button type="button" class="tool-btn" data-proj="persp" title="Perspective">Persp</button>
+      </div>
+
+      <div class="toolbar-group volume-scale" role="group" aria-label="Volume depth scale">
+        <label for="volume-mode">Volume Scale</label>
+        <select id="volume-mode">
+          <option value="relative" selected>Relative</option>
+          <option value="linear">Linear</option>
+          <option value="log">Log</option>
+        </select>
+      </div>
+
+      <div class="toolbar-group">
+        <button type="button" class="tool-btn" id="btn-reset" title="Reset camera & selection">Reset</button>
+      </div>
+    </header>
+
+    <main id="viewport" aria-label="3D candlestick chart">
+      <canvas id="c"></canvas>
+
+      <aside id="tooltip" class="tooltip" hidden>
+        <div class="tooltip-row tooltip-time" data-field="time">—</div>
+        <div class="tooltip-grid">
+          <span>O</span><span data-field="open">—</span>
+          <span>H</span><span data-field="high">—</span>
+          <span>L</span><span data-field="low">—</span>
+          <span>C</span><span data-field="close">—</span>
+          <span>Vol</span><span data-field="volume">—</span>
+          <span>RVOL</span><span data-field="rvol">—</span>
+        </div>
+      </aside>
+
+      <div class="axis-legend" aria-hidden="true">
+        <span class="ax ax-x">X Time</span>
+        <span class="ax ax-y">Y Price</span>
+        <span class="ax ax-z">Z Volume</span>
+      </div>
+
+      <p class="hint">Drag to rotate · Scroll to zoom · Right-drag / two-finger to pan</p>
+    </main>
+  </div>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
